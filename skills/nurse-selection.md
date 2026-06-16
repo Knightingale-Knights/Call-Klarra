@@ -2,7 +2,7 @@
 
 **Owner:** Paul (authored and edited by Paul only. The agent reads this file; it does not rewrite it.)
 **Last updated:** 2026-06-16
-**Version:** 0.1
+**Version:** 0.2
 
 ---
 
@@ -45,9 +45,20 @@ dominate; lower factors break ties and nudge between otherwise-comparable candid
 who know the site, especially where the facility `complexity` is 'complex'.
 
 ### 2. Reliability
-`reliability` — ranges 0 to 1 (completed / completed+no_show+cancelled). Higher is
-better. A nurse with no history defaults to 1.0 (give newcomers the benefit of the
-doubt). Prefer nurses who show up.
+`reliability` — a score from 0 to 100. Higher is better. It measures how a nurse
+responds to calls AND whether they follow through, computed from their call history:
+- answering + accepting a shift pushes the score UP,
+- completing an accepted shift pushes it UP most,
+- being shown available but not answering, or declining, pushes it DOWN,
+- accepting then no-showing or cancelling pushes it DOWN hardest.
+
+Recent behaviour dominates: each past event fades to about half its weight after ~30
+days (fast decay), so a nurse rehabilitates a poor score by being reliable lately, and
+old mistakes stop counting against them over time.
+
+A nurse with no call history defaults to 100 (trust by default; newcomers get the
+benefit of the doubt). As a rough read: 80–100 is dependable, 40–60 is shaky, under ~20
+means recent no-shows or no-answers — call only if no better option exists.
 
 ### 3. Back-to-back gap
 `last_shift_end` — compute hours between their last shift end and this shift's start.
