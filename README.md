@@ -34,7 +34,7 @@ knightingale-agent/
 ## Status
 
 - [x] Supabase data layer + get_candidate_pool function
-- [x] Decision skill file (v0.1)
+- [x] Decision skill file (v0.2)
+- [x] Reliability scoring (0–100, recency-weighted, from call_events)
 - [ ] learned_decisions store
-- [ ] travel_km geocoding
 - [ ] LiveKit + OpenAI Realtime agent
