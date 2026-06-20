@@ -147,11 +147,11 @@ def facility_by_phone(phone: str) -> dict | None:
 # --- Shift request queue (Step C: inbound intake -> orchestrator handoff) ---
 
 def create_shift_request(facility_id: int | None, callback_number: str,
-                         date: str, shift_type: str, role: str) -> int:
+                         date: str, shift_type: str, role: str,
+                         source: str = "voice") -> int:
     """
     Write a shift request to the queue for the orchestrator to pick up and fill.
-    Returns the new request id. The inbound call ends after this; the actual
-    nurse-calling happens off-call.
+    Returns the new request id.
     """
     client = get_client()
     resp = client.table("shift_requests").insert({
@@ -161,6 +161,7 @@ def create_shift_request(facility_id: int | None, callback_number: str,
         "shift_type": shift_type,
         "role": role,
         "status": "pending",
+        "source": source,
     }).execute()
     new_id = resp.data[0]["id"]
     logger.info("Created shift_request %s (%s %s %s)", new_id, date, shift_type, role)
@@ -205,3 +206,12 @@ def mark_request_unfilled(request_id: int) -> None:
         {"status": "unfilled", "updated_at": "now()"}
     ).eq("id", request_id).execute()
     logger.info("Request %s unfilled — no nurse found", request_id)
+
+# --- SMS sending (Twilio) ---
+
+def send_sms(to: str, body: str) -> None:
+    """Send an SMS via Twilio."""
+    from twilio.rest import Client as TwilioClient
+    tw = TwilioClient(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
+    tw.messages.create(to=to, from_=os.environ["TWILIO_PHONE_NUMBER"], body=body)
+    logger.info("Sent SMS to %s", to)

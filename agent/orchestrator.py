@@ -150,11 +150,28 @@ async def handle_request(lk: api.LiveKitAPI, req: dict):
         logger.info("%s -> %s", nurse["first_name"], outcome)
         if outcome == "accepted":
             db.mark_request_filled(req["id"], nurse["nurse_id"])
-            await call_facility(lk, req, filled=True, nurse_name=nurse["first_name"])
+            await notify_facility(lk, req, filled=True, nurse_name=nurse["first_name"])
             return
 
     db.mark_request_unfilled(req["id"])
-    await call_facility(lk, req, filled=False, nurse_name=None)
+    await notify_facility(lk, req, filled=False, nurse_name=None)
+
+
+async def notify_facility(lk, req, filled, nurse_name):
+    """Tell the facility the result — by SMS if the request came via SMS, else voice."""
+    if req.get("source") == "sms":
+        if filled:
+            body = (f"Good news — {nurse_name} is covering the {req['shift_type'].lower()} "
+                    f"shift on {req['date']}.")
+        else:
+            body = (f"Sorry, no one was available for the {req['shift_type'].lower()} shift "
+                    f"on {req['date']} yet. We'll keep trying.")
+        try:
+            db.send_sms(req["facility_callback_number"], body)
+        except Exception:
+            logger.exception("Failed to send result SMS")
+    else:
+        await call_facility(lk, req, filled=filled, nurse_name=nurse_name)
 
 
 async def main():
