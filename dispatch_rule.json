@@ -1,0 +1,14 @@
+{
+  "dispatch_rule": {
+    "rule": {
+      "dispatchRuleIndividual": {
+        "roomPrefix": "call-"
+      }
+    },
+    "room_config": {
+      "agents": [
+        { "agent_name": "knightingale-inbound" }
+      ]
+    }
+  }
+}

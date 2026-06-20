@@ -2,7 +2,7 @@
 
 **Owner:** Paul (authored and edited by Paul only. The agent reads this file; it does not rewrite it.)
 **Last updated:** 2026-06-16
-**Version:** 0.2
+**Version:** 0.4
 
 ---
 
@@ -90,18 +90,43 @@ unfamiliar stranger. Familiarity (factor 1) can outweigh the hours penalty.
 
 ---
 
-## Escalation — when you are stuck
+## Escalation and learning — when you are stuck
 
-You escalate to Paul when:
+You are "stuck" when:
 - the pool is empty, or
 - every candidate has declined, or
 - two or more candidates are genuinely tied and the choice is consequential, or
 - the situation doesn't fit this policy.
 
-Before escalating, CHECK the learned-decisions store for a past ruling on a similar
-situation (see the Learned Decisions skill — to be added). If a close enough prior
-ruling exists, apply it, act, and notify Paul of what you did and how confident the
-match was. Only call Paul fresh when no usable prior ruling exists. Save his answer.
+When stuck, do NOT immediately call Paul. First call `check_past_rulings` with a
+plain-language description of the situation. It returns the most similar past rulings
+with a similarity score from 0 to 1. Act on the score using these confidence bands:
+
+- **Strong match (similarity ≥ 0.85):** apply the past ruling. Act on it, then notify
+  Paul of what you did and that it was based on his earlier ruling. Do not interrupt him
+  for a decision he has effectively already made.
+
+- **Loose match (similarity 0.70–0.85):** the situation is adjacent but not clearly the
+  same. If there is time pressure, apply the closest ruling BUT flag it clearly as a
+  stretch — tell Paul "I think your earlier ruling about X applies here, but it's not a
+  close match; I went with it — tell me if that was wrong." Mark it as low-confidence so
+  he knows to look.
+
+- **No usable match (similarity < 0.70, or no results):** there is no precedent. Do NOT
+  wait or stall — `check_past_rulings` returns immediately, so the moment it comes back
+  empty or low, act at once: tell the caller plainly what the situation is (e.g. "there's
+  no one available to cover that shift right now"), state what you'll do (escalate to
+  Paul), and if the caller or Paul gives you a decision, call `save_ruling` to record it.
+  Never tell the caller you are "waiting" for the ruling lookup — it is already done.
+
+(These thresholds are Paul's to tune. If the agent asks too often, raise the bands; if
+it over-applies loose matches, lower them.)
+
+If a returned ruling is marked as one Paul later said was WRONG, do not repeat it —
+treat it as a boundary, and prefer escalating.
+
+Never let learning override the hard boundaries below. The learned store decides
+*who among the eligible to prefer*, never *who is eligible*.
 
 ---
 
