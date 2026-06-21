@@ -13,6 +13,20 @@ from supabase import create_client, Client
 
 logger = logging.getLogger("knightingale-agent.db")
 
+# --- Safe mode ---
+# KLARRA_MODE=dev blocks all writes + SMS (logged, no-op). Reads always pass through.
+KLARRA_MODE = os.environ.get("KLARRA_MODE", "live").lower()
+DEV = KLARRA_MODE == "dev"
+
+
+def _blocked(action: str) -> bool:
+    """True if a write should be skipped because we're in dev mode."""
+    if DEV:
+        logger.warning("[DEV] blocked write: %s", action)
+        return True
+    return False
+
+
 _client: Client | None = None
 
 
@@ -66,6 +80,8 @@ def record_call_event(nurse_id: int, outcome: str, facility_id: int | None = Non
     also serves as the audit trail of who was called and what happened.
     Valid outcomes: accepted, declined, no_answer, completed, no_show, cancelled.
     """
+    if _blocked(f"record_call_event nurse={nurse_id} {outcome}"):
+        return
     client = get_client()
     client.table("call_events").insert({
         "nurse_id": nurse_id,
@@ -110,6 +126,8 @@ def insert_learned_decision(situation_text: str, ruling: str,
     agent can reason from it next time. This is the ONLY place the agent 'learns' —
     and every row traces back to a real decision Paul made.
     """
+    if _blocked(f"insert_learned_decision {situation_text[:40]}"):
+        return
     client = get_client()
     embedding = embed_situation(situation_text)
     client.table("learned_decisions").insert({
@@ -153,6 +171,8 @@ def create_shift_request(facility_id: int | None, callback_number: str,
     Write a shift request to the queue for the orchestrator to pick up and fill.
     Returns the new request id.
     """
+    if _blocked(f"create_shift_request {date} {shift_type} {role}"):
+        return -1
     client = get_client()
     resp = client.table("shift_requests").insert({
         "facility_id": facility_id,
@@ -186,6 +206,8 @@ def claim_next_request() -> dict | None:
     if not pending.data:
         return None
     req = pending.data[0]
+    if _blocked(f"claim_next_request mark working id={req['id']}"):
+        return req
     client.table("shift_requests").update(
         {"status": "working", "updated_at": "now()"}
     ).eq("id", req["id"]).execute()
@@ -193,6 +215,8 @@ def claim_next_request() -> dict | None:
 
 
 def mark_request_filled(request_id: int, nurse_id: int) -> None:
+    if _blocked(f"mark_request_filled id={request_id} nurse={nurse_id}"):
+        return
     client = get_client()
     client.table("shift_requests").update(
         {"status": "filled", "filled_by_nurse_id": nurse_id, "updated_at": "now()"}
@@ -201,6 +225,8 @@ def mark_request_filled(request_id: int, nurse_id: int) -> None:
 
 
 def mark_request_unfilled(request_id: int) -> None:
+    if _blocked(f"mark_request_unfilled id={request_id}"):
+        return
     client = get_client()
     client.table("shift_requests").update(
         {"status": "unfilled", "updated_at": "now()"}
@@ -210,7 +236,14 @@ def mark_request_unfilled(request_id: int) -> None:
 # --- SMS sending (Twilio) ---
 
 def send_sms(to: str, body: str) -> None:
-    """Send an SMS via Twilio."""
+    """Send an SMS via Twilio. In dev, redirect to KLARRA_DEV_PHONE (or block)."""
+    if DEV:
+        dev_to = os.environ.get("KLARRA_DEV_PHONE")
+        if not dev_to:
+            logger.warning("[DEV] blocked SMS to %s: %s", to, body[:60])
+            return
+        logger.warning("[DEV] redirect SMS %s -> %s", to, dev_to)
+        to = dev_to
     from twilio.rest import Client as TwilioClient
     tw = TwilioClient(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
     tw.messages.create(to=to, from_=os.environ["TWILIO_PHONE_NUMBER"], body=body)
@@ -231,6 +264,8 @@ FACILITY_NAME_TO_SLUG = {
 def upsert_nurse(bubble_id: str, first_name: str, last_name: str, phone: str,
                  role: str, address: str | None) -> int:
     """Insert or update a nurse keyed by their Bubble _id. Returns nurse id."""
+    if _blocked(f"upsert_nurse {bubble_id}"):
+        return -1
     client = get_client()
     existing = client.table("nurses").select("id").eq("bubble_user_id", bubble_id).limit(1).execute()
     payload = {
@@ -247,6 +282,8 @@ def upsert_nurse(bubble_id: str, first_name: str, last_name: str, phone: str,
 
 def set_nurse_approvals(nurse_id: int, slugs: list[str]) -> None:
     """Replace a nurse's facility approvals with the given slugs."""
+    if _blocked(f"set_nurse_approvals nurse={nurse_id}"):
+        return
     client = get_client()
     # clear existing
     client.table("nurse_facility_approvals").delete().eq("nurse_id", nurse_id).execute()
@@ -266,6 +303,8 @@ def nurse_id_by_bubble(bubble_id: str) -> int | None:
 
 def upsert_availability(nurse_id: int, date: str, shift_type: str) -> None:
     """Insert availability if not already present (unique on nurse+date+shift)."""
+    if _blocked(f"upsert_availability nurse={nurse_id} {date}"):
+        return
     client = get_client()
     existing = (client.table("availability").select("id")
                 .eq("nurse_id", nurse_id).eq("date", date)
@@ -299,6 +338,8 @@ def upsert_shift(bubble_shift_id: str, nurse_id: int, facility_id: int,
                  status: str) -> None:
     """Insert a worked shift if not already present (keyed by bubble shift id stored
     nowhere yet — so we dedupe on nurse+facility+date+start)."""
+    if _blocked(f"upsert_shift nurse={nurse_id} {date}"):
+        return
     client = get_client()
     existing = (client.table("shifts").select("id")
                 .eq("nurse_id", nurse_id).eq("facility_id", facility_id)
