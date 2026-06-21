@@ -215,3 +215,98 @@ def send_sms(to: str, body: str) -> None:
     tw = TwilioClient(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
     tw.messages.create(to=to, from_=os.environ["TWILIO_PHONE_NUMBER"], body=body)
     logger.info("Sent SMS to %s", to)
+
+# --- Bubble sync helpers ---
+
+FACILITY_NAME_TO_SLUG = {
+    "Mclean Lodge": "mclean_lodge",
+    "Williamstown Hostel": "williamstown",
+    "Ron Conn": "ron_con",
+    "Angus Martin": "angus_martin",
+    "Port Melbourne": "port_melbourne",
+    "Eunice Seddon": "eunice_seddon",
+}
+
+
+def upsert_nurse(bubble_id: str, first_name: str, last_name: str, phone: str,
+                 role: str, address: str | None) -> int:
+    """Insert or update a nurse keyed by their Bubble _id. Returns nurse id."""
+    client = get_client()
+    existing = client.table("nurses").select("id").eq("bubble_user_id", bubble_id).limit(1).execute()
+    payload = {
+        "first_name": first_name, "last_name": last_name, "phone": phone,
+        "role": role, "address": address, "bubble_user_id": bubble_id,
+    }
+    if existing.data:
+        nid = existing.data[0]["id"]
+        client.table("nurses").update(payload).eq("id", nid).execute()
+        return nid
+    resp = client.table("nurses").insert(payload).execute()
+    return resp.data[0]["id"]
+
+
+def set_nurse_approvals(nurse_id: int, slugs: list[str]) -> None:
+    """Replace a nurse's facility approvals with the given slugs."""
+    client = get_client()
+    # clear existing
+    client.table("nurse_facility_approvals").delete().eq("nurse_id", nurse_id).execute()
+    for slug in slugs:
+        fac = client.table("facilities").select("id").eq("slug", slug).limit(1).execute()
+        if fac.data:
+            client.table("nurse_facility_approvals").insert({
+                "nurse_id": nurse_id, "facility_id": fac.data[0]["id"],
+            }).execute()
+
+
+def nurse_id_by_bubble(bubble_id: str) -> int | None:
+    client = get_client()
+    r = client.table("nurses").select("id").eq("bubble_user_id", bubble_id).limit(1).execute()
+    return r.data[0]["id"] if r.data else None
+
+
+def upsert_availability(nurse_id: int, date: str, shift_type: str) -> None:
+    """Insert availability if not already present (unique on nurse+date+shift)."""
+    client = get_client()
+    existing = (client.table("availability").select("id")
+                .eq("nurse_id", nurse_id).eq("date", date)
+                .eq("shift_type", shift_type).limit(1).execute())
+    if existing.data:
+        return
+    client.table("availability").insert({
+        "nurse_id": nurse_id, "date": date, "shift_type": shift_type, "status": "pending",
+    }).execute()
+
+# --- Shift history sync ---
+
+LOCATION_ID_TO_SLUG = {
+    "1714536331477x218496158382794920": "mclean_lodge",
+    "1725011874725x652462711584855800": "williamstown",
+    "1736306652404x854626961349243600": "ron_con",
+    "1740520501450x744150619674484000": "angus_martin",
+    "1743477412156x587548361481612400": "port_melbourne",
+    "1764815902993x496620108715589700": "eunice_seddon",
+}
+
+
+def facility_id_by_slug(slug: str) -> int | None:
+    client = get_client()
+    r = client.table("facilities").select("id").eq("slug", slug).limit(1).execute()
+    return r.data[0]["id"] if r.data else None
+
+
+def upsert_shift(bubble_shift_id: str, nurse_id: int, facility_id: int,
+                 date: str, shift_type: str, start_time: str, end_time: str,
+                 status: str) -> None:
+    """Insert a worked shift if not already present (keyed by bubble shift id stored
+    nowhere yet — so we dedupe on nurse+facility+date+start)."""
+    client = get_client()
+    existing = (client.table("shifts").select("id")
+                .eq("nurse_id", nurse_id).eq("facility_id", facility_id)
+                .eq("date", date).eq("start_time", start_time).limit(1).execute())
+    if existing.data:
+        return
+    client.table("shifts").insert({
+        "nurse_id": nurse_id, "facility_id": facility_id, "date": date,
+        "shift_type": shift_type, "start_time": start_time, "end_time": end_time,
+        "status": status,
+    }).execute()
