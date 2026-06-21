@@ -239,6 +239,18 @@ def mark_request_unfilled(request_id: int) -> None:
     ).eq("id", request_id).execute()
     logger.info("Request %s unfilled — no nurse found", request_id)
 
+
+def mark_request_done_dev(request_id: int) -> None:
+    """Dev-only: mark a test request done so the orchestrator won't re-claim and
+    re-call. Bypasses the write guard ON PURPOSE — only runs when DEV is true."""
+    if not DEV:
+        return
+    client = get_client()
+    client.table("shift_requests").update(
+        {"status": "dev_done", "updated_at": "now()"}
+    ).eq("id", request_id).execute()
+    logger.info("[DEV] request %s marked dev_done", request_id)
+
 # --- SMS sending (Twilio) ---
 
 def send_sms(to: str, body: str) -> None:

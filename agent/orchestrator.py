@@ -73,8 +73,8 @@ def rank_pool(pool: list[dict], req: dict) -> list[dict]:
         return pool
 
 
-async def call_one_nurse(lk: api.LiveKitAPI, nurse: dict, req: dict) -> str:
-    """Dispatch the outbound agent + place the call. Returns the outcome string."""
+async def dispatch_nurse_call(lk: api.LiveKitAPI, nurse: dict, req: dict) -> None:
+    """Dispatch the outbound agent + place the call. Does NOT wait for an outcome."""
     room = f"nurse-call-{req['id']}-{nurse['nurse_id']}-{int(time.time())}"
     meta = {
         "kind": "nurse",
@@ -92,6 +92,11 @@ async def call_one_nurse(lk: api.LiveKitAPI, nurse: dict, req: dict) -> str:
             agent_name=AGENT_NAME, room=room, metadata=json.dumps(meta)
         )
     )
+
+
+async def call_one_nurse(lk: api.LiveKitAPI, nurse: dict, req: dict) -> str:
+    """Dispatch the outbound agent + place the call. Returns the outcome string."""
+    await dispatch_nurse_call(lk, nurse, req)
     # Wait for the call to resolve by polling call_events for this nurse.
     deadline = time.time() + 90
     last_seen = _latest_outcome(nurse["nurse_id"])
@@ -138,16 +143,20 @@ async def handle_request(lk: api.LiveKitAPI, req: dict):
     logger.info("Filling request %s: %s %s %s at %s",
                 req["id"], req["role"], req["shift_type"], req["date"], fac["name"])
 
-    # DEV: skip pool + ranking. Call only the dev phone, as the nurse, reciting the shift.
+    # DEV: skip pool + ranking. Place ONE call to the dev phone, don't poll for an
+    # outcome (call_events writes are blocked in dev), then mark the request done so
+    # it can't be re-claimed and call you again.
     if db.DEV:
         dev_phone = os.environ.get("KLARRA_DEV_PHONE")
         if not dev_phone:
             logger.warning("[DEV] no KLARRA_DEV_PHONE set; cannot place test call")
+            db.mark_request_done_dev(req["id"])
             return
         nurse = {"nurse_id": -1, "first_name": "there", "phone": dev_phone}
-        logger.info("[DEV] calling %s as test nurse", dev_phone)
-        outcome = await call_one_nurse(lk, nurse, req)
-        logger.info("[DEV] outcome -> %s", outcome)
+        logger.info("[DEV] calling %s as test nurse (one-shot)", dev_phone)
+        await dispatch_nurse_call(lk, nurse, req)
+        db.mark_request_done_dev(req["id"])
+        logger.info("[DEV] request %s marked done; will not re-call", req["id"])
         return
 
     pool = db.get_candidate_pool(fac["slug"], req["date"], req["shift_type"], req["role"])
