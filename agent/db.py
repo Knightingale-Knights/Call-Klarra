@@ -15,7 +15,7 @@ logger = logging.getLogger("knightingale-agent.db")
 
 # --- Safe mode ---
 # KLARRA_MODE=dev blocks all writes + SMS (logged, no-op). Reads always pass through.
-KLARRA_MODE = os.environ.get("KLARRA_MODE", "live").lower()
+KLARRA_MODE = os.environ.get("KLARRA_MODE", "live").strip().strip('"').strip("'").lower()
 DEV = KLARRA_MODE == "dev"
 
 
