@@ -32,6 +32,10 @@ from livekit.agents import (
     Agent, AgentSession, JobContext, WorkerOptions, cli, function_tool, get_job_context,
 )
 from livekit.plugins import openai
+try:
+    from openai.types.beta.realtime.session import TurnDetection
+except Exception:
+    TurnDetection = None
 
 import db
 
@@ -52,18 +56,13 @@ async def _hang_up():
 
 def nurse_instructions(d: dict) -> str:
     return f"""
-You are Klarra from Knightingale, calling a nurse to offer a shift. Warm, brief, Aussie.
-1. Open: "Hi {d['nurse_name']}, it's Klarra from Knightingale — have you got a quick sec?"
-2. Offer: a {d['role']} {d['shift_type'].lower()} shift on {d['date']} at {d['facility_name']}.
-3. Ask if they can take it.
-4. If YES: call record_result with "accepted". Then say your FULL closing out loud first —
-   thank them and tell them the shift will appear in the app, e.g. "Great, thanks
-   {d['nurse_name']} — you'll see the shift pop up in the app shortly. Have a good one!"
-   ONLY after speaking that whole line do you call hang_up.
-5. If NO: call record_result with "declined". Then say a full friendly sign-off out loud,
-   e.g. "No worries at all, thanks {d['nurse_name']}, have a good one!" ONLY after speaking
-   that whole line do you call hang_up.
-Never call hang_up before your closing sentence has been fully spoken. Don't cut yourself off.
+You are Klarra from Knightingale, calling a nurse to offer a shift. Warm, brief. Speak with an English (British) accent.
+Speak naturally and let your sentences finish.
+1. Open with the offer in one line: "Hi {d['nurse_name']}, I've got a {d['role']} {d['shift_type'].lower()} shift on {d['date']} at {d['facility_name']} — would you like it?"
+2. Wait for their answer.
+3. If YES: FIRST say your full closing out loud, e.g. "Great, thanks {d['nurse_name']} — you'll see the shift pop up in the app shortly. Have a good one!" THEN call record_result with "accepted". THEN call hang_up.
+4. If NO: FIRST say a full friendly sign-off out loud, e.g. "No worries at all, thanks {d['nurse_name']}, have a good one!" THEN call record_result with "declined". THEN call hang_up.
+Always speak your full line before any tool call. Never cut yourself off. Never hang up mid-sentence.
 """.strip()
 
 
@@ -139,7 +138,20 @@ async def entrypoint(ctx: JobContext):
         instructions = facility_instructions(meta)
         greet = "Greet the facility and give them the update."
 
-    session = AgentSession(llm=openai.realtime.RealtimeModel(voice="alloy"))
+    if TurnDetection is not None:
+        rt = openai.realtime.RealtimeModel(
+            voice="alloy",
+            speed=1.25,
+            turn_detection=TurnDetection(
+                type="semantic_vad",
+                eagerness="low",
+                create_response=True,
+                interrupt_response=True,
+            ),
+        )
+    else:
+        rt = openai.realtime.RealtimeModel(voice="alloy", speed=1.25)
+    session = AgentSession(llm=rt)
     await session.start(agent=Agent(instructions=instructions, tools=tools), room=ctx.room)
     await session.generate_reply(instructions=greet)
 
