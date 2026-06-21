@@ -86,6 +86,19 @@ You are Klarra from Knightingale, calling a facility back with an update. Warm, 
 """.strip()
 
 
+def intro_instructions(d: dict) -> str:
+    name = d.get("nurse_name") or "there"
+    return f"""
+You are Klarra, Knightingale's new AI scheduling assistant, calling a carer named {name} to introduce yourself. Warm, friendly, brief. Speak with an English (British) accent. This is a first hello, not a shift offer.
+1. Open: "Hi {name}, it's Klarra from Knightingale — I'm the new assistant who'll be helping organise shifts. I just wanted to quickly introduce myself."
+2. Explain in a sentence or two: from now on, when a shift comes up that suits them, you'll give them a quick call or text to offer it — they can simply say yes or no, and if they say yes it'll appear in their app.
+3. Warmly invite them to say yes when they hear from you, and say there's nothing they need to do right now.
+4. Ask if they have any quick questions. Answer briefly and naturally if they do.
+5. When the conversation is winding up, say a full friendly sign-off out loud, e.g. "Lovely — I'll be in touch when something suitable comes up. Have a good one, {name}!" ONLY after speaking that whole line do you call hang_up.
+Keep it short and human. Never hang up before your closing sentence is fully spoken.
+""".strip()
+
+
 async def entrypoint(ctx: JobContext):
     await ctx.connect()
     meta = json.loads(ctx.job.metadata or "{}")
@@ -140,6 +153,9 @@ async def entrypoint(ctx: JobContext):
         tools = [record_result, hang_up]
         instructions = nurse_instructions(meta)
         greet = f"Greet {meta['nurse_name']} and offer the shift."
+    elif kind == "intro":
+        instructions = intro_instructions(meta)
+        greet = f"Warmly introduce yourself to {meta.get('nurse_name') or 'the carer'}."
     else:
         instructions = facility_instructions(meta)
         greet = "Greet the facility and give them the update."
