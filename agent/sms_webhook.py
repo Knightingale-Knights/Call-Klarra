@@ -7,6 +7,7 @@ Run:  python agent/sms_webhook.py
 
 import os
 import json
+import random
 import logging
 
 import certifi
@@ -23,6 +24,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("knightingale-sms")
 
 app = Flask(__name__)
+
+ACK_REPLIES = [
+    "Absolutely, working on this — one moment.",
+    "Sure, we're on it.",
+    "Not a problem. Just a moment please.",
+    "Got it — on it now.",
+    "Of course, leave it with me a sec.",
+]
 
 
 def parse_request(text: str) -> dict | None:
@@ -64,8 +73,16 @@ def sms():
     logger.info("SMS from %s: %s", from_number, body)
 
     facility = db.facility_by_phone(from_number)
+    if not facility and db.DEV:
+        facility = db.first_facility()
+        logger.info("[DEV] unknown SMS sender -> stand-in facility %s",
+                    facility["slug"] if facility else None)
     if not facility:
         return twiml_reply("Sorry, this number isn't recognised. Please contact Knightingale directly.")
+
+    callback = from_number
+    if db.DEV:
+        callback = os.environ.get("KLARRA_DEV_PHONE", from_number)
 
     parsed = parse_request(body)
     if not parsed:
@@ -74,7 +91,7 @@ def sms():
     try:
         req_id = db.create_shift_request(
             facility_id=facility["id"],
-            callback_number=from_number,
+            callback_number=callback,
             date=parsed["date"],
             shift_type=parsed["shift_type"],
             role=parsed["role"],
@@ -84,10 +101,7 @@ def sms():
         logger.exception("Failed to log SMS request")
         return twiml_reply("Something went wrong logging your request. Please try calling instead.")
 
-    return twiml_reply(
-        f"Got it — a {parsed['role']} {parsed['shift_type'].lower()} shift on "
-        f"{parsed['date']} at {facility['name']}. Checking who's available; I'll text you back shortly."
-    )
+    return twiml_reply(random.choice(ACK_REPLIES))
 
 
 if __name__ == "__main__":
