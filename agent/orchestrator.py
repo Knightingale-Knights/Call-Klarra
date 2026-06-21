@@ -137,6 +137,19 @@ async def handle_request(lk: api.LiveKitAPI, req: dict):
     fac = req["facilities"]
     logger.info("Filling request %s: %s %s %s at %s",
                 req["id"], req["role"], req["shift_type"], req["date"], fac["name"])
+
+    # DEV: skip pool + ranking. Call only the dev phone, as the nurse, reciting the shift.
+    if db.DEV:
+        dev_phone = os.environ.get("KLARRA_DEV_PHONE")
+        if not dev_phone:
+            logger.warning("[DEV] no KLARRA_DEV_PHONE set; cannot place test call")
+            return
+        nurse = {"nurse_id": -1, "first_name": "there", "phone": dev_phone}
+        logger.info("[DEV] calling %s as test nurse", dev_phone)
+        outcome = await call_one_nurse(lk, nurse, req)
+        logger.info("[DEV] outcome -> %s", outcome)
+        return
+
     pool = db.get_candidate_pool(fac["slug"], req["date"], req["shift_type"], req["role"])
     if not pool:
         logger.info("No eligible nurses for request %s", req["id"])

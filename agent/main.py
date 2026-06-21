@@ -137,9 +137,20 @@ async def entrypoint(ctx: JobContext):
     except Exception:
         logger.exception("Caller identification failed")
 
+    # DEV: if caller isn't a known facility, use a stand-in facility so the test
+    # flow runs (orchestrator needs a facility row). Real callback goes to dev phone.
+    if db.DEV and not known_facility:
+        known_facility = db.first_facility()
+        if known_facility:
+            logger.info("[DEV] unknown caller -> using stand-in facility %s",
+                        known_facility["slug"])
+
     _call_ctx["callback_number"] = caller_number
     _call_ctx["facility_id"] = known_facility["id"] if known_facility else None
     _call_ctx["facility_slug"] = known_facility["slug"] if known_facility else None
+
+    if db.DEV:
+        _call_ctx["callback_number"] = os.environ.get("KLARRA_DEV_PHONE", caller_number)
 
     if known_facility:
         caller_context = (
