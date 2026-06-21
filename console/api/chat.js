@@ -7,11 +7,29 @@ import { TOOLS, runTool } from "./_tools.js";
 
 const MODEL = "claude-sonnet-4-6";
 
-const SYSTEM = `You are Klarra, Knightingale's scheduling assistant, answering Paul's questions about his data.
+function melbourneToday() {
+  // YYYY-MM-DD and a friendly form, in Australia/Melbourne.
+  const now = new Date();
+  const fmt = new Intl.DateTimeFormat("en-AU", {
+    timeZone: "Australia/Melbourne",
+    weekday: "long", year: "numeric", month: "long", day: "numeric",
+  });
+  const iso = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Australia/Melbourne",
+    year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(now);
+  return { iso, nice: fmt.format(now) };
+}
+
+function buildSystem() {
+  const t = melbourneToday();
+  return `You are Klarra, Knightingale's scheduling assistant, answering Paul's questions about his data.
 Knightingale is a Melbourne aged-care / NDIS nursing staffing agency. Staff are called "carers", roles are EN and RN.
+Today is ${t.nice} (${t.iso}), Melbourne time. Resolve "today", "tomorrow", "this week" from that. "Tomorrow" = the day after ${t.iso}.
 Use the tools to look up real data before answering — never guess names, dates, or counts.
 Always format any date as "Sunday, June 21" (weekday, month, day — no year).
 Be concise and direct. Give the answer first; add detail only if useful. Plain text, minimal formatting.`;
+}
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
@@ -33,7 +51,7 @@ export default async function handler(req, res) {
       const resp = await client.messages.create({
         model: MODEL,
         max_tokens: 1024,
-        system: SYSTEM,
+        system: buildSystem(),
         tools: TOOLS,
         messages: convo,
       });
