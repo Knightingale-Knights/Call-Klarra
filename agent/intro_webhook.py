@@ -33,6 +33,20 @@ app = Flask(__name__)
 AGENT_NAME = "knightingale-outbound"
 
 
+def normalise_au(phone: str) -> str:
+    """Normalise an Australian number to E.164 (+61...). Leaves already-+ numbers alone."""
+    p = "".join(phone.split())  # strip spaces
+    if p.startswith("+"):
+        return p
+    if p.startswith("0"):
+        return "+61" + p[1:]
+    if p.startswith("61"):
+        return "+" + p
+    if p.startswith("4") and len(p) == 9:  # bare mobile, no leading 0
+        return "+61" + p
+    return p
+
+
 def _dispatch_intro(name: str, phone: str):
     """Dispatch the outbound agent to place an intro call. Runs its own event loop."""
     async def go():
@@ -55,6 +69,7 @@ def intro():
     phone = (data.get("phone") or "").strip()
     if not phone:
         return jsonify({"error": "phone required"}), 400
+    phone = normalise_au(phone)
 
     # In dev, ring the dev phone instead of the real carer.
     if db.DEV:
