@@ -118,9 +118,13 @@ async def entrypoint(ctx: JobContext):
     async def record_result(outcome: str) -> str:
         """Record the nurse's answer. Args: outcome: 'accepted' or 'declined'."""
         result_store["value"] = outcome
-        db.record_call_event(meta["nurse_id"], outcome,
-                             facility_id=meta.get("facility_id"),
-                             shift_date=meta.get("date"))
+        if db.DEV:
+            if meta.get("request_id"):
+                db.set_dev_outcome(meta["request_id"], outcome)
+        else:
+            db.record_call_event(meta["nurse_id"], outcome,
+                                 facility_id=meta.get("facility_id"),
+                                 shift_date=meta.get("date"))
         return "Recorded."
 
     @function_tool

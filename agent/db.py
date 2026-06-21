@@ -251,6 +251,31 @@ def mark_request_done_dev(request_id: int) -> None:
     ).eq("id", request_id).execute()
     logger.info("[DEV] request %s marked dev_done", request_id)
 
+
+def set_dev_outcome(request_id: int, outcome: str) -> None:
+    """Dev-only: store the nurse's outcome on the request row so the orchestrator
+    can read it back and reply accurately. Bypasses the guard on purpose."""
+    if not DEV:
+        return
+    client = get_client()
+    client.table("shift_requests").update(
+        {"status": f"dev_{outcome}", "updated_at": "now()"}
+    ).eq("id", request_id).execute()
+    logger.info("[DEV] request %s outcome -> %s", request_id, outcome)
+
+
+def get_dev_outcome(request_id: int) -> str | None:
+    """Dev-only: read back the stored outcome (accepted/declined) if present."""
+    client = get_client()
+    r = (client.table("shift_requests").select("status")
+         .eq("id", request_id).limit(1).execute())
+    if not r.data:
+        return None
+    st = r.data[0]["status"]
+    if st in ("dev_accepted", "dev_declined"):
+        return st.removeprefix("dev_")
+    return None
+
 # --- SMS sending (Twilio) ---
 
 def send_sms(to: str, body: str) -> None:

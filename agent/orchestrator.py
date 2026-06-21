@@ -81,6 +81,7 @@ async def dispatch_nurse_call(lk: api.LiveKitAPI, nurse: dict, req: dict) -> Non
         "phone": nurse["phone"],
         "nurse_id": nurse["nurse_id"],
         "nurse_name": nurse["first_name"],
+        "request_id": req["id"],
         "facility_id": req["facility_id"],
         "facility_name": req["facilities"]["name"],
         "date": req["date"],
@@ -155,8 +156,21 @@ async def handle_request(lk: api.LiveKitAPI, req: dict):
         nurse = {"nurse_id": -1, "first_name": "there", "phone": dev_phone}
         logger.info("[DEV] calling %s as test nurse (one-shot)", dev_phone)
         await dispatch_nurse_call(lk, nurse, req)
+        # Wait for the nurse outcome (stored on the request row in dev).
+        outcome = None
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            await asyncio.sleep(3)
+            outcome = db.get_dev_outcome(req["id"])
+            if outcome:
+                break
+        logger.info("[DEV] outcome -> %s", outcome)
+        # Reply as the facility, accurately, via the same channel it came in on.
+        filled = outcome == "accepted"
+        await notify_facility(lk, req, filled=filled,
+                              nurse_name="the nurse" if filled else None)
         db.mark_request_done_dev(req["id"])
-        logger.info("[DEV] request %s marked done; will not re-call", req["id"])
+        logger.info("[DEV] request %s done", req["id"])
         return
 
     pool = db.get_candidate_pool(fac["slug"], req["date"], req["shift_type"], req["role"])
