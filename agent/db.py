@@ -27,6 +27,16 @@ def _blocked(action: str) -> bool:
     return False
 
 
+def pretty_date(d: str) -> str:
+    """Format 'YYYY-MM-DD' as 'Sunday, June 21'. Returns input unchanged on failure."""
+    from datetime import datetime
+    try:
+        dt = datetime.strptime(str(d)[:10], "%Y-%m-%d")
+        return dt.strftime("%A, %B ") + str(dt.day)
+    except Exception:
+        return str(d)
+
+
 _client: Client | None = None
 
 

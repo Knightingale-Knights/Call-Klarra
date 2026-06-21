@@ -96,7 +96,8 @@ async def submit_shift_request(date: str, shift_type: str, role: str) -> str:
         return f"Something went wrong logging the request: {e}"
     callback_minutes = random.randint(5, 10)
     return (
-        f"Logged request #{req_id}. Tell the caller you'll call back in about "
+        f"Logged request #{req_id}. When you read the date back, say it exactly as "
+        f"'{db.pretty_date(date)}'. Tell the caller you'll call back in about "
         f"{callback_minutes} minutes, read the shift details back, then call end_call."
     )
 

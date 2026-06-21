@@ -55,10 +55,11 @@ async def _hang_up():
 
 
 def nurse_instructions(d: dict) -> str:
+    nice_date = db.pretty_date(d['date'])
     return f"""
 You are Klarra from Knightingale, calling a nurse to offer a shift. Warm, brief. Speak with an English (British) accent.
 Speak naturally and let your sentences finish.
-1. Open with the offer in one line: "Hi {d['nurse_name']}, I've got a {d['role']} {d['shift_type'].lower()} shift on {d['date']} at {d['facility_name']} — would you like it?"
+1. Open with the offer in one line: "Hi {d['nurse_name']}, I've got a {d['role']} {d['shift_type'].lower()} shift on {nice_date} at {d['facility_name']} — would you like it?"
 2. Wait for their answer.
 3. If YES: FIRST say your full closing out loud, e.g. "Great, thanks {d['nurse_name']} — you'll see the shift pop up in the app shortly. Have a good one!" THEN call record_result with "accepted". THEN call hang_up.
 4. If NO: FIRST say a full friendly sign-off out loud, e.g. "No worries at all, thanks {d['nurse_name']}, have a good one!" THEN call record_result with "declined". THEN call hang_up.
@@ -67,12 +68,13 @@ Always speak your full line before any tool call. Never cut yourself off. Never 
 
 
 def facility_instructions(d: dict) -> str:
+    nice_date = db.pretty_date(d['date'])
     if d.get("filled"):
         body = (f"Good news — you've got {d['nurse_name']} covering the "
-                f"{d['shift_type'].lower()} shift on {d['date']}.")
+                f"{d['shift_type'].lower()} shift on {nice_date}.")
     else:
         body = (f"Unfortunately I couldn't find anyone available for the "
-                f"{d['shift_type'].lower()} shift on {d['date']} just yet. "
+                f"{d['shift_type'].lower()} shift on {nice_date} just yet. "
                 f"I'll keep trying and let you know.")
     return f"""
 You are Klarra from Knightingale, calling a facility back with an update. Warm, brief.

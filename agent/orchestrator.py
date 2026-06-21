@@ -198,10 +198,10 @@ async def notify_facility(lk, req, filled, nurse_name):
     if req.get("source") == "sms":
         if filled:
             body = (f"Good news — {nurse_name} is covering the {req['shift_type'].lower()} "
-                    f"shift on {req['date']}.")
+                    f"shift on {db.pretty_date(req['date'])}.")
         else:
             body = (f"Sorry, no one was available for the {req['shift_type'].lower()} shift "
-                    f"on {req['date']} yet. We'll keep trying.")
+                    f"on {db.pretty_date(req['date'])} yet. We'll keep trying.")
         try:
             db.send_sms(req["facility_callback_number"], body)
         except Exception:
