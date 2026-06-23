@@ -66,11 +66,46 @@ def twiml_reply(text: str) -> Response:
     return Response(body, mimetype="text/xml")
 
 
+def _notify_facility_sms(req: dict, filled: bool, nurse_name: str | None):
+    """Text the facility the result of an approved shift."""
+    to = req.get("facility_callback_number")
+    if not to:
+        return
+    if filled:
+        body = (f"Good news — {nurse_name} is covering the "
+                f"{req['shift_type'].lower()} shift on {db.pretty_date(req['date'])}.")
+    else:
+        body = (f"Sorry, no one was available for the {req['shift_type'].lower()} "
+                f"shift on {db.pretty_date(req['date'])} yet. We'll keep trying.")
+    try:
+        db.send_sms(to, body)
+    except Exception:
+        logger.exception("Failed to send facility result SMS")
+
+
 @app.route("/sms", methods=["POST"])
 def sms():
     from_number = request.form.get("From")
     body = request.form.get("Body", "")
     logger.info("SMS from %s: %s", from_number, body)
+
+    # --- Approval gate: is this Paul answering a parked shift? ---
+    admin = os.environ.get("KLARRA_DEV_PHONE")
+    word = body.strip().lower()
+    if admin and from_number == admin and word in ("yes", "y", "no", "n"):
+        parked = db.get_awaiting_approval()
+        if parked:
+            approved = word in ("yes", "y")
+            db.resolve_approval(parked["id"], approved,
+                                parked.get("approval_nurse_id"))
+            if approved:
+                # Tell the facility now (same channel the request came in on).
+                _notify_facility_sms(parked, filled=True,
+                                     nurse_name=parked.get("approval_nurse_name"))
+                return twiml_reply("Confirmed. The facility has been notified.")
+            else:
+                return twiml_reply("Cancelled. The shift has been closed; the facility wasn't notified.")
+        # No parked request — fall through to normal handling.
 
     facility = db.facility_by_phone(from_number)
     if not facility and db.DEV:

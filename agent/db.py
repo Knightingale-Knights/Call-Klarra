@@ -286,6 +286,46 @@ def get_dev_outcome(request_id: int) -> str | None:
         return st.removeprefix("dev_")
     return None
 
+
+def set_awaiting_approval(request_id: int, nurse_id: int, nurse_name: str,
+                          reason: str) -> None:
+    """Park a request pending Paul's YES/NO. Stores the chosen nurse + reason.
+    Allowed in dev too (it's how the gate is tested)."""
+    client = get_client()
+    client.table("shift_requests").update({
+        "status": "awaiting_approval",
+        "approval_nurse_id": nurse_id,
+        "approval_nurse_name": nurse_name,
+        "approval_reason": reason,
+        "updated_at": "now()",
+    }).eq("id", request_id).execute()
+    logger.info("Request %s awaiting approval (nurse %s)", request_id, nurse_name)
+
+
+def get_awaiting_approval() -> dict | None:
+    """Return the most recent request parked awaiting approval, with facility join."""
+    client = get_client()
+    r = (client.table("shift_requests")
+         .select("*, facilities(slug, name, complexity)")
+         .eq("status", "awaiting_approval")
+         .order("updated_at", desc=True)
+         .limit(1)
+         .execute())
+    return r.data[0] if r.data else None
+
+
+def resolve_approval(request_id: int, approved: bool, nurse_id: int | None) -> None:
+    """Apply Paul's decision: approved -> filled, else unfilled."""
+    client = get_client()
+    if approved:
+        payload = {"status": "filled", "filled_by_nurse_id": nurse_id,
+                   "updated_at": "now()"}
+    else:
+        payload = {"status": "unfilled", "updated_at": "now()"}
+    client.table("shift_requests").update(payload).eq("id", request_id).execute()
+    logger.info("Request %s approval resolved -> %s", request_id,
+                "filled" if approved else "unfilled")
+
 # --- SMS sending (Twilio) ---
 
 def send_sms(to: str, body: str) -> None:

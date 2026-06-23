@@ -41,15 +41,17 @@ POLL_SECONDS = 5
 
 
 def rank_pool(pool: list[dict], req: dict) -> list[dict]:
-    """Ask the model to order the eligible pool per the decision skill. Returns the
-    pool re-ordered best-first. Falls back to original order on any error."""
+    """Ask the model to order the eligible pool per the decision skill. Returns
+    (ranked_pool, reason_for_top_pick). Falls back to original order on any error."""
     client = openai_sdk.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
     prompt = (
         f"{SKILL}\n\n---\nYou are ranking nurses for this shift: "
         f"{req['role']} {req['shift_type']} on {req['date']} at "
         f"{req['facilities']['name']} (complexity: {req['facilities']['complexity']}).\n"
         f"Here is the eligible pool as JSON:\n{json.dumps(pool)}\n\n"
-        f"Return ONLY a JSON array of nurse_id values, best first, no other text."
+        f'Return ONLY JSON: {{"order":[nurse_id,...best first],'
+        f'"reason":"one short sentence on why the top nurse was chosen, citing the '
+        f'specific factors from the policy"}}. No other text.'
     )
     try:
         resp = client.chat.completions.create(
@@ -59,18 +61,19 @@ def rank_pool(pool: list[dict], req: dict) -> list[dict]:
         )
         text = resp.choices[0].message.content.strip()
         text = text.replace("```json", "").replace("```", "").strip()
-        order = json.loads(text)
+        parsed = json.loads(text)
+        order = parsed.get("order", [])
+        reason = parsed.get("reason", "")
         by_id = {n["nurse_id"]: n for n in pool}
         ranked = [by_id[i] for i in order if i in by_id]
-        # append any the model missed
         for n in pool:
             if n not in ranked:
                 ranked.append(n)
         logger.info("Ranked order: %s", [n["first_name"] for n in ranked])
-        return ranked
+        return ranked, reason
     except Exception:
         logger.exception("Ranking failed; using pool order")
-        return pool
+        return pool, ""
 
 
 async def dispatch_nurse_call(lk: api.LiveKitAPI, nurse: dict, req: dict) -> None:
@@ -165,12 +168,16 @@ async def handle_request(lk: api.LiveKitAPI, req: dict):
             if outcome:
                 break
         logger.info("[DEV] outcome -> %s", outcome)
-        # Reply as the facility, accurately, via the same channel it came in on.
-        filled = outcome == "accepted"
-        await notify_facility(lk, req, filled=filled,
-                              nurse_name="the nurse" if filled else None)
-        db.mark_request_done_dev(req["id"])
-        logger.info("[DEV] request %s done", req["id"])
+        if outcome == "accepted":
+            nurse_obj = {"nurse_id": -1, "first_name": "the nurse"}
+            send_approval_brief(req, nurse_obj, "DEV test — ranking skipped")
+            db.set_awaiting_approval(req["id"], -1, "the nurse",
+                                     "DEV test — ranking skipped")
+            logger.info("[DEV] request %s awaiting approval", req["id"])
+        else:
+            # declined/no_answer in dev — reply as facility, end.
+            await notify_facility(lk, req, filled=False, nurse_name=None)
+            db.mark_request_done_dev(req["id"])
         return
 
     pool = db.get_candidate_pool(fac["slug"], req["date"], req["shift_type"], req["role"])
@@ -180,17 +187,39 @@ async def handle_request(lk: api.LiveKitAPI, req: dict):
         await call_facility(lk, req, filled=False, nurse_name=None)
         return
 
-    for nurse in rank_pool(pool, req):
+    ranked, reason = rank_pool(pool, req)
+    for nurse in ranked:
         logger.info("Calling %s for request %s", nurse["first_name"], req["id"])
         outcome = await call_one_nurse(lk, nurse, req)
         logger.info("%s -> %s", nurse["first_name"], outcome)
         if outcome == "accepted":
-            db.mark_request_filled(req["id"], nurse["nurse_id"])
-            await notify_facility(lk, req, filled=True, nurse_name=nurse["first_name"])
+            # Don't tell the facility yet — send Paul an approval brief and pause.
+            send_approval_brief(req, nurse, reason)
+            db.set_awaiting_approval(req["id"], nurse["nurse_id"],
+                                     nurse["first_name"], reason)
+            logger.info("Request %s awaiting Paul's approval", req["id"])
             return
 
     db.mark_request_unfilled(req["id"])
     await notify_facility(lk, req, filled=False, nurse_name=None)
+
+
+def send_approval_brief(req, nurse, reason):
+    """Text Paul the brief and ask for YES/NO before the facility is told."""
+    admin = os.environ.get("KLARRA_DEV_PHONE")
+    if not admin:
+        logger.warning("No KLARRA_DEV_PHONE set; cannot send approval brief")
+        return
+    body = (
+        f"Shift approval needed.\n"
+        f"Facility: {req['facilities']['name']}\n"
+        f"Date: {db.pretty_date(req['date'])}\n"
+        f"Shift: {req['shift_type']}\n"
+        f"Nurse: {nurse['first_name']}\n"
+        f"Why: {reason or 'top-ranked per policy'}\n\n"
+        f"Reply YES to confirm, NO to cancel."
+    )
+    db.send_sms(admin, body)
 
 
 async def notify_facility(lk, req, filled, nurse_name):
