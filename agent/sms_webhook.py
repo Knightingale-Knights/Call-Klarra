@@ -89,24 +89,6 @@ def sms():
     body = request.form.get("Body", "")
     logger.info("SMS from %s: %s", from_number, body)
 
-    # --- Approval gate: is this Paul answering a parked shift? ---
-    admin = os.environ.get("KLARRA_DEV_PHONE")
-    word = body.strip().lower()
-    if admin and from_number == admin and word in ("yes", "y", "no", "n"):
-        parked = db.get_awaiting_approval()
-        if parked:
-            approved = word in ("yes", "y")
-            db.resolve_approval(parked["id"], approved,
-                                parked.get("approval_nurse_id"))
-            if approved:
-                # Tell the facility now (same channel the request came in on).
-                _notify_facility_sms(parked, filled=True,
-                                     nurse_name=parked.get("approval_nurse_name"))
-                return twiml_reply("Confirmed. The facility has been notified.")
-            else:
-                return twiml_reply("Cancelled. The shift has been closed; the facility wasn't notified.")
-        # No parked request — fall through to normal handling.
-
     facility = db.facility_by_phone(from_number)
     if not facility and db.DEV:
         facility = db.first_facility()

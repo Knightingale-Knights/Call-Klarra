@@ -142,66 +142,86 @@ async def call_facility(lk: api.LiveKitAPI, req: dict, filled: bool, nurse_name:
     )
 
 
+AFTERHOURS_START = 21  # 9pm
+AFTERHOURS_END = 5     # 5am
+CALLBACK_DELAY_SECONDS = 180  # 3 minutes from when the shift was logged
+
+
+def is_afterhours() -> bool:
+    """True if within the afterhours window (9pm–5am Melbourne), forced for testing,
+    or running in dev (so the afterhours flow can always be tested)."""
+    if db.DEV or os.environ.get("KLARRA_FORCE_AFTERHOURS") == "1":
+        return True
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    h = datetime.now(ZoneInfo("Australia/Melbourne")).hour
+    return h >= AFTERHOURS_START or h < AFTERHOURS_END
+
+
+def _logged_at(req: dict) -> float:
+    """Epoch seconds when the request was created, for the 3-min timer."""
+    from datetime import datetime
+    raw = req.get("created_at")
+    if not raw:
+        return time.time()
+    try:
+        s = str(raw).replace("Z", "+00:00")
+        return datetime.fromisoformat(s).timestamp()
+    except Exception:
+        return time.time()
+
+
 async def handle_request(lk: api.LiveKitAPI, req: dict):
     fac = req["facilities"]
     logger.info("Filling request %s: %s %s %s at %s",
                 req["id"], req["role"], req["shift_type"], req["date"], fac["name"])
 
-    # DEV: skip pool + ranking. Place ONE call to the dev phone, don't poll for an
-    # outcome (call_events writes are blocked in dev), then mark the request done so
-    # it can't be re-claimed and call you again.
-    if db.DEV:
-        dev_phone = os.environ.get("KLARRA_DEV_PHONE")
-        if not dev_phone:
-            logger.warning("[DEV] no KLARRA_DEV_PHONE set; cannot place test call")
-            db.mark_request_done_dev(req["id"])
-            return
-        nurse = {"nurse_id": -1, "first_name": "there", "phone": dev_phone}
-        logger.info("[DEV] calling %s as test nurse (one-shot)", dev_phone)
-        await dispatch_nurse_call(lk, nurse, req)
-        # Wait for the nurse outcome (stored on the request row in dev).
-        outcome = None
-        deadline = time.time() + 120
-        while time.time() < deadline:
-            await asyncio.sleep(3)
-            outcome = db.get_dev_outcome(req["id"])
-            if outcome:
-                break
-        logger.info("[DEV] outcome -> %s", outcome)
-        if outcome == "accepted":
-            nurse_obj = {"nurse_id": -1, "first_name": "the nurse"}
-            send_approval_brief(req, nurse_obj, "DEV test — ranking skipped")
-            db.set_awaiting_approval(req["id"], -1, "the nurse",
-                                     "DEV test — ranking skipped")
-            logger.info("[DEV] request %s awaiting approval", req["id"])
-        else:
-            # declined/no_answer in dev — reply as facility, end.
-            await notify_facility(lk, req, filled=False, nurse_name=None)
-            db.mark_request_done_dev(req["id"])
-        return
-
     pool = db.get_candidate_pool(fac["slug"], req["date"], req["shift_type"], req["role"])
     if not pool:
         logger.info("No eligible nurses for request %s", req["id"])
         db.mark_request_unfilled(req["id"])
-        await call_facility(lk, req, filled=False, nurse_name=None)
+        await notify_facility(lk, req, filled=False, nurse_name=None)
+        if db.DEV:
+            db.mark_request_done_dev(req["id"])
         return
 
     ranked, reason = rank_pool(pool, req)
-    for nurse in ranked:
-        logger.info("Calling %s for request %s", nurse["first_name"], req["id"])
-        outcome = await call_one_nurse(lk, nurse, req)
-        logger.info("%s -> %s", nurse["first_name"], outcome)
-        if outcome == "accepted":
-            # Don't tell the facility yet — send Paul an approval brief and pause.
-            send_approval_brief(req, nurse, reason)
-            db.set_awaiting_approval(req["id"], nurse["nurse_id"],
-                                     nurse["first_name"], reason)
-            logger.info("Request %s awaiting Paul's approval", req["id"])
-            return
+    top = ranked[0]
+    logger.info("Selected %s for request %s (%s)", top["first_name"], req["id"], reason)
 
-    db.mark_request_unfilled(req["id"])
-    await notify_facility(lk, req, filled=False, nurse_name=None)
+    # Afterhours: wait until 3 min have passed since the shift was logged, then
+    # call the facility back with the chosen nurse. No nurse call — availability = assigned.
+    if is_afterhours():
+        elapsed = time.time() - _logged_at(req)
+        remaining = CALLBACK_DELAY_SECONDS - elapsed
+        if remaining > 0:
+            logger.info("Afterhours: holding %ds before facility callback", int(remaining))
+            await asyncio.sleep(remaining)
+
+    db.mark_request_filled(req["id"], top["nurse_id"])
+    await notify_facility(lk, req, filled=True, nurse_name=top["first_name"])
+    send_fyi(req, top, reason)
+    if db.DEV:
+        db.mark_request_done_dev(req["id"])
+
+
+def send_fyi(req, nurse, reason):
+    """Text Paul an FYI after the facility has been told. No action needed."""
+    admin = os.environ.get("KLARRA_DEV_PHONE")
+    if not admin:
+        return
+    body = (
+        f"Shift filled.\n"
+        f"Facility: {req['facilities']['name']}\n"
+        f"Date: {db.pretty_date(req['date'])}\n"
+        f"Shift: {req['shift_type']}\n"
+        f"Nurse: {nurse['first_name']}\n"
+        f"Why: {reason or 'top-ranked per policy'}"
+    )
+    try:
+        db.send_sms(admin, body)
+    except Exception:
+        logger.exception("Failed to send FYI SMS")
 
 
 def send_approval_brief(req, nurse, reason):
