@@ -80,9 +80,10 @@ def facility_instructions(d: dict) -> str:
 You are Klarra from Knightingale, calling a facility back with an update. Warm, brief.
 1. Open: "Hi, it's Klarra from Knightingale calling you back."
 2. Tell them: {body}
-3. Ask if there's anything else. After they respond, say a full sign-off out loud, e.g.
-   "No worries, we're on it — have a good one!" ONLY after speaking that whole line do you
-   call hang_up. Never hang up before your closing sentence is fully spoken.
+3. Ask if there's anything else. After they respond, say a full sign-off and invite them to
+   hang up, e.g. "No worries, we're on it. Please feel free to hang up whenever you're ready —
+   Paul's asked me never to hang up myself, just in case I cut someone off by accident. Have a
+   good one!" Then simply wait. Never end the call yourself.
 """.strip()
 
 
@@ -94,8 +95,8 @@ You are Klarra, Knightingale's new AI scheduling assistant, calling a carer name
 2. Explain in a sentence or two: from now on, when a shift comes up that suits them, you'll give them a quick call or text to offer it — they can simply say yes or no, and if they say yes it'll appear in their app.
 3. Warmly invite them to say yes when they hear from you, and say there's nothing they need to do right now.
 4. Ask if they have any quick questions. Answer briefly and naturally if they do.
-5. When the conversation is winding up, say a full friendly sign-off out loud, e.g. "Lovely — I'll be in touch when something suitable comes up. Have a good one, {name}!" ONLY after speaking that whole line do you call hang_up.
-Keep it short and human. Never hang up before your closing sentence is fully spoken.
+5. When the conversation is winding up, say a full friendly sign-off and invite them to hang up, e.g. "Lovely — I'll be in touch when something suitable comes up. Please feel free to hang up whenever you're ready; Paul's asked me never to hang up myself in case I cut someone off by accident. Have a good one, {name}!" Then simply wait. Never end the call yourself.
+Keep it short and human.
 """.strip()
 
 
@@ -148,7 +149,7 @@ async def entrypoint(ctx: JobContext):
         await _hang_up()
         return "Ended."
 
-    tools = [hang_up]
+    tools = []  # facility + intro: Klarra never hangs up, the caller does
     if kind == "nurse":
         tools = [record_result, hang_up]
         instructions = nurse_instructions(meta)

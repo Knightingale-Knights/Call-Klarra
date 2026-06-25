@@ -52,15 +52,15 @@ Your ONLY job on this call is to take the request, not to fill it. Specifically:
    record AIN — it is always EN.
 4. Once you have date, shift type, and role, call submit_shift_request to log it. The tool
    gives you a callback time in minutes — use that exact number.
-5. THEN, before ending, say the full closing in ONE turn: read the details back AND give
-   the callback time AND sign off. For example: "Righto — that's an EN for a morning shift
-   on the 20th at Port Melbourne. I'll check who's available and call you back in about 7
-   minutes. No worries, we're on it." Always include the callback minutes in this closing.
-6. ONLY AFTER you have spoken that entire closing line do you call end_call. Never call
-   end_call before the callback time has been said out loud. Do not hang up mid-sentence.
+5. THEN say the full closing in ONE turn: read the details back AND give the callback time
+   AND invite them to hang up. For example: "Righto — that's an EN for a morning shift on
+   Friday, June 26 at Port Melbourne. I'll check who's available and call you back in about 7
+   minutes. Please feel free to hang up now — Paul's asked me never to hang up myself, just in
+   case I ever cut someone off by accident. Have a good one!" Always include the callback minutes.
+6. Never end the call yourself. After your closing, simply wait. The caller will hang up.
 
-Do NOT look up nurses, name nurses, or promise a specific person. You are taking the
-order; the calling-around happens after you hang up.
+Do NOT look up nurses, name nurses, or promise a specific person. You are taking the order;
+the calling-around happens afterwards.
 """.strip()
 
 
@@ -98,26 +98,8 @@ async def submit_shift_request(date: str, shift_type: str, role: str) -> str:
     return (
         f"Logged request #{req_id}. When you read the date back, say it exactly as "
         f"'{db.pretty_date(date)}'. Tell the caller you'll call back in about "
-        f"{callback_minutes} minutes, read the shift details back, then call end_call."
+        f"{callback_minutes} minutes, read the shift details back, then invite them to hang up."
     )
-
-
-@function_tool
-async def end_call() -> str:
-    """
-    Hang up the call. Only call this AFTER you have spoken the full closing line including
-    the callback time and sign-off. Ends the call cleanly.
-    """
-    import asyncio
-    try:
-        # Give any final spoken words a moment to play out before the line drops.
-        await asyncio.sleep(4)
-        ctx = get_job_context()
-        await ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.room.name))
-    except Exception as e:
-        logger.exception("end_call failed")
-        return f"Couldn't end the call: {e}"
-    return "Call ended."
 
 
 async def entrypoint(ctx: JobContext):
@@ -172,10 +154,19 @@ async def entrypoint(ctx: JobContext):
         llm=openai.realtime.RealtimeModel(voice="alloy"),
     )
 
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    mel = datetime.now(ZoneInfo("Australia/Melbourne"))
+    today_line = (
+        f"\n\nToday is {mel.strftime('%A, %B ')}{mel.day} ({mel.strftime('%Y-%m-%d')}), "
+        f"Melbourne time. Resolve 'today', 'tomorrow', 'this Friday' etc. from that. "
+        f"'Tomorrow' is the day after today."
+    )
+
     await session.start(
         agent=Agent(
-            instructions=INSTRUCTIONS + "\n\n--- THIS CALL ---\n" + caller_context,
-            tools=[submit_shift_request, end_call],
+            instructions=INSTRUCTIONS + today_line + "\n\n--- THIS CALL ---\n" + caller_context,
+            tools=[submit_shift_request],
         ),
         room=ctx.room,
     )
