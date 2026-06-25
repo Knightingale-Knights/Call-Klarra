@@ -89,6 +89,98 @@ def _notify_facility_sms(req: dict, filled: bool, nurse_name: str | None):
         logger.exception("Failed to send facility result SMS")
 
 
+def _afterhours_now() -> bool:
+    """True if 9pm–5am Melbourne, or dev (so it's always testable)."""
+    if db.DEV:
+        return True
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    h = datetime.now(ZoneInfo("Australia/Melbourne")).hour
+    return h >= 21 or h < 5
+
+
+ADMIN_PHONE = "+61426512584"
+
+AFTERHOURS_INTRO = (
+    "In order for Paul and Vidhu to do their best for you during the day, they need to "
+    "sleep at night. So they've entrusted after-hours messages to me, their AI assistant. "
+    "My name is Klarra. If you let me know what's going on, I'll pass it on to Vidhu and Paul."
+)
+
+AFTERHOURS_SYSTEM = (
+    "You are Klarra, Knightingale's friendly after-hours AI assistant, texting with someone "
+    "whose number isn't a recognised facility. Knightingale is a Melbourne aged-care/NDIS "
+    "nursing staffing agency; Paul and Vidhu run it. Be warm, natural, easy-going, concise — "
+    "this is SMS. Gather what's going on: who they are, the issue, which facility/person, and "
+    "anything Paul and Vidhu need to act in the morning. Ask one thing at a time. When you have "
+    "enough, sign off warmly, e.g. that Paul and Vidhu start around 5am and will get back to "
+    "them then. When you have gathered enough and are signing off, end your message with the "
+    "exact token [DONE] on its own at the very end (the user won't see it)."
+)
+
+
+def handle_afterhours_chat(phone: str, body: str) -> Response:
+    """Run a multi-turn SMS conversation with an unknown afterhours caller."""
+    thread = db.get_afterhours_thread(phone)
+    messages = (thread or {}).get("messages", []) if thread else []
+
+    # Brand-new thread: send the intro, seed history, wait for their reply.
+    if not messages:
+        messages = [{"role": "assistant", "content": AFTERHOURS_INTRO}]
+        db.save_afterhours_thread(phone, messages)
+        return twiml_reply(AFTERHOURS_INTRO)
+
+    # If a prior thread was already wrapped up, start fresh on a new message.
+    if thread and thread.get("done"):
+        messages = [{"role": "assistant", "content": AFTERHOURS_INTRO}]
+        db.save_afterhours_thread(phone, messages)
+        return twiml_reply(AFTERHOURS_INTRO)
+
+    messages.append({"role": "user", "content": body})
+
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    resp = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=400,
+        system=AFTERHOURS_SYSTEM,
+        messages=messages,
+    )
+    reply = "".join(b.text for b in resp.content if b.type == "text").strip()
+
+    done = "[DONE]" in reply
+    reply = reply.replace("[DONE]", "").strip()
+    messages.append({"role": "assistant", "content": reply})
+    db.save_afterhours_thread(phone, messages, done=done)
+
+    if done:
+        _summarise_to_admin(phone, messages)
+
+    return twiml_reply(reply)
+
+
+def _summarise_to_admin(phone: str, messages: list):
+    """Text Paul a summary of the after-hours conversation."""
+    try:
+        client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+        transcript = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
+        resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=300,
+            messages=[{"role": "user", "content": (
+                "Summarise this after-hours enquiry for Paul in 2-4 short lines: who texted "
+                "(number below), what they need, and anything urgent. Plain text.\n\n"
+                f"Number: {phone}\n\n{transcript}"
+            )}],
+        )
+        summary = "".join(b.text for b in resp.content if b.type == "text").strip()
+        db.send_sms(ADMIN_PHONE, f"After-hours enquiry ({phone}):\n{summary}")
+        t = db.get_afterhours_thread(phone)
+        if t:
+            db.save_afterhours_thread(phone, t["messages"], done=True, summarised=True)
+    except Exception:
+        logger.exception("Failed to summarise after-hours chat")
+
+
 @app.route("/sms", methods=["POST"])
 def sms():
     from_number = request.form.get("From")
@@ -102,11 +194,18 @@ def sms():
         ))
 
     facility = db.facility_by_phone(from_number)
-    if not facility and db.DEV:
+
+    # Dev: only treat the sender as a stand-in facility if explicitly testing the
+    # shift flow. Otherwise an unknown number falls through to the afterhours chat.
+    if not facility and db.DEV and os.environ.get("KLARRA_DEV_AS_FACILITY") == "1":
         facility = db.first_facility()
         logger.info("[DEV] unknown SMS sender -> stand-in facility %s",
                     facility["slug"] if facility else None)
+
     if not facility:
+        # Unknown number. Afterhours -> have a conversation; daytime -> brief reply.
+        if _afterhours_now():
+            return handle_afterhours_chat(from_number, body)
         return twiml_reply("Sorry, this number isn't recognised. Please contact Knightingale directly.")
 
     callback = from_number

@@ -178,6 +178,27 @@ def first_facility() -> dict | None:
     return resp.data[0] if resp.data else None
 
 
+# --- Afterhours unknown-caller threads ---
+
+def get_afterhours_thread(phone: str) -> dict | None:
+    client = get_client()
+    r = client.table("afterhours_threads").select("*").eq("phone", phone).limit(1).execute()
+    return r.data[0] if r.data else None
+
+
+def save_afterhours_thread(phone: str, messages: list, done: bool = False,
+                           summarised: bool = False) -> None:
+    """Upsert the running transcript for an unknown caller."""
+    client = get_client()
+    client.table("afterhours_threads").upsert({
+        "phone": phone,
+        "messages": messages,
+        "done": done,
+        "summarised": summarised,
+        "updated_at": "now()",
+    }).execute()
+
+
 
 # --- Shift request queue (Step C: inbound intake -> orchestrator handoff) ---
 
