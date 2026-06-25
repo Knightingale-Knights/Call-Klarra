@@ -34,6 +34,12 @@ ACK_REPLIES = [
 ]
 
 
+def _today_melb() -> str:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("Australia/Melbourne")).strftime("%Y-%m-%d")
+
+
 def parse_request(text: str) -> dict | None:
     """Use Claude to pull date/shift/role from the text. Returns dict or None."""
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
@@ -47,7 +53,7 @@ def parse_request(text: str) -> dict | None:
                 "EN and RN; treat anything like AIN/assistant as EN. Respond ONLY with JSON: "
                 '{"date":"YYYY-MM-DD","shift_type":"Morning|Afternoon|Night","role":"EN|RN"}. '
                 "If you cannot determine all three, respond {\"error\":\"...\"}. "
-                f"Today is 2026-06-21. SMS: \"{text}\""
+                f"Today is {_today_melb()} (Australia/Melbourne). SMS: \"{text}\""
             ),
         }],
     )
@@ -88,6 +94,12 @@ def sms():
     from_number = request.form.get("From")
     body = request.form.get("Body", "")
     logger.info("SMS from %s: %s", from_number, body)
+
+    # Courtesy: a bare thank-you gets a friendly reply, no shift parsing.
+    if body.strip().lower().strip("!.") in ("thanks", "thank you", "ta", "cheers", "thankyou"):
+        return twiml_reply(random.choice(
+            ["No problem.", "My pleasure.", "Easy.", "No worries.", "Anytime.", "All good."]
+        ))
 
     facility = db.facility_by_phone(from_number)
     if not facility and db.DEV:
