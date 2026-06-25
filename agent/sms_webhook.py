@@ -209,7 +209,7 @@ def sms():
         return twiml_reply("Sorry, this number isn't recognised. Please contact Knightingale directly.")
 
     callback = from_number
-    if db.DEV:
+    if db.DEV and from_number not in db.dev_testers():
         callback = os.environ.get("KLARRA_DEV_PHONE", from_number)
 
     parsed = parse_request(body)

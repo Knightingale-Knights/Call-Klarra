@@ -132,7 +132,7 @@ async def entrypoint(ctx: JobContext):
     _call_ctx["facility_id"] = known_facility["id"] if known_facility else None
     _call_ctx["facility_slug"] = known_facility["slug"] if known_facility else None
 
-    if db.DEV:
+    if db.DEV and caller_number not in db.dev_testers():
         _call_ctx["callback_number"] = os.environ.get("KLARRA_DEV_PHONE", caller_number)
 
     if known_facility:

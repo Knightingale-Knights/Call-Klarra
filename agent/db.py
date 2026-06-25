@@ -349,9 +349,21 @@ def resolve_approval(request_id: int, approved: bool, nurse_id: int | None) -> N
 
 # --- SMS sending (Twilio) ---
 
+def dev_testers() -> set:
+    """Recognised tester numbers in dev (comma-separated KLARRA_DEV_PHONES,
+    plus the primary KLARRA_DEV_PHONE)."""
+    raw = os.environ.get("KLARRA_DEV_PHONES", "")
+    s = {p.strip() for p in raw.split(",") if p.strip()}
+    primary = os.environ.get("KLARRA_DEV_PHONE")
+    if primary:
+        s.add(primary)
+    return s
+
+
 def send_sms(to: str, body: str) -> None:
-    """Send an SMS via Twilio. In dev, redirect to KLARRA_DEV_PHONE (or block)."""
-    if DEV:
+    """Send an SMS via Twilio. In dev, allow sends to known testers (to their own
+    number); redirect anything else to the primary dev phone (or block)."""
+    if DEV and to not in dev_testers():
         dev_to = os.environ.get("KLARRA_DEV_PHONE")
         if not dev_to:
             logger.warning("[DEV] blocked SMS to %s: %s", to, body[:60])
