@@ -109,7 +109,7 @@ def sync_availability():
         if not nid:
             continue  # nurse not synced (inactive / no role)
         date_only = date[:10]  # ISO -> YYYY-MM-DD
-        db.upsert_availability(nid, date_only, shift)
+        db.upsert_availability(nid, date_only, shift, bubble_id=a["_id"])
         synced += 1
     logger.info("Synced %d availability records", synced)
 

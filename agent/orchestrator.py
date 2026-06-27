@@ -186,8 +186,6 @@ async def handle_request(lk: api.LiveKitAPI, req: dict):
         return
 
     ranked, reason = rank_pool(pool, req)
-    top = ranked[0]
-    logger.info("Selected %s for request %s (%s)", top["first_name"], req["id"], reason)
 
     # Afterhours: wait until 3 min have passed since the shift was logged, then
     # call the facility back with the chosen nurse. No nurse call — availability = assigned.
@@ -197,6 +195,26 @@ async def handle_request(lk: api.LiveKitAPI, req: dict):
         if remaining > 0:
             logger.info("Afterhours: holding %ds before facility callback", int(remaining))
             await asyncio.sleep(remaining)
+
+    # Try each ranked nurse in order; skip any that got taken in the meantime
+    # (conditional update only succeeds if their availability is still 'pending').
+    top = None
+    for candidate in ranked:
+        if db.assign_availability(candidate["nurse_id"], req["date"], req["shift_type"]):
+            top = candidate
+            break
+        logger.info("Nurse %s no longer available for request %s, trying next",
+                    candidate["first_name"], req["id"])
+
+    if not top:
+        logger.info("All candidates taken for request %s", req["id"])
+        db.mark_request_unfilled(req["id"])
+        await notify_facility(lk, req, filled=False, nurse_name=None)
+        if db.DEV:
+            db.mark_request_done_dev(req["id"])
+        return
+
+    logger.info("Selected %s for request %s (%s)", top["first_name"], req["id"], reason)
 
     db.mark_request_filled(req["id"], top["nurse_id"])
     await notify_facility(lk, req, filled=True, nurse_name=top["first_name"])

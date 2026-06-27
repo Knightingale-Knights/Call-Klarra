@@ -251,6 +251,23 @@ def claim_next_request() -> dict | None:
     return req
 
 
+def assign_availability(nurse_id: int, date: str, shift_type: str) -> bool:
+    """Conditionally flip this nurse's availability row to 'assigned' for date+shift —
+    ONLY if it's still 'pending'. Returns True if this call won the race, False if
+    someone already took it (or no row exists)."""
+    client = get_client()
+    resp = (
+        client.table("availability")
+        .update({"status": "assigned"})
+        .eq("nurse_id", nurse_id).eq("date", date).eq("shift_type", shift_type)
+        .eq("status", "pending")
+        .execute()
+    )
+    won = bool(resp.data)
+    logger.info("assign_availability nurse=%s %s %s -> %s", nurse_id, date, shift_type, won)
+    return won
+
+
 def mark_request_filled(request_id: int, nurse_id: int) -> None:
     if _blocked(f"mark_request_filled id={request_id} nurse={nurse_id}"):
         return
@@ -427,18 +444,23 @@ def nurse_id_by_bubble(bubble_id: str) -> int | None:
     return r.data[0]["id"] if r.data else None
 
 
-def upsert_availability(nurse_id: int, date: str, shift_type: str) -> None:
-    """Insert availability if not already present (unique on nurse+date+shift)."""
+def upsert_availability(nurse_id: int, date: str, shift_type: str, bubble_id: str | None = None) -> None:
+    """Insert availability if not already present (unique on nurse+date+shift).
+    If it already exists, backfill bubble_id when missing."""
     if _blocked(f"upsert_availability nurse={nurse_id} {date}"):
         return
     client = get_client()
-    existing = (client.table("availability").select("id")
+    existing = (client.table("availability").select("id,bubble_id")
                 .eq("nurse_id", nurse_id).eq("date", date)
                 .eq("shift_type", shift_type).limit(1).execute())
     if existing.data:
+        row = existing.data[0]
+        if bubble_id and not row.get("bubble_id"):
+            client.table("availability").update({"bubble_id": bubble_id}).eq("id", row["id"]).execute()
         return
     client.table("availability").insert({
         "nurse_id": nurse_id, "date": date, "shift_type": shift_type, "status": "pending",
+        "bubble_id": bubble_id,
     }).execute()
 
 # --- Shift history sync ---
