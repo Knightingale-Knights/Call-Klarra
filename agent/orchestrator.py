@@ -76,6 +76,18 @@ def rank_pool(pool: list[dict], req: dict) -> list[dict]:
         return pool, ""
 
 
+def rotate_top10(ranked: list[dict]) -> list[dict]:
+    """Rotate the top 10 of the ranked pool by the global counter, so the same
+    top pick doesn't get called every time. Positions 11+ untouched."""
+    n = min(10, len(ranked))
+    if n <= 1:
+        return ranked
+    offset = db.next_rotation() % n
+    top = ranked[:n]
+    rotated = top[offset:] + top[:offset]
+    return rotated + ranked[n:]
+
+
 async def dispatch_nurse_call(lk: api.LiveKitAPI, nurse: dict, req: dict) -> None:
     """Dispatch the outbound agent + place the call. Does NOT wait for an outcome."""
     room = f"nurse-call-{req['id']}-{nurse['nurse_id']}-{int(time.time())}"
@@ -186,6 +198,7 @@ async def handle_request(lk: api.LiveKitAPI, req: dict):
         return
 
     ranked, reason = rank_pool(pool, req)
+    ranked = rotate_top10(ranked)
 
     if is_afterhours():
         await _handle_afterhours(lk, req, ranked, reason)

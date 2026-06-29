@@ -268,6 +268,13 @@ def assign_availability(nurse_id: int, date: str, shift_type: str) -> bool:
     return won
 
 
+def next_rotation() -> int:
+    """Atomically increment the global rotation counter and return its new value."""
+    client = get_client()
+    resp = client.rpc("increment_rotation_counter").execute()
+    return resp.data
+
+
 def mark_request_filled(request_id: int, nurse_id: int) -> None:
     if _blocked(f"mark_request_filled id={request_id} nurse={nurse_id}"):
         return
