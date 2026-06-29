@@ -43,8 +43,9 @@ Your ONLY job on this call is to take the request, not to fill it. Specifically:
 1. Open with exactly: "You've phoned Knightingale, Klarra speaking." Then STOP and wait
    for the caller to tell you what they need. Do not ask a follow-up question in the same
    breath as the greeting.
-2. The facility is already identified by their phone number (see THIS CALL below). Don't
-   ask which facility they are.
+2. The facility is already identified by their phone number, UNLESS the THIS CALL section
+   below says otherwise (e.g. head office calling on behalf of another site) — follow
+   THIS CALL's instructions on this point, they take priority over this general rule.
 3. Gather the date and the shift type (Morning/Afternoon/Night). For role: Knightingale
    only staffs EN (enrolled nurses) and RN (registered nurses) on these calls. If the
    caller says anything that sounds like "EN", "enrolled", "AIN", "assistant", or you're
@@ -66,11 +67,13 @@ the calling-around happens afterwards.
 
 # Set at call start so the submit tool knows the facility + where to call back, without
 # the model having to supply (and possibly mishear) those values.
-_call_ctx: dict = {"facility_id": None, "callback_number": None, "facility_slug": None}
+_call_ctx: dict = {"facility_id": None, "callback_number": None, "facility_slug": None,
+                   "is_head_office": False, "facility_lookup": {}}
 
 
 @function_tool
-async def submit_shift_request(date: str, shift_type: str, role: str) -> str:
+async def submit_shift_request(date: str, shift_type: str, role: str,
+                               target_facility_slug: str | None = None) -> str:
     """
     Log the shift request to the queue so the team can start finding a nurse. Call this
     once you have the date, shift type, and role confirmed.
@@ -79,13 +82,26 @@ async def submit_shift_request(date: str, shift_type: str, role: str) -> str:
         date: shift date in YYYY-MM-DD format.
         shift_type: 'Morning', 'Afternoon', or 'Night'.
         role: 'EN', 'RN', or 'AIN'.
+        target_facility_slug: ONLY used when this call is from head office (Collins) on
+            behalf of another site. When calling from Collins, this is REQUIRED — you
+            MUST ask which site the shift is for and pass the site name exactly as spoken
+            (e.g. 'Williamstown', 'Ron Conn'). Leave empty only for non-Collins callers.
     """
     callback = _call_ctx["callback_number"]
     if not callback:
         return "I can't log this because I couldn't read your callback number."
+
+    facility_id = _call_ctx["facility_id"]
+    if _call_ctx["is_head_office"] and target_facility_slug:
+        match = _call_ctx["facility_lookup"].get(target_facility_slug.lower().strip())
+        if not match:
+            return (f"'{target_facility_slug}' isn't a facility I recognise — ask the "
+                    f"caller to confirm the site name and try again.")
+        facility_id = match["id"]
+
     try:
         req_id = db.create_shift_request(
-            facility_id=_call_ctx["facility_id"],
+            facility_id=facility_id,
             callback_number=callback,
             date=date,
             shift_type=shift_type,
@@ -131,11 +147,27 @@ async def entrypoint(ctx: JobContext):
     _call_ctx["callback_number"] = caller_number
     _call_ctx["facility_id"] = known_facility["id"] if known_facility else None
     _call_ctx["facility_slug"] = known_facility["slug"] if known_facility else None
+    _call_ctx["is_head_office"] = bool(known_facility and known_facility["slug"] == "collins")
 
     if db.DEV and caller_number not in db.dev_testers():
         _call_ctx["callback_number"] = os.environ.get("KLARRA_DEV_PHONE", caller_number)
 
-    if known_facility:
+    if known_facility and _call_ctx["is_head_office"]:
+        all_facilities = [f for f in db.list_facilities() if f["slug"] != "collins"]
+        _call_ctx["facility_lookup"] = {}
+        for f in all_facilities:
+            _call_ctx["facility_lookup"][f["slug"].lower()] = f
+            _call_ctx["facility_lookup"][f["name"].lower()] = f
+        site_list = ", ".join(f"{f['name']} ({f['slug']})" for f in all_facilities)
+        caller_context = (
+            f"This call is from Collins, Knightingale's head office. Collins books shifts "
+            f"ON BEHALF OF other sites — it is never itself the shift location. Ask the "
+            f"caller which site this shift is for. Valid sites: {site_list}. Match what "
+            f"they say to the closest name in that list and pass its slug as "
+            f"target_facility_slug when you call submit_shift_request. If you're not sure "
+            f"which site they mean, ask them to confirm before logging it."
+        )
+    elif known_facility:
         caller_context = (
             f"This call is from {known_facility['name']} "
             f"(facility slug: {known_facility['slug']}, "
