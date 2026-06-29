@@ -48,6 +48,24 @@ for noisy in ("hpack", "httpx", "httpcore", "h2"):
 AGENT_NAME = "knightingale-outbound"
 
 
+def text_outcome(meta: dict, outcome: str) -> None:
+    """Text Paul each time a nurse call resolves (accepted/declined/no_answer)."""
+    admin = os.environ.get("KLARRA_DEV_PHONE")
+    if not admin:
+        return
+    body = (
+        f"Nurse call: {outcome}\n"
+        f"Nurse: {meta.get('nurse_name', '?')}\n"
+        f"Facility: {meta.get('facility_name', '?')}\n"
+        f"Date: {db.pretty_date(meta.get('date', ''))}\n"
+        f"Shift: {meta.get('shift_type', '?')}"
+    )
+    try:
+        db.send_sms(admin, body)
+    except Exception:
+        logger.exception("Failed to send outcome SMS")
+
+
 async def _hang_up():
     await asyncio.sleep(6)
     jc = get_job_context()
@@ -125,6 +143,7 @@ async def entrypoint(ctx: JobContext):
             db.record_call_event(meta["nurse_id"], "no_answer",
                                  facility_id=meta.get("facility_id"),
                                  shift_date=meta.get("date"))
+            text_outcome(meta, "no_answer")
         await ctx.shutdown()
         return
 
@@ -141,6 +160,7 @@ async def entrypoint(ctx: JobContext):
             db.record_call_event(meta["nurse_id"], outcome,
                                  facility_id=meta.get("facility_id"),
                                  shift_date=meta.get("date"))
+            text_outcome(meta, outcome)
         return "Recorded."
 
     @function_tool
