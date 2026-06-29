@@ -187,14 +187,20 @@ async def handle_request(lk: api.LiveKitAPI, req: dict):
 
     ranked, reason = rank_pool(pool, req)
 
-    # Afterhours: wait until 3 min have passed since the shift was logged, then
-    # call the facility back with the chosen nurse. No nurse call — availability = assigned.
     if is_afterhours():
-        elapsed = time.time() - _logged_at(req)
-        remaining = CALLBACK_DELAY_SECONDS - elapsed
-        if remaining > 0:
-            logger.info("Afterhours: holding %ds before facility callback", int(remaining))
-            await asyncio.sleep(remaining)
+        await _handle_afterhours(lk, req, ranked, reason)
+    else:
+        await _handle_daytime(lk, req, ranked, reason)
+
+
+async def _handle_afterhours(lk, req, ranked, reason):
+    """Wait 3 min from when the shift was logged, then assign the top available
+    candidate (no nurse call — availability = assignment) and call the facility back."""
+    elapsed = time.time() - _logged_at(req)
+    remaining = CALLBACK_DELAY_SECONDS - elapsed
+    if remaining > 0:
+        logger.info("Afterhours: holding %ds before facility callback", int(remaining))
+        await asyncio.sleep(remaining)
 
     # Try each ranked nurse in order; skip any that got taken in the meantime
     # (conditional update only succeeds if their availability is still 'pending').
@@ -219,6 +225,36 @@ async def handle_request(lk: api.LiveKitAPI, req: dict):
     db.mark_request_filled(req["id"], top["nurse_id"])
     await notify_facility(lk, req, filled=True, nurse_name=top["first_name"])
     send_fyi(req, top, reason)
+    if db.DEV:
+        db.mark_request_done_dev(req["id"])
+
+
+async def _handle_daytime(lk, req, ranked, reason):
+    """Call ranked nurses one at a time until one accepts. Availability is only
+    flipped to 'assigned' on accept, via the conditional write (race-safe)."""
+    for candidate in ranked:
+        logger.info("Calling %s for request %s", candidate["first_name"], req["id"])
+        outcome = await call_one_nurse(lk, candidate, req)
+        db.record_call_event(candidate["nurse_id"], outcome,
+                              facility_id=req["facility_id"], shift_date=req["date"])
+        if outcome == "accepted":
+            if db.assign_availability(candidate["nurse_id"], req["date"], req["shift_type"]):
+                logger.info("Selected %s for request %s (%s)",
+                            candidate["first_name"], req["id"], reason)
+                db.mark_request_filled(req["id"], candidate["nurse_id"])
+                await notify_facility(lk, req, filled=True, nurse_name=candidate["first_name"])
+                send_fyi(req, candidate, reason)
+                if db.DEV:
+                    db.mark_request_done_dev(req["id"])
+                return
+            logger.info("Nurse %s accepted but slot was already taken, trying next",
+                        candidate["first_name"])
+        else:
+            logger.info("Nurse %s outcome: %s, trying next", candidate["first_name"], outcome)
+
+    logger.info("All candidates exhausted for request %s", req["id"])
+    db.mark_request_unfilled(req["id"])
+    await notify_facility(lk, req, filled=False, nurse_name=None)
     if db.DEV:
         db.mark_request_done_dev(req["id"])
 
