@@ -151,6 +151,14 @@ def insert_learned_decision(situation_text: str, ruling: str,
 
 # --- Facility identification by caller number (Step 15) ---
 
+def list_facilities() -> list[dict]:
+    """All facilities (id, name, slug) — used to let a caller name a different
+    destination facility (e.g. Collins booking on behalf of another site)."""
+    client = get_client()
+    r = client.table("facilities").select("id, name, slug").execute()
+    return r.data or []
+
+
 def facility_by_phone(phone: str) -> dict | None:
     """
     Look up which facility a phone number belongs to, via facility_phones.
