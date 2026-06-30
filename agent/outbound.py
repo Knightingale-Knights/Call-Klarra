@@ -75,10 +75,14 @@ async def _hang_up():
 
 def nurse_instructions(d: dict) -> str:
     nice_date = db.pretty_date(d['date'])
+    if d.get("start_time") and d.get("end_time"):
+        shift_desc = f"from {d['start_time']} to {d['end_time']}"
+    else:
+        shift_desc = d['shift_type'].lower()
     return f"""
 You are Klarra from Knightingale, calling a nurse to offer a shift. Warm, brief. Speak with an English (British) accent.
 Speak naturally and let your sentences finish.
-1. Open with the offer in one line: "Hi {d['nurse_name']}, I've got a {d['role']} {d['shift_type'].lower()} shift on {nice_date} at {d['facility_name']} — would you like it?"
+1. Open with the offer in one line: "Hi {d['nurse_name']}, I've got a {d['role']} shift {shift_desc} on {nice_date} at {d['facility_name']} — would you like it?"
 2. Wait for their answer.
 3. If YES: FIRST say your full closing out loud, e.g. "Great, thanks {d['nurse_name']} — you'll see the shift pop up in the app shortly. Have a good one!" THEN call record_result with "accepted". THEN call hang_up.
 4. If NO: FIRST say a full friendly sign-off out loud, e.g. "No worries at all, thanks {d['nurse_name']}, have a good one!" THEN call record_result with "declined". THEN call hang_up.

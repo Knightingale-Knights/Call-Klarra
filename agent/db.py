@@ -212,12 +212,9 @@ def save_afterhours_thread(phone: str, messages: list, done: bool = False,
 
 def create_shift_request(facility_id: int | None, callback_number: str,
                          date: str, shift_type: str, role: str,
-                         source: str = "voice") -> int:
-    """
-    Write a shift request to the queue for the orchestrator to pick up and fill.
-    Returns the new request id.
-    In dev this is allowed through — it's the trigger for a test call.
-    """
+                         source: str = "voice",
+                         start_time: str | None = None,
+                         end_time: str | None = None) -> int:
     client = get_client()
     resp = client.table("shift_requests").insert({
         "facility_id": facility_id,
@@ -227,6 +224,8 @@ def create_shift_request(facility_id: int | None, callback_number: str,
         "role": role,
         "status": "pending",
         "source": source,
+        "start_time": start_time,
+        "end_time": end_time,
     }).execute()
     new_id = resp.data[0]["id"]
     logger.info("Created shift_request %s (%s %s %s)", new_id, date, shift_type, role)

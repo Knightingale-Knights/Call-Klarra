@@ -102,6 +102,8 @@ async def dispatch_nurse_call(lk: api.LiveKitAPI, nurse: dict, req: dict) -> Non
         "date": req["date"],
         "shift_type": req["shift_type"],
         "role": req["role"],
+        "start_time": req.get("start_time"),
+        "end_time": req.get("end_time"),
     }
     await lk.agent_dispatch.create_dispatch(
         api.CreateAgentDispatchRequest(

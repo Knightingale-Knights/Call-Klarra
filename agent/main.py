@@ -73,19 +73,20 @@ _call_ctx: dict = {"facility_id": None, "callback_number": None, "facility_slug"
 
 @function_tool
 async def submit_shift_request(date: str, shift_type: str, role: str,
+                               start_time: str | None = None,
+                               end_time: str | None = None,
                                target_facility_slug: str | None = None) -> str:
     """
-    Log the shift request to the queue so the team can start finding a nurse. Call this
-    once you have the date, shift type, and role confirmed.
+    Log the shift request. Call once you have date, shift type, role, and ideally
+    start/end times confirmed.
 
     Args:
-        date: shift date in YYYY-MM-DD format.
+        date: YYYY-MM-DD.
         shift_type: 'Morning', 'Afternoon', or 'Night'.
-        role: 'EN', 'RN', or 'AIN'.
-        target_facility_slug: ONLY used when this call is from head office (Collins) on
-            behalf of another site. When calling from Collins, this is REQUIRED — you
-            MUST ask which site the shift is for and pass the site name exactly as spoken
-            (e.g. 'Williamstown', 'Ron Conn'). Leave empty only for non-Collins callers.
+        role: 'EN' or 'RN'.
+        start_time: e.g. '14:00' or '2pm'. Optional but ask for it.
+        end_time: e.g. '21:30' or '930pm'. Optional but ask for it.
+        target_facility_slug: Collins calls only — site name as spoken by caller.
     """
     callback = _call_ctx["callback_number"]
     if not callback:
@@ -106,6 +107,8 @@ async def submit_shift_request(date: str, shift_type: str, role: str,
             date=date,
             shift_type=shift_type,
             role=role,
+            start_time=start_time,
+            end_time=end_time,
         )
     except Exception as e:
         logger.exception("Failed to create shift request")
