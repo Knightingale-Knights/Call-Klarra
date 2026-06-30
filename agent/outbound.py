@@ -134,7 +134,7 @@ async def entrypoint(ctx: JobContext):
     trunk_id = os.environ["OUTBOUND_TRUNK_ID"]
     try:
         if kind == "nurse":
-            session = AgentSession(llm=openai.realtime.RealtimeModel(voice="alloy", speed=1.25))
+            session = AgentSession(llm=openai.realtime.RealtimeModel(voice="shimmer", speed=1.25))
             async with AMD(session, llm="openai/gpt-4o-mini",
                            suppress_compatibility_warning=True) as detector:
                 await ctx.api.sip.create_sip_participant(
@@ -212,7 +212,7 @@ async def entrypoint(ctx: JobContext):
 
     if TurnDetection is not None:
         rt = openai.realtime.RealtimeModel(
-            voice="alloy",
+            voice="shimmer",
             speed=1.25,
             turn_detection=TurnDetection(
                 type="semantic_vad",
@@ -222,7 +222,7 @@ async def entrypoint(ctx: JobContext):
             ),
         )
     else:
-        rt = openai.realtime.RealtimeModel(voice="alloy", speed=1.25)
+        rt = openai.realtime.RealtimeModel(voice="shimmer", speed=1.25)
     if kind != "nurse":
         session = AgentSession(llm=rt)
     else:
