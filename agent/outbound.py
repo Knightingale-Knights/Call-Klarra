@@ -31,7 +31,6 @@ from livekit import api
 from livekit.agents import (
     Agent, AgentSession, JobContext, WorkerOptions, cli, function_tool, get_job_context,
 )
-from livekit.agents.voice.amd import AMD
 from livekit.plugins import openai
 try:
     from openai.types.beta.realtime.session import TurnDetection
@@ -83,9 +82,9 @@ def nurse_instructions(d: dict) -> str:
 You are Klarra from Knightingale, calling a nurse to offer a shift. Warm, brief. Speak with an English (British) accent.
 Speak naturally and let your sentences finish.
 1. Open with the offer in one line: "Hi {d['nurse_name']}, I've got a {d['role']} shift {shift_desc} on {nice_date} at {d['facility_name']} — would you like it?"
-2. Wait for their answer.
-3. If YES: FIRST say your full closing out loud, e.g. "Great, thanks {d['nurse_name']} — you'll see the shift pop up in the app shortly. Have a good one!" THEN call record_result with "accepted". THEN call hang_up.
-4. If NO: FIRST say a full friendly sign-off out loud, e.g. "No worries at all, thanks {d['nurse_name']}, have a good one!" THEN call record_result with "declined". THEN call hang_up.
+2. Wait for their answer. IMPORTANT: accept any clear affirmative from a real person — "yes", "yep", "yeah", "sure", "sounds good", "I'll take it" etc. Only accept if it's clearly a real person responding. Any automated message, voicemail greeting, hold music, or unclear/robotic response = treat as no answer and call record_result with "declined".
+3. If YES (clear explicit confirmation from a real person): FIRST say your full closing out loud, e.g. "Great, thanks {d['nurse_name']} — you'll see the shift pop up in the app shortly. Have a good one!" THEN call record_result with "accepted". THEN call hang_up.
+4. If NO or unclear: FIRST say a full friendly sign-off out loud, e.g. "No worries at all, thanks {d['nurse_name']}, have a good one!" THEN call record_result with "declined". THEN call hang_up.
 Always speak your full line before any tool call. Never cut yourself off. Never hang up mid-sentence.
 """.strip()
 
@@ -133,39 +132,15 @@ async def entrypoint(ctx: JobContext):
     # Place the outbound call into this room.
     trunk_id = os.environ["OUTBOUND_TRUNK_ID"]
     try:
-        if kind == "nurse":
-            session = AgentSession(llm=openai.realtime.RealtimeModel(voice="shimmer", speed=1.25))
-            async with AMD(session, llm="openai/gpt-4o-mini",
-                           suppress_compatibility_warning=True) as detector:
-                await ctx.api.sip.create_sip_participant(
-                    api.CreateSIPParticipantRequest(
-                        room_name=ctx.room.name,
-                        sip_trunk_id=trunk_id,
-                        sip_call_to=phone,
-                        participant_identity="callee",
-                        wait_until_answered=True,
-                    )
-                )
-                await ctx.wait_for_participant(identity="callee")
-                result = await detector.execute()
-            if result.type != "human":
-                logger.info("AMD: %s for %s — treating as no_answer", result.type, phone)
-                db.record_call_event(meta["nurse_id"], "no_answer",
-                                     facility_id=meta.get("facility_id"),
-                                     shift_date=meta.get("date"))
-                text_outcome(meta, "no_answer")
-                await ctx.shutdown()
-                return
-        else:
-            await ctx.api.sip.create_sip_participant(
-                api.CreateSIPParticipantRequest(
-                    room_name=ctx.room.name,
-                    sip_trunk_id=trunk_id,
-                    sip_call_to=phone,
-                    participant_identity="callee",
-                    wait_until_answered=True,
-                )
+        await ctx.api.sip.create_sip_participant(
+            api.CreateSIPParticipantRequest(
+                room_name=ctx.room.name,
+                sip_trunk_id=trunk_id,
+                sip_call_to=phone,
+                participant_identity="callee",
+                wait_until_answered=True,
             )
+        )
     except api.TwirpError:
         logger.warning("Call to %s not answered/failed", phone)
         if kind == "nurse":
@@ -173,7 +148,6 @@ async def entrypoint(ctx: JobContext):
                                  facility_id=meta.get("facility_id"),
                                  shift_date=meta.get("date"))
             text_outcome(meta, "no_answer")
-        await ctx.shutdown()
         return
 
     result_store = {"value": None}
@@ -223,11 +197,7 @@ async def entrypoint(ctx: JobContext):
         )
     else:
         rt = openai.realtime.RealtimeModel(voice="shimmer", speed=1.25)
-    if kind != "nurse":
-        session = AgentSession(llm=rt)
-    else:
-        # session already created above for AMD; update its LLM to use turn detection
-        session._llm = rt
+    session = AgentSession(llm=rt)
     await session.start(agent=Agent(instructions=instructions, tools=tools), room=ctx.room)
     await session.generate_reply(instructions=greet)
 
