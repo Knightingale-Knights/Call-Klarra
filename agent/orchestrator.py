@@ -256,7 +256,7 @@ async def _handle_daytime(lk, req, ranked, reason):
                             candidate["first_name"], req["id"], reason)
                 db.mark_request_filled(req["id"], candidate["nurse_id"])
                 await notify_facility(lk, req, filled=True, nurse_name=candidate["first_name"])
-                send_fyi(req, candidate, reason)
+                send_fyi(req, candidate, f"top-ranked after rotation (original reason: {reason})")
                 if db.DEV:
                     db.mark_request_done_dev(req["id"])
                 return
