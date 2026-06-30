@@ -31,6 +31,7 @@ from livekit import api
 from livekit.agents import (
     Agent, AgentSession, JobContext, WorkerOptions, cli, function_tool, get_job_context,
 )
+from livekit.agents.voice.amd import AMD
 from livekit.plugins import openai
 try:
     from openai.types.beta.realtime.session import TurnDetection
@@ -128,15 +129,39 @@ async def entrypoint(ctx: JobContext):
     # Place the outbound call into this room.
     trunk_id = os.environ["OUTBOUND_TRUNK_ID"]
     try:
-        await ctx.api.sip.create_sip_participant(
-            api.CreateSIPParticipantRequest(
-                room_name=ctx.room.name,
-                sip_trunk_id=trunk_id,
-                sip_call_to=phone,
-                participant_identity="callee",
-                wait_until_answered=True,
+        if kind == "nurse":
+            session = AgentSession(llm=openai.realtime.RealtimeModel(voice="alloy", speed=1.25))
+            async with AMD(session, llm="openai/gpt-4o-mini",
+                           suppress_compatibility_warning=True) as detector:
+                await ctx.api.sip.create_sip_participant(
+                    api.CreateSIPParticipantRequest(
+                        room_name=ctx.room.name,
+                        sip_trunk_id=trunk_id,
+                        sip_call_to=phone,
+                        participant_identity="callee",
+                        wait_until_answered=True,
+                    )
+                )
+                await ctx.wait_for_participant(identity="callee")
+                result = await detector.execute()
+            if result.prediction != "human":
+                logger.info("AMD: %s for %s — treating as no_answer", result.prediction, phone)
+                db.record_call_event(meta["nurse_id"], "no_answer",
+                                     facility_id=meta.get("facility_id"),
+                                     shift_date=meta.get("date"))
+                text_outcome(meta, "no_answer")
+                await ctx.shutdown()
+                return
+        else:
+            await ctx.api.sip.create_sip_participant(
+                api.CreateSIPParticipantRequest(
+                    room_name=ctx.room.name,
+                    sip_trunk_id=trunk_id,
+                    sip_call_to=phone,
+                    participant_identity="callee",
+                    wait_until_answered=True,
+                )
             )
-        )
     except api.TwirpError:
         logger.warning("Call to %s not answered/failed", phone)
         if kind == "nurse":
@@ -194,7 +219,11 @@ async def entrypoint(ctx: JobContext):
         )
     else:
         rt = openai.realtime.RealtimeModel(voice="alloy", speed=1.25)
-    session = AgentSession(llm=rt)
+    if kind != "nurse":
+        session = AgentSession(llm=rt)
+    else:
+        # session already created above for AMD; update its LLM to use turn detection
+        session._llm = rt
     await session.start(agent=Agent(instructions=instructions, tools=tools), room=ctx.room)
     await session.generate_reply(instructions=greet)
 
