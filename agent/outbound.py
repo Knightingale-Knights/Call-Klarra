@@ -148,8 +148,8 @@ async def entrypoint(ctx: JobContext):
                 )
                 await ctx.wait_for_participant(identity="callee")
                 result = await detector.execute()
-            if result.prediction != "human":
-                logger.info("AMD: %s for %s — treating as no_answer", result.prediction, phone)
+            if result.type != "human":
+                logger.info("AMD: %s for %s — treating as no_answer", result.type, phone)
                 db.record_call_event(meta["nurse_id"], "no_answer",
                                      facility_id=meta.get("facility_id"),
                                      shift_date=meta.get("date"))
