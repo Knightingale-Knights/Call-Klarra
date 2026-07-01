@@ -50,8 +50,8 @@ def rank_pool(pool: list[dict], req: dict) -> list[dict]:
         f"{req['facilities']['name']} (complexity: {req['facilities']['complexity']}).\n"
         f"Here is the eligible pool as JSON:\n{json.dumps(pool)}\n\n"
         f'Return ONLY JSON: {{"order":[nurse_id,...best first],'
-        f'"reason":"one short sentence on why the top nurse was chosen, citing the '
-        f'specific factors from the policy"}}. No other text.'
+        f'"reason":"one short sentence on why the top nurse was chosen, referencing their '
+        f'specific attributes (shifts, hours, reliability) — do not say Calling or any action word"}}. No other text.'
     )
     try:
         resp = client.chat.completions.create(
@@ -258,7 +258,7 @@ async def _handle_daytime(lk, req, ranked, reason):
                             candidate["first_name"], req["id"], reason)
                 db.mark_request_filled(req["id"], candidate["nurse_id"])
                 await notify_facility(lk, req, filled=True, nurse_name=candidate["first_name"])
-                send_fyi(req, candidate, f"top-ranked after rotation (original reason: {reason})")
+                send_fyi(req, candidate, f"called first due to rotation (top-ranked was: {reason})")
                 if db.DEV:
                     db.mark_request_done_dev(req["id"])
                 return
