@@ -239,7 +239,7 @@ async def _handle_afterhours(lk, req, ranked, reason):
 
     db.mark_request_filled(req["id"], top["nurse_id"])
     await notify_facility(lk, req, filled=True, nurse_name=top["first_name"])
-    send_fyi(req, top, reason)
+    send_fyi(req, top, reason, ranked=ranked)
     if db.DEV:
         db.mark_request_done_dev(req["id"])
 
@@ -258,7 +258,7 @@ async def _handle_daytime(lk, req, ranked, reason):
                             candidate["first_name"], req["id"], reason)
                 db.mark_request_filled(req["id"], candidate["nurse_id"])
                 await notify_facility(lk, req, filled=True, nurse_name=candidate["first_name"])
-                send_fyi(req, candidate, f"called first due to rotation (top-ranked was: {reason})")
+                send_fyi(req, candidate, reason, ranked=ranked)
                 if db.DEV:
                     db.mark_request_done_dev(req["id"])
                 return
@@ -274,21 +274,28 @@ async def _handle_daytime(lk, req, ranked, reason):
         db.mark_request_done_dev(req["id"])
 
 
-def send_fyi(req, nurse, reason):
+def send_fyi(req, nurse, reason, ranked=None):
     """Text Paul an FYI after the facility has been told. No action needed."""
     admin = os.environ.get("KLARRA_DEV_PHONE")
     if not admin:
         return
+    start = req.get("start_time") or ""
+    end = req.get("end_time") or ""
+    shift_time = f"{start} - {end}" if start and end else req["shift_type"]
     body = (
-        f"Shift filled.\n"
+        f"Shift filled\n"
+        f"Nurse: {nurse['first_name']}\n"
         f"Facility: {req['facilities']['name']}\n"
         f"Date: {db.pretty_date(req['date'])}\n"
-        f"Shift: {req['shift_type']}\n"
-        f"Nurse: {nurse['first_name']}\n"
-        f"Why: {reason or 'top-ranked per policy'}"
+        f"Shift: {shift_time}\n"
     )
+    if ranked:
+        body += "Nurses:\n"
+        for i, n in enumerate(ranked[:10], 1):
+            marker = "✓ " if n["nurse_id"] == nurse["nurse_id"] else ""
+            body += f"{i} - {marker}{n['first_name']}: {int(n.get('reliability') or 0)}\n"
     try:
-        db.send_sms(admin, body)
+        db.send_sms(admin, body.strip())
     except Exception:
         logger.exception("Failed to send FYI SMS")
 
