@@ -77,15 +77,13 @@ def rank_pool(pool: list[dict], req: dict) -> list[dict]:
 
 
 def rotate_top10(ranked: list[dict]) -> list[dict]:
-    """Rotate the top 10 of the ranked pool by the global counter, so the same
-    top pick doesn't get called every time. Positions 11+ untouched."""
-    n = min(10, len(ranked))
+    """Rotate the full ranked pool by the global counter so the same nurse
+    isn't always called first."""
+    n = len(ranked)
     if n <= 1:
         return ranked
     offset = db.next_rotation() % n
-    top = ranked[:n]
-    rotated = top[offset:] + top[:offset]
-    return rotated + ranked[n:]
+    return ranked[offset:] + ranked[:offset]
 
 
 async def dispatch_nurse_call(lk: api.LiveKitAPI, nurse: dict, req: dict) -> None:
