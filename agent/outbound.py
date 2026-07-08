@@ -82,7 +82,7 @@ def nurse_instructions(d: dict) -> str:
 You are Klarra from Knightingale, calling a nurse to offer a shift. Warm, brief. Speak with an English (British) accent.
 Speak naturally and let your sentences finish.
 1. Open with the offer in one line: "Hi {d['nurse_name']}, I've got a {d['role']} shift {shift_desc} on {nice_date} at {d['facility_name']} — would you like it?"
-2. Wait for their answer. IMPORTANT: accept any clear affirmative from a real person — "yes", "yep", "yeah", "sure", "sounds good", "I'll take it" etc. Only accept if it's clearly a real person responding. Any automated message, voicemail greeting, hold music, or unclear/robotic response = treat as no answer and call record_result with "declined".
+2. Wait for their answer. You MUST hear a clear spoken response from the nurse before proceeding. If you hear nothing, silence, a click, or the call drops — call record_result with "declined" immediately. Only proceed to step 3 if the nurse actually speaks and gives a clear affirmative ("yes", "yep", "yeah", "sure", "sounds good", etc.). Any automated message or voicemail = record_result "declined".
 3. If YES (clear explicit confirmation from a real person): FIRST say your full closing out loud, e.g. "Great, thanks {d['nurse_name']} — you'll see the shift pop up in the app shortly. Have a good one!" THEN call record_result with "accepted". THEN call hang_up.
 4. If NO or unclear: FIRST say a full friendly sign-off out loud, e.g. "No worries at all, thanks {d['nurse_name']}, have a good one!" THEN call record_result with "declined". THEN call hang_up.
 Always speak your full line before any tool call. Never cut yourself off. Never hang up mid-sentence.
@@ -166,6 +166,19 @@ async def entrypoint(ctx: JobContext):
             text_outcome(meta, outcome)
         return "Recorded."
 
+    def on_participant_disconnected(participant):
+        """If nurse disconnects before record_result fired, log no_answer."""
+        if participant.identity == "callee" and result_store["value"] is None:
+            logger.info("Callee disconnected before result — logging no_answer")
+            if kind == "nurse" and not db.DEV:
+                db.record_call_event(meta["nurse_id"], "no_answer",
+                                     facility_id=meta.get("facility_id"),
+                                     shift_date=meta.get("date"))
+                text_outcome(meta, "no_answer")
+            result_store["value"] = "no_answer"
+
+    ctx.room.on("participant_disconnected", on_participant_disconnected)
+
     @function_tool
     async def hang_up() -> str:
         """End the call after you've finished speaking."""
@@ -190,7 +203,7 @@ async def entrypoint(ctx: JobContext):
             speed=1.25,
             turn_detection=TurnDetection(
                 type="semantic_vad",
-                eagerness="low",
+                eagerness="medium",
                 create_response=True,
                 interrupt_response=True,
             ),

@@ -9,6 +9,7 @@ and decision-making happens OFF this call, in the orchestrator (separate process
 Run locally:  python agent/main.py dev
 """
 
+import asyncio
 import os
 import random
 import logging
@@ -53,12 +54,8 @@ Your ONLY job on this call is to take the request, not to fill it. Specifically:
    record AIN — it is always EN.
 4. Once you have date, shift type, and role, call submit_shift_request to log it. The tool
    gives you a callback time in minutes — use that exact number.
-5. THEN say the full closing in ONE turn: read the details back AND give the callback time
-   AND invite them to hang up. For example: "Righto — that's an EN for a morning shift on
-   Friday, June 26 at Port Melbourne. I'll check who's available and call you back in about 7
-   minutes. Please feel free to hang up now — Paul's asked me never to hang up myself, just in
-   case I ever cut someone off by accident. Have a good one!" Always include the callback minutes.
-6. Never end the call yourself. After your closing, simply wait. The caller will hang up.
+5. THEN say the full closing in ONE turn: read the details back AND give the callback time AND say "Bye!" Then call hang_up. For example: "Righto — that's an EN for a morning shift on Friday, June 26 at Port Melbourne. I'll check who's available and call you back in about 7 minutes. Bye!" Then call hang_up.
+6. Never end the call before saying the full closing and calling hang_up.
 
 Do NOT look up nurses, name nurses, or promise a specific person. You are taking the order;
 the calling-around happens afterwards.
@@ -121,7 +118,13 @@ async def submit_shift_request(date: str, shift_type: str, role: str,
     )
 
 
-async def entrypoint(ctx: JobContext):
+@function_tool
+async def hang_up() -> str:
+    """End the call 2 seconds after Klarra says Bye."""
+    await asyncio.sleep(2)
+    jc = get_job_context()
+    await jc.api.room.delete_room(api.DeleteRoomRequest(room=jc.room.name))
+    return "Ended."
     await ctx.connect()
     logger.info("Agent connected to room: %s", ctx.room.name)
 
@@ -185,9 +188,22 @@ async def entrypoint(ctx: JobContext):
             f"flag it for Paul. Do not call submit_shift_request."
         )
 
-    session = AgentSession(
-        llm=openai.realtime.RealtimeModel(voice="alloy"),
-    )
+    from livekit.plugins.openai import realtime
+    try:
+        from openai.types.beta.realtime.session import TurnDetection
+        rt = realtime.RealtimeModel(
+            voice="shimmer",
+            speed=1.25,
+            turn_detection=TurnDetection(
+                type="semantic_vad",
+                eagerness="medium",
+                create_response=True,
+                interrupt_response=True,
+            ),
+        )
+    except Exception:
+        rt = realtime.RealtimeModel(voice="shimmer", speed=1.25)
+    session = AgentSession(llm=rt)
 
     from datetime import datetime
     from zoneinfo import ZoneInfo
@@ -201,7 +217,7 @@ async def entrypoint(ctx: JobContext):
     await session.start(
         agent=Agent(
             instructions=INSTRUCTIONS + today_line + "\n\n--- THIS CALL ---\n" + caller_context,
-            tools=[submit_shift_request],
+            tools=[submit_shift_request, hang_up],
         ),
         room=ctx.room,
     )
