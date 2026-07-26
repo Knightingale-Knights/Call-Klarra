@@ -469,6 +469,79 @@ def mark_offer(offer_id: str, status: str, **timestamps) -> None:
     logger.info("Offer %s -> %s", offer_id, status)
 
 
+def get_offer(offer_id: str) -> dict | None:
+    """Read back a single sms_nurse_offers row by id — used to poll for a nurse's
+    reply after an offer/alert without re-querying the whole pending list."""
+    client = get_client()
+    r = client.table("sms_nurse_offers").select("*").eq("id", offer_id).limit(1).execute()
+    return r.data[0] if r.data else None
+
+
+def get_sms_state(shift_request_id: int) -> dict | None:
+    """Read the sms_shift_state header row for a shift request."""
+    client = get_client()
+    r = (client.table("sms_shift_state").select("*")
+         .eq("shift_request_id", shift_request_id).limit(1).execute())
+    return r.data[0] if r.data else None
+
+
+def mark_sms_state(shift_request_id: int, status: str | None = None, **fields) -> None:
+    """Update the sms_shift_state row for a shift request. Pass status and/or any of
+    confirmed_nurse_id / admin_reminder_count / admin_notified_at / admin_approved_at."""
+    if _blocked(f"mark_sms_state request={shift_request_id} -> {status}"):
+        return
+    client = get_client()
+    payload = {"updated_at": "now()", **fields}
+    if status is not None:
+        payload["status"] = status
+    client.table("sms_shift_state").update(payload).eq(
+        "shift_request_id", shift_request_id
+    ).execute()
+    logger.info("SMS state %s -> %s", shift_request_id, status)
+
+
+def place_alert_call(phone: str) -> None:
+    """Ring a nurse's phone as a nudge (no conversation) — hangs up as soon as it's
+    answered. In dev, redirects to KLARRA_DEV_PHONE like send_sms does."""
+    to = phone
+    if DEV and to not in dev_testers():
+        dev_to = os.environ.get("KLARRA_DEV_PHONE")
+        if not dev_to:
+            logger.warning("[DEV] blocked alert call to %s", to)
+            return
+        logger.warning("[DEV] redirect alert call %s -> %s", to, dev_to)
+        to = dev_to
+    from twilio.rest import Client as TwilioClient
+    tw = TwilioClient(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
+    tw.calls.create(
+        to=to,
+        from_=os.environ["TWILIO_PHONE_NUMBER"],
+        twiml="<Response><Hangup/></Response>",
+    )
+    logger.info("Placed alert call to %s", to)
+
+
+def get_sms_state(shift_request_id: int) -> dict | None:
+    """Return the sms_shift_state row for this request, or None."""
+    client = get_client()
+    r = (client.table("sms_shift_state").select("*")
+         .eq("shift_request_id", shift_request_id).limit(1).execute())
+    return r.data[0] if r.data else None
+
+
+def mark_sms_state(shift_request_id: int, status: str, **fields) -> None:
+    """Update the sms_shift_state row's status, plus any other columns passed in
+    fields (e.g. confirmed_nurse_id, admin_notified_at, admin_reminder_count)."""
+    if _blocked(f"mark_sms_state request={shift_request_id} -> {status}"):
+        return
+    client = get_client()
+    payload = {"status": status, "updated_at": "now()", **fields}
+    client.table("sms_shift_state").update(payload).eq(
+        "shift_request_id", shift_request_id
+    ).execute()
+    logger.info("SMS state for request %s -> %s", shift_request_id, status)
+
+
 # --- SMS sending (Twilio) ---
 
 def dev_testers() -> set:
@@ -496,6 +569,26 @@ def send_sms(to: str, body: str) -> None:
     tw = TwilioClient(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
     tw.messages.create(to=to, from_=os.environ["TWILIO_PHONE_NUMBER"], body=body)
     logger.info("Sent SMS to %s", to)
+
+
+def place_alert_call(to: str) -> None:
+    """Place a short alert call via Twilio that hangs up immediately once answered —
+    a ring-based nudge to check the SMS offer just sent. Same DEV redirect as send_sms."""
+    if DEV and to not in dev_testers():
+        dev_to = os.environ.get("KLARRA_DEV_PHONE")
+        if not dev_to:
+            logger.warning("[DEV] blocked alert call to %s", to)
+            return
+        logger.warning("[DEV] redirect alert call %s -> %s", to, dev_to)
+        to = dev_to
+    from twilio.rest import Client as TwilioClient
+    tw = TwilioClient(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
+    tw.calls.create(
+        to=to,
+        from_=os.environ["TWILIO_PHONE_NUMBER"],
+        twiml="<Response><Hangup/></Response>",
+    )
+    logger.info("Placed alert call to %s", to)
 
 # --- Bubble sync helpers ---
 
