@@ -235,14 +235,17 @@ def create_shift_request(facility_id: int | None, callback_number: str,
 
 def claim_next_request() -> dict | None:
     """
-    Grab the oldest pending shift request and mark it 'working' so no other worker
-    picks it up. Returns the request (joined with facility slug/name) or None.
+    Grab the oldest pending VOICE-lane shift request and mark it 'working' so no
+    other worker picks it up. SMS-sourced requests are claimed separately by
+    claim_next_sms_request() so the two orchestrators never race on the same row.
+    Returns the request (joined with facility slug/name) or None.
     """
     client = get_client()
     pending = (
         client.table("shift_requests")
         .select("*, facilities(slug, name, complexity)")
         .eq("status", "pending")
+        .neq("source", "sms")
         .order("created_at")
         .limit(1)
         .execute()
@@ -377,6 +380,94 @@ def resolve_approval(request_id: int, approved: bool, nurse_id: int | None) -> N
     client.table("shift_requests").update(payload).eq("id", request_id).execute()
     logger.info("Request %s approval resolved -> %s", request_id,
                 "filled" if approved else "unfilled")
+
+
+# --- SMS shift-state queue (SMS nurse-offer workflow) ---
+
+def claim_next_sms_request() -> dict | None:
+    """
+    Grab the oldest pending SMS-lane shift request and mark it 'working'. Mirrors
+    claim_next_request() but filtered to source='sms', so the SMS orchestrator and
+    the voice orchestrator never claim the same row.
+    """
+    client = get_client()
+    pending = (
+        client.table("shift_requests")
+        .select("*, facilities(slug, name, complexity)")
+        .eq("status", "pending")
+        .eq("source", "sms")
+        .order("created_at")
+        .limit(1)
+        .execute()
+    )
+    if not pending.data:
+        return None
+    req = pending.data[0]
+    if _blocked(f"claim_next_sms_request mark working id={req['id']}"):
+        return req
+    client.table("shift_requests").update(
+        {"status": "working", "updated_at": "now()"}
+    ).eq("id", req["id"]).execute()
+    return req
+
+
+def create_sms_offers(shift_request_id: int, ranked_pool: list[dict]) -> None:
+    """
+    Set up the SMS offer cascade for a shift request: one sms_shift_state header row
+    (status='offering'), and one sms_nurse_offers row per ranked nurse (status='pending',
+    in rank order starting at 1).
+    """
+    if _blocked(f"create_sms_offers request={shift_request_id}"):
+        return
+    client = get_client()
+    client.table("sms_shift_state").insert({
+        "shift_request_id": shift_request_id,
+        "status": "offering",
+    }).execute()
+    rows = [
+        {
+            "shift_request_id": shift_request_id,
+            "nurse_id": n["nurse_id"],
+            "rank_position": i,
+            "status": "pending",
+        }
+        for i, n in enumerate(ranked_pool, 1)
+    ]
+    if rows:
+        client.table("sms_nurse_offers").insert(rows).execute()
+    logger.info("Created SMS offer cascade for request %s (%d nurses)",
+                shift_request_id, len(rows))
+
+
+def get_next_pending_offer(shift_request_id: int) -> dict | None:
+    """Return the lowest rank_position offer still 'pending' for this request, or None
+    if the pool is exhausted."""
+    client = get_client()
+    r = (
+        client.table("sms_nurse_offers")
+        .select("*, nurses(id, first_name, phone)")
+        .eq("shift_request_id", shift_request_id)
+        .eq("status", "pending")
+        .order("rank_position")
+        .limit(1)
+        .execute()
+    )
+    return r.data[0] if r.data else None
+
+
+def mark_offer(offer_id: str, status: str, **timestamps) -> None:
+    """
+    Update one sms_nurse_offers row's status, plus any of offered_at / alert_called_at /
+    replied_at passed in timestamps (as ISO strings, or 'now()' literal).
+    Valid status: pending, offered, alerted, accepted, declined, no_reply, skipped.
+    """
+    if _blocked(f"mark_offer id={offer_id} -> {status}"):
+        return
+    client = get_client()
+    payload = {"status": status, **timestamps}
+    client.table("sms_nurse_offers").update(payload).eq("id", offer_id).execute()
+    logger.info("Offer %s -> %s", offer_id, status)
+
 
 # --- SMS sending (Twilio) ---
 
