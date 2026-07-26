@@ -2,6 +2,13 @@
 SMS webhook — receives a facility's text, parses the shift request, logs it, replies.
 The orchestrator picks it up and (for sms) texts the facility the result.
 
+Also routes two other kinds of inbound SMS for the SMS nurse-offer workflow:
+  - A nurse replying YES/NO to an active offer -> updates sms_nurse_offers.
+  - Paul replying OK to an admin-approval request -> updates sms_shift_state.
+Both are checked BEFORE the facility-shift-request parsing, since Paul's own number
+doubles as the Collins head-office callback number — otherwise an "OK" reply from him
+would fall through and get mis-parsed as a shift request.
+
 Run:  python agent/sms_webhook.py
 """
 
@@ -181,6 +188,53 @@ def _summarise_to_admin(phone: str, messages: list):
         logger.exception("Failed to summarise after-hours chat")
 
 
+# --- SMS nurse-offer workflow routing ---
+
+def _is_admin_number(phone: str) -> bool:
+    admin = os.environ.get("KLARRA_DEV_PHONE")
+    return bool(admin) and phone == admin
+
+
+def _parse_yes_no(text: str) -> str | None:
+    t = text.strip().lower().strip("!.")
+    if t in ("yes", "y", "yeah", "yep", "sure", "ok", "okay", "yup"):
+        return "yes"
+    if t in ("no", "n", "nah", "nope"):
+        return "no"
+    return None
+
+
+def handle_admin_reply(body: str) -> Response | None:
+    """If Paul has a pending approval and this looks like an OK, confirm it and
+    return the reply. Returns None if there's nothing to approve (caller should
+    fall through to normal handling)."""
+    approval = db.get_pending_admin_approval()
+    if not approval:
+        return None
+    if "ok" in body.strip().lower():
+        db.mark_sms_state(approval["shift_request_id"], "confirmed", admin_approved_at="now()")
+        return twiml_reply("Confirmed — texting the facility now.")
+    # There's a pending approval but this reply doesn't read as an OK. Don't
+    # silently swallow it, but don't mis-fire the confirm either.
+    return twiml_reply("Reply OK to confirm the shift, or I'll keep waiting.")
+
+
+def handle_nurse_offer_reply(phone: str, body: str) -> Response | None:
+    """If this nurse has an active (offered/alerted) SMS offer, route YES/NO to it.
+    Returns None if they have no active offer (caller should fall through)."""
+    offer = db.get_active_offer_by_phone(phone)
+    if not offer:
+        return None
+    answer = _parse_yes_no(body)
+    if answer == "yes":
+        db.mark_offer(offer["id"], "accepted", replied_at="now()")
+        return twiml_reply("Great, thanks! You'll see it in the app shortly.")
+    if answer == "no":
+        db.mark_offer(offer["id"], "declined", replied_at="now()")
+        return twiml_reply("No worries, thanks for letting us know.")
+    return twiml_reply("Sorry, I didn't catch that — reply YES or NO for the shift.")
+
+
 @app.route("/sms", methods=["POST"])
 def sms():
     from_number = request.form.get("From")
@@ -192,6 +246,18 @@ def sms():
         return twiml_reply(random.choice(
             ["No problem.", "My pleasure.", "Easy.", "No worries.", "Anytime.", "All good."]
         ))
+
+    # Paul confirming a pending shift approval — checked before facility parsing,
+    # since his number is also the Collins callback number.
+    if _is_admin_number(from_number):
+        admin_response = handle_admin_reply(body)
+        if admin_response is not None:
+            return admin_response
+
+    # A nurse replying to an active SMS shift offer.
+    nurse_response = handle_nurse_offer_reply(from_number, body)
+    if nurse_response is not None:
+        return nurse_response
 
     facility = db.facility_by_phone(from_number)
 
