@@ -521,6 +521,44 @@ def place_alert_call(phone: str) -> None:
     logger.info("Placed alert call to %s", to)
 
 
+def get_active_offer_by_phone(phone: str) -> dict | None:
+    """Find this nurse's most recent unresolved (offered/alerted) SMS offer, if any —
+    used by sms_webhook to route a YES/NO reply to the right offer row."""
+    client = get_client()
+    nurse = client.table("nurses").select("id, first_name").eq("phone", phone).limit(1).execute()
+    if not nurse.data:
+        return None
+    r = (
+        client.table("sms_nurse_offers")
+        .select("*, shift_requests(id, facility_id, facility_callback_number, date, shift_type)")
+        .eq("nurse_id", nurse.data[0]["id"])
+        .in_("status", ["offered", "alerted"])
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if not r.data:
+        return None
+    row = r.data[0]
+    row["nurse_first_name"] = nurse.data[0]["first_name"]
+    return row
+
+
+def get_pending_admin_approval() -> dict | None:
+    """Most recent sms_shift_state row awaiting Paul's OK, if any — used by
+    sms_webhook to route his reply without mistaking it for a shift request."""
+    client = get_client()
+    r = (
+        client.table("sms_shift_state")
+        .select("*, shift_requests(id, facility_id, facility_callback_number, date, shift_type)")
+        .eq("status", "pending_admin_approval")
+        .order("admin_notified_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return r.data[0] if r.data else None
+
+
 def get_sms_state(shift_request_id: int) -> dict | None:
     """Return the sms_shift_state row for this request, or None."""
     client = get_client()
