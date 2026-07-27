@@ -56,7 +56,25 @@ def get_candidate_pool(facility_slug: str, date: str, shift_type: str, role: str
     Return the eligible nurse pool for a shift, with decision attributes computed live.
     Hard filters (approved + available + correct role) are already applied inside the
     database function — every nurse returned is a valid option.
+
+    Dev mode: always returns a single hardcoded stand-in nurse using KLARRA_DEV_PHONE,
+    regardless of what's actually in Supabase — testing never needs (or looks at) real
+    approvals/availability rows. Uses nurse_id=-1 as a sentinel — see assign_availability,
+    which special-cases it.
     """
+    if DEV:
+        dev_phone = os.environ.get("KLARRA_DEV_PHONE")
+        if dev_phone:
+            logger.info("[DEV] using hardcoded stand-in nurse pool")
+            return [{
+                "nurse_id": -1,
+                "first_name": "DevTest",
+                "last_name": "Nurse",
+                "phone": dev_phone,
+                "role": role,
+                "reliability": 100,
+            }]
+
     client = get_client()
     resp = client.rpc(
         "get_candidate_pool",
@@ -264,7 +282,12 @@ def claim_next_request() -> dict | None:
 def assign_availability(nurse_id: int, date: str, shift_type: str) -> bool:
     """Conditionally flip this nurse's availability row to 'assigned' for date+shift —
     ONLY if it's still 'pending'. Returns True if this call won the race, False if
-    someone already took it (or no row exists)."""
+    someone already took it (or no row exists).
+
+    nurse_id=-1 is the dev stand-in sentinel from get_candidate_pool's fallback — it has
+    no real row, so we short-circuit to True rather than a guaranteed-failing lookup."""
+    if DEV and nurse_id == -1:
+        return True
     client = get_client()
     resp = (
         client.table("availability")
