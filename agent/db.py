@@ -51,26 +51,54 @@ def get_client() -> Client:
     return _client
 
 
+def _get_or_create_dev_nurse(role: str) -> dict | None:
+    """Dev-only: find (or create) a real nurses-table row keyed on KLARRA_DEV_PHONE,
+    so the hardcoded stand-in candidate has a genuine nurse_id — satisfies real
+    foreign key constraints (e.g. sms_nurse_offers.nurse_id) instead of a fake
+    sentinel that only worked for update-based writes."""
+    dev_phone = os.environ.get("KLARRA_DEV_PHONE")
+    if not dev_phone:
+        return None
+    client = get_client()
+    existing = (
+        client.table("nurses").select("id, first_name, role")
+        .eq("phone", dev_phone).limit(1).execute()
+    )
+    if existing.data:
+        row = existing.data[0]
+        if row.get("role") != role:
+            client.table("nurses").update({"role": role}).eq("id", row["id"]).execute()
+            row["role"] = role
+        return row
+    logger.info("[DEV] creating stand-in dev nurse for %s", dev_phone)
+    resp = client.table("nurses").insert({
+        "first_name": "DevTest",
+        "last_name": "Nurse",
+        "phone": dev_phone,
+        "role": role,
+    }).execute()
+    return resp.data[0]
+
+
 def get_candidate_pool(facility_slug: str, date: str, shift_type: str, role: str) -> list[dict]:
     """
     Return the eligible nurse pool for a shift, with decision attributes computed live.
     Hard filters (approved + available + correct role) are already applied inside the
     database function — every nurse returned is a valid option.
 
-    Dev mode: always returns a single hardcoded stand-in nurse using KLARRA_DEV_PHONE,
-    regardless of what's actually in Supabase — testing never needs (or looks at) real
-    approvals/availability rows. Uses nurse_id=-1 as a sentinel — see assign_availability,
-    which special-cases it.
+    Dev mode: always returns a single stand-in nurse using KLARRA_DEV_PHONE — backed by
+    a real nurses-table row (found or auto-created via _get_or_create_dev_nurse), so it
+    satisfies real foreign key constraints, regardless of what's actually in Supabase
+    for approvals/availability.
     """
     if DEV:
-        dev_phone = os.environ.get("KLARRA_DEV_PHONE")
-        if dev_phone:
-            logger.info("[DEV] using hardcoded stand-in nurse pool")
+        dev_nurse = _get_or_create_dev_nurse(role)
+        if dev_nurse:
+            logger.info("[DEV] using stand-in nurse pool (nurse_id=%s)", dev_nurse["id"])
             return [{
-                "nurse_id": -1,
-                "first_name": "DevTest",
-                "last_name": "Nurse",
-                "phone": dev_phone,
+                "nurse_id": dev_nurse["id"],
+                "first_name": dev_nurse.get("first_name") or "DevTest",
+                "phone": os.environ.get("KLARRA_DEV_PHONE"),
                 "role": role,
                 "reliability": 100,
             }]
@@ -282,12 +310,7 @@ def claim_next_request() -> dict | None:
 def assign_availability(nurse_id: int, date: str, shift_type: str) -> bool:
     """Conditionally flip this nurse's availability row to 'assigned' for date+shift —
     ONLY if it's still 'pending'. Returns True if this call won the race, False if
-    someone already took it (or no row exists).
-
-    nurse_id=-1 is the dev stand-in sentinel from get_candidate_pool's fallback — it has
-    no real row, so we short-circuit to True rather than a guaranteed-failing lookup."""
-    if DEV and nurse_id == -1:
-        return True
+    someone already took it (or no row exists)."""
     client = get_client()
     resp = (
         client.table("availability")
