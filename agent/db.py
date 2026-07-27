@@ -412,6 +412,10 @@ def claim_next_sms_request() -> dict | None:
     Grab the oldest pending SMS-lane shift request and mark it 'working'. Mirrors
     claim_next_request() but filtered to source='sms', so the SMS orchestrator and
     the voice orchestrator never claim the same row.
+
+    Always marks 'working' for real, even in dev — this is a claim lock, not a
+    real-world side effect. Leaving it blocked caused the same pending row to be
+    re-claimed and reprocessed every poll cycle instead of just once.
     """
     client = get_client()
     pending = (
@@ -426,8 +430,6 @@ def claim_next_sms_request() -> dict | None:
     if not pending.data:
         return None
     req = pending.data[0]
-    if _blocked(f"claim_next_sms_request mark working id={req['id']}"):
-        return req
     client.table("shift_requests").update(
         {"status": "working", "updated_at": "now()"}
     ).eq("id", req["id"]).execute()
@@ -443,8 +445,22 @@ def create_sms_offers(shift_request_id: int, ranked_pool: list[dict]) -> None:
     Always writes for real, even in dev — these tables only track the SMS test/offer
     flow itself (not real nurses/facilities/shifts), so there's nothing to protect by
     blocking them; blocking them would just break dev testing entirely.
+
+    Idempotent: if a cascade already exists for this request (e.g. a crashed or
+    reprocessed attempt), skips re-creating it instead of erroring on the duplicate key.
     """
     client = get_client()
+    existing = (
+        client.table("sms_shift_state")
+        .select("shift_request_id")
+        .eq("shift_request_id", shift_request_id)
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        logger.info("SMS offer cascade already exists for request %s, skipping create",
+                    shift_request_id)
+        return
     client.table("sms_shift_state").insert({
         "shift_request_id": shift_request_id,
         "status": "offering",
