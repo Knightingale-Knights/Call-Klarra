@@ -5,8 +5,8 @@ before telling the facility. Runs ALONGSIDE the voice orchestrator on its own
 poll loop, claiming only source='sms' rows (via claim_next_sms_request) so the
 two never race on the same shift_requests row.
 
-Relies on sms_webhook.py to write nurse replies into sms_nurse_offers and Paul's
-OK into sms_shift_state — until that's built, every offer times out to no_reply.
+sms_webhook.py routes nurse YES/NO replies into sms_nurse_offers and Paul's OK into
+sms_shift_state — that's what this orchestrator polls for.
 
 Run:  python agent/sms_orchestrator.py
 """
@@ -136,6 +136,8 @@ def handle_request(req: dict):
         db.send_sms(req["facility_callback_number"],
                     f"Sorry, no one was available for the {req['shift_type'].lower()} "
                     f"shift on {db.pretty_date(req['date'])} yet. We'll keep trying.")
+        if db.DEV:
+            db.mark_request_done_dev(req["id"])
         return
 
     ranked, reason = rank_pool(pool, req)
@@ -155,6 +157,8 @@ def handle_request(req: dict):
                 db.send_sms(ADMIN_PHONE, f"No one accepted request {req['id']} "
                             f"({fac['name']}, {db.pretty_date(req['date'])} "
                             f"{req['shift_type']}).")
+            if db.DEV:
+                db.mark_request_done_dev(req["id"])
             return
 
         outcome = offer_nurse(offer, req)
@@ -170,6 +174,8 @@ def handle_request(req: dict):
                             f"Good news — {nurse['first_name']} is covering the "
                             f"{req['shift_type'].lower()} shift on "
                             f"{db.pretty_date(req['date'])}.")
+            if db.DEV:
+                db.mark_request_done_dev(req["id"])
             return
         # declined or no_reply -> loop continues to the next pending offer
 
