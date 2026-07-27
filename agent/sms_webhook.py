@@ -38,6 +38,7 @@ ACK_REPLIES = [
     "Not a problem. Just a moment please.",
     "Got it — on it now.",
     "Of course, leave it with me a sec.",
+    "Certainly, 1 moment please.",
 ]
 
 
