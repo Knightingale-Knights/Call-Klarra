@@ -439,9 +439,11 @@ def create_sms_offers(shift_request_id: int, ranked_pool: list[dict]) -> None:
     Set up the SMS offer cascade for a shift request: one sms_shift_state header row
     (status='offering'), and one sms_nurse_offers row per ranked nurse (status='pending',
     in rank order starting at 1).
+
+    Always writes for real, even in dev — these tables only track the SMS test/offer
+    flow itself (not real nurses/facilities/shifts), so there's nothing to protect by
+    blocking them; blocking them would just break dev testing entirely.
     """
-    if _blocked(f"create_sms_offers request={shift_request_id}"):
-        return
     client = get_client()
     client.table("sms_shift_state").insert({
         "shift_request_id": shift_request_id,
@@ -483,9 +485,8 @@ def mark_offer(offer_id: str, status: str, **timestamps) -> None:
     Update one sms_nurse_offers row's status, plus any of offered_at / alert_called_at /
     replied_at passed in timestamps (as ISO strings, or 'now()' literal).
     Valid status: pending, offered, alerted, accepted, declined, no_reply, skipped.
+    Always writes for real, even in dev — see create_sms_offers.
     """
-    if _blocked(f"mark_offer id={offer_id} -> {status}"):
-        return
     client = get_client()
     payload = {"status": status, **timestamps}
     client.table("sms_nurse_offers").update(payload).eq("id", offer_id).execute()
@@ -510,9 +511,8 @@ def get_sms_state(shift_request_id: int) -> dict | None:
 
 def mark_sms_state(shift_request_id: int, status: str | None = None, **fields) -> None:
     """Update the sms_shift_state row for a shift request. Pass status and/or any of
-    confirmed_nurse_id / admin_reminder_count / admin_notified_at / admin_approved_at."""
-    if _blocked(f"mark_sms_state request={shift_request_id} -> {status}"):
-        return
+    confirmed_nurse_id / admin_reminder_count / admin_notified_at / admin_approved_at.
+    Always writes for real, even in dev — see create_sms_offers."""
     client = get_client()
     payload = {"updated_at": "now()", **fields}
     if status is not None:
