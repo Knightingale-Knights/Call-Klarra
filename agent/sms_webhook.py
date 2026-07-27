@@ -48,7 +48,7 @@ def _today_melb() -> str:
 
 
 def parse_request(text: str) -> dict | None:
-    """Use Claude to pull date/shift/role from the text. Returns dict or None."""
+    """Use Claude to pull date/shift/role/times from the text. Returns dict or None."""
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     msg = client.messages.create(
         model="claude-sonnet-4-6",
@@ -58,8 +58,11 @@ def parse_request(text: str) -> dict | None:
             "content": (
                 "Extract a nursing shift request from this SMS. Knightingale only staffs "
                 "EN and RN; treat anything like AIN/assistant as EN. Respond ONLY with JSON: "
-                '{"date":"YYYY-MM-DD","shift_type":"Morning|Afternoon|Night","role":"EN|RN"}. '
-                "If you cannot determine all three, respond {\"error\":\"...\"}. "
+                '{"date":"YYYY-MM-DD","shift_type":"Morning|Afternoon|Night","role":"EN|RN",'
+                '"start_time":"HH:MM or null","end_time":"HH:MM or null"}. '
+                "start_time/end_time are 24-hour HH:MM if the SMS states or clearly implies "
+                "specific times (e.g. '2-10pm', 'from 14:00'), otherwise null — do not guess. "
+                "If you cannot determine date, shift_type, and role, respond {\"error\":\"...\"}. "
                 f"Today is {_today_melb()} (Australia/Melbourne). SMS: \"{text}\""
             ),
         }],
@@ -290,6 +293,8 @@ def sms():
             shift_type=parsed["shift_type"],
             role=parsed["role"],
             source="sms",
+            start_time=parsed.get("start_time"),
+            end_time=parsed.get("end_time"),
         )
     except Exception as e:
         logger.exception("Failed to log SMS request")
