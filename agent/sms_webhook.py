@@ -33,7 +33,7 @@ logger = logging.getLogger("knightingale-sms")
 app = Flask(__name__)
 
 ACK_REPLIES = [
-    "Absolutely, working on this — one moment.",
+    "Absolutely, working on this, just a moment please.",
     "Sure, we're on it.",
     "Not a problem. Just a moment please.",
     "Got it — on it now.",
