@@ -33,12 +33,11 @@ logger = logging.getLogger("knightingale-sms")
 app = Flask(__name__)
 
 ACK_REPLIES = [
-    "Absolutely, working on this, just a moment please.",
+    "Absolutely, working on this — one moment.",
     "Sure, we're on it.",
     "Not a problem. Just a moment please.",
     "Got it — on it now.",
     "Of course, leave it with me a sec.",
-    "Certainly, 1 moment please.",
 ]
 
 
@@ -195,7 +194,8 @@ def _summarise_to_admin(phone: str, messages: list):
 # --- SMS nurse-offer workflow routing ---
 
 def _is_admin_number(phone: str) -> bool:
-    admin = os.environ.get("KLARRA_DEV_PHONE")
+    admin = os.environ.get("KLARRA_DEV_PHONE", "").strip().strip('"').strip("'")
+    phone = (phone or "").strip()
     return bool(admin) and phone == admin
 
 
