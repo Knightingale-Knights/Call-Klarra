@@ -125,6 +125,9 @@ async def hang_up() -> str:
     jc = get_job_context()
     await jc.api.room.delete_room(api.DeleteRoomRequest(room=jc.room.name))
     return "Ended."
+
+
+async def entrypoint(ctx: JobContext):
     await ctx.connect()
     logger.info("Agent connected to room: %s", ctx.room.name)
 
