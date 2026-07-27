@@ -44,22 +44,83 @@ def _offer_status(offer_id: str) -> str | None:
     return r.data[0]["status"] if r.data else None
 
 
+def _short_date(d: str) -> str:
+    """Format 'YYYY-MM-DD' as 'Tue 28th'. Returns input unchanged on failure."""
+    from datetime import datetime
+    try:
+        dt = datetime.strptime(str(d)[:10], "%Y-%m-%d")
+        day = dt.day
+        suffix = "th" if 11 <= day % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+        return dt.strftime("%a ") + f"{day}{suffix}"
+    except Exception:
+        return str(d)
+
+
+def _compact_time(t: str) -> str:
+    """'07:00' -> '0700'."""
+    return t.replace(":", "") if t else t
+
+
 def offer_message(nurse: dict, req: dict) -> str:
-    nice_date = db.pretty_date(req["date"])
+    nice_date = _short_date(req["date"])
     if req.get("start_time") and req.get("end_time"):
-        shift_desc = f"from {req['start_time']} to {req['end_time']}"
+        time_desc = f"from {_compact_time(req['start_time'])} - {_compact_time(req['end_time'])}"
     else:
-        shift_desc = req["shift_type"].lower()
+        time_desc = f"({req['shift_type']})"
     return (
-        f"Hi {nurse['first_name']}, it's Klarra from Knightingale. "
-        f"I've got a {req['role']} shift {shift_desc} on {nice_date} at "
-        f"{req['facilities']['name']} — want it? Reply YES or NO."
+        f"Hi {nurse['first_name']}, I've got a shift at {req['facilities']['name']} "
+        f"on {nice_date} {time_desc}. Please reply YES if you would like it. "
+        f"Please reply NO if you would prefer to pass. Thank you"
     )
+
+
+def text_offer_outcome(nurse: dict, req: dict, outcome: str) -> None:
+    """Text Paul each time a nurse's SMS offer resolves (accepted/declined/no_reply) —
+    mirrors outbound.py's text_outcome for voice calls."""
+    if not ADMIN_PHONE:
+        return
+    body = (
+        f"Nurse text: {outcome}\n"
+        f"Nurse: {nurse['first_name']}\n"
+        f"Facility: {req['facilities']['name']}\n"
+        f"Date: {db.pretty_date(req['date'])}\n"
+        f"Shift: {req['shift_type']}"
+    )
+    try:
+        db.send_sms(ADMIN_PHONE, body)
+    except Exception:
+        logger.exception("Failed to send offer outcome SMS")
+
+
+def send_fyi(req: dict, nurse: dict, ranked: list[dict]) -> None:
+    """Text Paul the final ranked list with the winner checked off — mirrors
+    orchestrator.py's send_fyi for voice."""
+    if not ADMIN_PHONE:
+        return
+    start = req.get("start_time") or ""
+    end = req.get("end_time") or ""
+    shift_time = f"{start} - {end}" if start and end else req["shift_type"]
+    body = (
+        f"Shift filled (SMS)\n"
+        f"Nurse: {nurse['first_name']}\n"
+        f"Facility: {req['facilities']['name']}\n"
+        f"Date: {db.pretty_date(req['date'])}\n"
+        f"Shift: {shift_time}\n"
+        f"Nurses:\n"
+    )
+    for i, n in enumerate(ranked[:10], 1):
+        marker = "✓ " if n["nurse_id"] == nurse["id"] else ""
+        body += f"{i} - {marker}{n['first_name']}: {int(n.get('reliability') or 0)}\n"
+    try:
+        db.send_sms(ADMIN_PHONE, body.strip())
+    except Exception:
+        logger.exception("Failed to send SMS FYI")
 
 
 def offer_nurse(offer: dict, req: dict) -> str:
     """Text one nurse the offer, alert-call them, wait for a reply. Returns the
-    resulting offer status: accepted, declined, or no_reply."""
+    resulting offer status: accepted, declined, or no_reply. Texts Paul the outcome
+    as soon as it's known."""
     nurse = offer["nurses"]
     logger.info("Offering request %s to %s (rank %s)", req["id"], nurse["first_name"],
                 offer["rank_position"])
@@ -73,6 +134,7 @@ def offer_nurse(offer: dict, req: dict) -> str:
         waited += REPLY_POLL_SECONDS
         status = _offer_status(offer["id"])
         if status in ("accepted", "declined"):
+            text_offer_outcome(nurse, req, status)
             return status
 
     db.place_alert_call(nurse["phone"])
@@ -84,9 +146,11 @@ def offer_nurse(offer: dict, req: dict) -> str:
         waited += REPLY_POLL_SECONDS
         status = _offer_status(offer["id"])
         if status in ("accepted", "declined"):
+            text_offer_outcome(nurse, req, status)
             return status
 
     db.mark_offer(offer["id"], "no_reply")
+    text_offer_outcome(nurse, req, "no_reply")
     return "no_reply"
 
 
@@ -174,6 +238,7 @@ def handle_request(req: dict):
                             f"Good news — {nurse['first_name']} is covering the "
                             f"{req['shift_type'].lower()} shift on "
                             f"{db.pretty_date(req['date'])}.")
+                send_fyi(req, nurse, ranked)
             if db.DEV:
                 db.mark_request_done_dev(req["id"])
             return
