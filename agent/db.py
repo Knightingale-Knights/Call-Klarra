@@ -205,6 +205,31 @@ def list_facilities() -> list[dict]:
     return r.data or []
 
 
+def find_facility_by_name(name: str | None) -> dict | None:
+    """Fuzzy-match a typed site name against real facilities, excluding Collins
+    (head office, never itself a shift site) — same idea as main.py's voice-flow
+    target_facility_slug matching, but for SMS free text."""
+    if not name:
+        return None
+    client = get_client()
+    resp = client.table("facilities").select("id, name, slug, complexity").execute()
+    candidates = [f for f in (resp.data or []) if f["slug"] != "collins"]
+    needle = name.lower().strip()
+
+    for f in candidates:
+        if needle == f["slug"].lower() or needle == f["name"].lower():
+            return f
+    for f in candidates:
+        if needle in f["name"].lower() or needle in f["slug"].lower().replace("_", " "):
+            return f
+    import difflib
+    by_name = {f["name"].lower(): f for f in candidates}
+    match = difflib.get_close_matches(needle, by_name.keys(), n=1, cutoff=0.6)
+    if match:
+        return by_name[match[0]]
+    return None
+
+
 def facility_by_phone(phone: str) -> dict | None:
     """
     Look up which facility a phone number belongs to, via facility_phones.
