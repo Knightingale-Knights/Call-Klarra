@@ -48,7 +48,7 @@ def _today_melb() -> str:
 
 
 def parse_request(text: str) -> dict | None:
-    """Use Claude to pull date/shift/role/times from the text. Returns dict or None."""
+    """Use Claude to pull date/shift/role/times/facility from the text. Returns dict or None."""
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     msg = client.messages.create(
         model="claude-sonnet-4-6",
@@ -59,7 +59,8 @@ def parse_request(text: str) -> dict | None:
                 "Extract a nursing shift request from this SMS. Knightingale only staffs "
                 "EN and RN; treat anything like AIN/assistant as EN. Respond ONLY with JSON: "
                 '{"date":"YYYY-MM-DD","shift_type":"Morning|Afternoon|Night","role":"EN|RN",'
-                '"start_time":"HH:MM or null","end_time":"HH:MM or null"}. '
+                '"start_time":"HH:MM or null","end_time":"HH:MM or null",'
+                '"facility":"site name as written in the SMS, or null if none is mentioned"}. '
                 "start_time/end_time are 24-hour HH:MM if the SMS states or clearly implies "
                 "specific times (e.g. '2-10pm', 'from 14:00'), otherwise null — do not guess. "
                 "If you cannot determine date, shift_type, and role, respond {\"error\":\"...\"}. "
@@ -286,9 +287,19 @@ def sms():
     if not parsed:
         return twiml_reply("Sorry, I couldn't read that. Please text the date, shift (morning/afternoon/night) and role (EN/RN).")
 
+    target_facility_id = facility["id"]
+    if facility["slug"] == "collins":
+        match = db.find_facility_by_name(parsed.get("facility"))
+        if not match:
+            return twiml_reply(
+                "Which site is this shift for? Please include the facility name, "
+                "e.g. 'EN morning shift tomorrow at Port Melbourne'."
+            )
+        target_facility_id = match["id"]
+
     try:
         req_id = db.create_shift_request(
-            facility_id=facility["id"],
+            facility_id=target_facility_id,
             callback_number=callback,
             date=parsed["date"],
             shift_type=parsed["shift_type"],
