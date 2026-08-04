@@ -5,9 +5,10 @@ The orchestrator picks it up and (for sms) texts the facility the result.
 Also routes two other kinds of inbound SMS for the SMS nurse-offer workflow:
   - A nurse replying YES/NO to an active offer -> updates sms_nurse_offers.
   - Paul replying OK to an admin-approval request -> updates sms_shift_state.
-Both are checked BEFORE the facility-shift-request parsing, since Paul's own number
-doubles as the Collins head-office callback number — otherwise an "OK" reply from him
-would fall through and get mis-parsed as a shift request.
+Routing order matters: admin approval is checked first, then facility identity,
+then nurse-offer replies — a recognised facility number is NEVER treated as a nurse
+reply, even if that same phone number also happens to match a nurse record (e.g. a
+dev/test stand-in nurse sharing KLARRA_DEV_PHONE with Collins).
 
 Run:  python agent/sms_webhook.py
 """
@@ -265,19 +266,25 @@ def sms():
             ["No problem.", "My pleasure.", "Easy.", "No worries.", "Anytime.", "All good."]
         ))
 
-    # Paul confirming a pending shift approval — checked before facility parsing,
-    # since his number is also the Collins callback number.
+    # Paul confirming a pending shift approval — checked before anything else,
+    # since his number is also the Collins callback number (and, in dev/test setups,
+    # may also match a stand-in nurse record).
     if _is_admin_number(from_number):
         admin_response = handle_admin_reply(body)
         if admin_response is not None:
             return admin_response
 
-    # A nurse replying to an active SMS shift offer.
-    nurse_response = handle_nurse_offer_reply(from_number, body)
-    if nurse_response is not None:
-        return nurse_response
-
+    # A recognised facility's number always means facility messaging (a shift request),
+    # never a nurse reply — checked BEFORE nurse-offer routing, so a facility number
+    # that happens to also match a nurse record (e.g. the dev stand-in nurse sharing
+    # KLARRA_DEV_PHONE with Collins) is never mis-routed as a late nurse reply.
     facility = db.facility_by_phone(from_number)
+
+    if not facility:
+        # Not a recognised facility — could be a nurse replying to an offer.
+        nurse_response = handle_nurse_offer_reply(from_number, body)
+        if nurse_response is not None:
+            return nurse_response
 
     # Dev: only treat the sender as a stand-in facility if explicitly testing the
     # shift flow. Otherwise an unknown number falls through to the afterhours chat.
