@@ -226,18 +226,31 @@ def handle_admin_reply(body: str) -> Response | None:
 
 def handle_nurse_offer_reply(phone: str, body: str) -> Response | None:
     """If this nurse has an active (offered/alerted) SMS offer, route YES/NO to it.
-    Returns None if they have no active offer (caller should fall through)."""
+    If they're a known nurse but their offer window has already closed (e.g. a reply
+    that arrives after the 40s offer window, or after the shift moved to the next
+    candidate), give a clear reply instead of falling through to the generic
+    unrecognised-number message. Returns None only if this phone has never received
+    an SMS offer at all (caller should fall through)."""
     offer = db.get_active_offer_by_phone(phone)
-    if not offer:
-        return None
-    answer = _parse_yes_no(body)
-    if answer == "yes":
-        db.mark_offer(offer["id"], "accepted", replied_at="now()")
-        return twiml_reply("Great, thanks! You'll see it in the app shortly.")
-    if answer == "no":
-        db.mark_offer(offer["id"], "declined", replied_at="now()")
-        return twiml_reply("No worries, thanks for letting us know.")
-    return twiml_reply("Sorry, I didn't catch that — reply YES or NO for the shift.")
+    if offer:
+        answer = _parse_yes_no(body)
+        if answer == "yes":
+            db.mark_offer(offer["id"], "accepted", replied_at="now()")
+            return twiml_reply("Great, thanks! You'll see it in the app shortly.")
+        if answer == "no":
+            db.mark_offer(offer["id"], "declined", replied_at="now()")
+            return twiml_reply("No worries, thanks for letting us know.")
+        return twiml_reply("Sorry, I didn't catch that — reply YES or NO for the shift.")
+
+    latest = db.get_latest_offer_by_phone(phone)
+    if latest:
+        return twiml_reply(
+            "Thanks for the reply — that shift's already been sorted, so there's "
+            "nothing to action there. We'll text you next time something suitable "
+            "comes up."
+        )
+
+    return None
 
 
 @app.route("/sms", methods=["POST"])
