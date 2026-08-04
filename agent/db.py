@@ -631,6 +631,29 @@ def get_active_offer_by_phone(phone: str) -> dict | None:
     return row
 
 
+def get_latest_offer_by_phone(phone: str) -> dict | None:
+    """Most recent SMS offer sent to this nurse, regardless of status — used to give
+    a sensible reply to a late YES/NO that arrived after the offer window closed,
+    instead of falling through to the generic unrecognised-number message."""
+    client = get_client()
+    nurse = client.table("nurses").select("id, first_name").eq("phone", phone).limit(1).execute()
+    if not nurse.data:
+        return None
+    r = (
+        client.table("sms_nurse_offers")
+        .select("*, shift_requests(id, facility_id, facility_callback_number, date, shift_type)")
+        .eq("nurse_id", nurse.data[0]["id"])
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if not r.data:
+        return None
+    row = r.data[0]
+    row["nurse_first_name"] = nurse.data[0]["first_name"]
+    return row
+
+
 def get_pending_admin_approval() -> dict | None:
     """Most recent sms_shift_state row awaiting Paul's OK, if any — used by
     sms_webhook to route his reply without mistaking it for a shift request."""
