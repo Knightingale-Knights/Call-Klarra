@@ -5,10 +5,20 @@ The orchestrator picks it up and (for sms) texts the facility the result.
 Also routes two other kinds of inbound SMS for the SMS nurse-offer workflow:
   - A nurse replying YES/NO to an active offer -> updates sms_nurse_offers.
   - Paul replying OK to an admin-approval request -> updates sms_shift_state.
-Routing order matters: admin approval is checked first, then facility identity,
-then nurse-offer replies — a recognised facility number is NEVER treated as a nurse
-reply, even if that same phone number also happens to match a nurse record (e.g. a
-dev/test stand-in nurse sharing KLARRA_DEV_PHONE with Collins).
+
+Routing order matters, and is deliberately this order:
+  1. Admin approval reply (narrow: only fires if there's a real pending approval).
+  2. An ACTIVE nurse offer (offered/alerted) on this number — wins over facility
+     identity, because it means we are actively expecting a YES/NO from this exact
+     number right now. This matters because in dev/test setups one phone number can
+     simultaneously be a registered facility AND the stand-in nurse (both sharing
+     KLARRA_DEV_PHONE) — without this priority, a nurse's genuine YES/NO gets
+     swallowed by the facility-request parser instead of reaching the offer.
+  3. Recognised facility -> shift-request parsing.
+  4. Not a facility, but has past (non-active) offer history -> "already sorted"
+     reply, so a late YES/NO doesn't fall through to the generic unrecognised-number
+     message.
+  5. Otherwise -> afterhours chat / unrecognised-number fallback.
 
 Run:  python agent/sms_webhook.py
 """
@@ -225,33 +235,30 @@ def handle_admin_reply(body: str) -> Response | None:
     return twiml_reply("Reply OK to confirm the shift, or I'll keep waiting.")
 
 
-def handle_nurse_offer_reply(phone: str, body: str) -> Response | None:
-    """If this nurse has an active (offered/alerted) SMS offer, route YES/NO to it.
-    If they're a known nurse but their offer window has already closed (e.g. a reply
-    that arrives after the 40s offer window, or after the shift moved to the next
-    candidate), give a clear reply instead of falling through to the generic
-    unrecognised-number message. Returns None only if this phone has never received
-    an SMS offer at all (caller should fall through)."""
-    offer = db.get_active_offer_by_phone(phone)
-    if offer:
-        answer = _parse_yes_no(body)
-        if answer == "yes":
-            db.mark_offer(offer["id"], "accepted", replied_at="now()")
-            return twiml_reply("Great, thanks! You'll see it in the app shortly.")
-        if answer == "no":
-            db.mark_offer(offer["id"], "declined", replied_at="now()")
-            return twiml_reply("No worries, thanks for letting us know.")
-        return twiml_reply("Sorry, I didn't catch that — reply YES or NO for the shift.")
+def handle_active_offer_reply(offer: dict, body: str) -> Response:
+    """A nurse's reply while their offer is still open (offered/alerted)."""
+    answer = _parse_yes_no(body)
+    if answer == "yes":
+        db.mark_offer(offer["id"], "accepted", replied_at="now()")
+        return twiml_reply("Great, thanks! You'll see it in the app shortly.")
+    if answer == "no":
+        db.mark_offer(offer["id"], "declined", replied_at="now()")
+        return twiml_reply("No worries, thanks for letting us know.")
+    return twiml_reply("Sorry, I didn't catch that — reply YES or NO for the shift.")
 
+
+def handle_late_nurse_reply(phone: str, body: str) -> Response | None:
+    """A known nurse (has offer history) replying with no active offer right now, and
+    this number isn't a recognised facility either. Returns None if this phone has
+    never received an SMS offer at all (caller should fall through)."""
     latest = db.get_latest_offer_by_phone(phone)
-    if latest:
-        return twiml_reply(
-            "Thanks for the reply — that shift's already been sorted, so there's "
-            "nothing to action there. We'll text you next time something suitable "
-            "comes up."
-        )
-
-    return None
+    if not latest:
+        return None
+    return twiml_reply(
+        "Thanks for the reply — that shift's already been sorted, so there's "
+        "nothing to action there. We'll text you next time something suitable "
+        "comes up."
+    )
 
 
 @app.route("/sms", methods=["POST"])
@@ -274,17 +281,19 @@ def sms():
         if admin_response is not None:
             return admin_response
 
-    # A recognised facility's number always means facility messaging (a shift request),
-    # never a nurse reply — checked BEFORE nurse-offer routing, so a facility number
-    # that happens to also match a nurse record (e.g. the dev stand-in nurse sharing
-    # KLARRA_DEV_PHONE with Collins) is never mis-routed as a late nurse reply.
+    # An ACTIVE nurse offer on this number wins over facility identity — see the
+    # module docstring for why this ordering matters.
+    active_offer = db.get_active_offer_by_phone(from_number)
+    if active_offer:
+        return handle_active_offer_reply(active_offer, body)
+
     facility = db.facility_by_phone(from_number)
 
     if not facility:
-        # Not a recognised facility — could be a nurse replying to an offer.
-        nurse_response = handle_nurse_offer_reply(from_number, body)
-        if nurse_response is not None:
-            return nurse_response
+        # Not a facility, no active offer — could still be a nurse replying late.
+        late_response = handle_late_nurse_reply(from_number, body)
+        if late_response is not None:
+            return late_response
 
     # Dev: only treat the sender as a stand-in facility if explicitly testing the
     # shift flow. Otherwise an unknown number falls through to the afterhours chat.
