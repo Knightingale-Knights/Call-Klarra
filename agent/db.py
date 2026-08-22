@@ -278,7 +278,6 @@ def save_afterhours_thread(phone: str, messages: list, done: bool = False,
     }).execute()
 
 
-
 # --- Shift request queue (Step C: inbound intake -> orchestrator handoff) ---
 
 def create_shift_request(facility_id: int | None, callback_number: str,
@@ -301,6 +300,7 @@ def create_shift_request(facility_id: int | None, callback_number: str,
     new_id = resp.data[0]["id"]
     logger.info("Created shift_request %s (%s %s %s)", new_id, date, shift_type, role)
     return new_id
+
 
 # --- Orchestrator queue helpers (Step E) ---
 
@@ -587,27 +587,6 @@ def mark_sms_state(shift_request_id: int, status: str | None = None, **fields) -
     logger.info("SMS state %s -> %s", shift_request_id, status)
 
 
-def place_alert_call(phone: str) -> None:
-    """Ring a nurse's phone as a nudge (no conversation) — hangs up as soon as it's
-    answered. In dev, redirects to KLARRA_DEV_PHONE like send_sms does."""
-    to = phone
-    if DEV and to not in dev_testers():
-        dev_to = os.environ.get("KLARRA_DEV_PHONE")
-        if not dev_to:
-            logger.warning("[DEV] blocked alert call to %s", to)
-            return
-        logger.warning("[DEV] redirect alert call %s -> %s", to, dev_to)
-        to = dev_to
-    from twilio.rest import Client as TwilioClient
-    tw = TwilioClient(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
-    tw.calls.create(
-        to=to,
-        from_=os.environ["TWILIO_PHONE_NUMBER"],
-        twiml="<Response><Hangup/></Response>",
-    )
-    logger.info("Placed alert call to %s", to)
-
-
 def get_active_offer_by_phone(phone: str) -> dict | None:
     """Find this nurse's most recent unresolved (offered/alerted) SMS offer, if any —
     used by sms_webhook to route a YES/NO reply to the right offer row."""
@@ -669,27 +648,6 @@ def get_pending_admin_approval() -> dict | None:
     return r.data[0] if r.data else None
 
 
-def get_sms_state(shift_request_id: int) -> dict | None:
-    """Return the sms_shift_state row for this request, or None."""
-    client = get_client()
-    r = (client.table("sms_shift_state").select("*")
-         .eq("shift_request_id", shift_request_id).limit(1).execute())
-    return r.data[0] if r.data else None
-
-
-def mark_sms_state(shift_request_id: int, status: str, **fields) -> None:
-    """Update the sms_shift_state row's status, plus any other columns passed in
-    fields (e.g. confirmed_nurse_id, admin_notified_at, admin_reminder_count)."""
-    if _blocked(f"mark_sms_state request={shift_request_id} -> {status}"):
-        return
-    client = get_client()
-    payload = {"status": status, "updated_at": "now()", **fields}
-    client.table("sms_shift_state").update(payload).eq(
-        "shift_request_id", shift_request_id
-    ).execute()
-    logger.info("SMS state for request %s -> %s", shift_request_id, status)
-
-
 # --- SMS sending (Twilio) ---
 
 def dev_testers() -> set:
@@ -737,6 +695,7 @@ def place_alert_call(to: str) -> None:
         twiml="<Response><Hangup/></Response>",
     )
     logger.info("Placed alert call to %s", to)
+
 
 # --- Bubble sync helpers ---
 
@@ -808,6 +767,7 @@ def upsert_availability(nurse_id: int, date: str, shift_type: str, bubble_id: st
         "nurse_id": nurse_id, "date": date, "shift_type": shift_type, "status": "pending",
         "bubble_id": bubble_id,
     }).execute()
+
 
 # --- Shift history sync ---
 
