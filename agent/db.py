@@ -5,6 +5,16 @@ The agent never writes raw SQL. It calls these helpers, which call the database
 functions (get_candidate_pool, match_learned_decisions) and the call_events table.
 Keeping DB access here means the agent code stays about *conversation and decisions*,
 not query plumbing.
+
+KLARRA_MODE
+-----------
+dev   — no real-world side effects. Writes blocked, all SMS/calls redirected to the
+        dev phone, candidate pool replaced by a stand-in DevTest nurse.
+mid   — real Supabase writes, real texts to FACILITIES and DEV PHONES only.
+        Nurses are NEVER contacted: any number that isn't a dev tester or a
+        registered facility phone is blocked here at the transport layer, so a
+        mistake upstream still can't reach a nurse.
+live  — full automation, nurses contacted directly.
 """
 
 import os
@@ -14,13 +24,14 @@ from supabase import create_client, Client
 logger = logging.getLogger("knightingale-agent.db")
 
 # --- Safe mode ---
-# KLARRA_MODE=dev blocks all writes + SMS (logged, no-op). Reads always pass through.
 KLARRA_MODE = os.environ.get("KLARRA_MODE", "live").strip().strip('"').strip("'").lower()
 DEV = KLARRA_MODE == "dev"
+MID = KLARRA_MODE == "mid"
 
 
 def _blocked(action: str) -> bool:
-    """True if a write should be skipped because we're in dev mode."""
+    """True if a write should be skipped because we're in dev mode.
+    MID writes for real — the point of mid is genuine state, just no nurse contact."""
     if DEV:
         logger.warning("[DEV] blocked write: %s", action)
         return True
@@ -47,7 +58,7 @@ def get_client() -> Client:
         url = os.environ["SUPABASE_URL"]
         key = os.environ["SUPABASE_SERVICE_KEY"]
         _client = create_client(url, key)
-        logger.info("Supabase client initialised")
+        logger.info("Supabase client initialised (KLARRA_MODE=%s)", KLARRA_MODE)
     return _client
 
 
@@ -90,6 +101,9 @@ def get_candidate_pool(facility_slug: str, date: str, shift_type: str, role: str
     a real nurses-table row (found or auto-created via _get_or_create_dev_nurse), so it
     satisfies real foreign key constraints, regardless of what's actually in Supabase
     for approvals/availability.
+
+    Mid mode: returns the REAL pool — mid needs a genuine top-ranked nurse to name to
+    the facility. Nurses still aren't contacted (see send_sms / place_alert_call).
     """
     if DEV:
         dev_nurse = _get_or_create_dev_nurse(role)
@@ -388,6 +402,16 @@ def mark_request_done_dev(request_id: int) -> None:
     logger.info("[DEV] request %s marked dev_done", request_id)
 
 
+def mark_request_status(request_id: int, status: str) -> None:
+    """Set an arbitrary status on a shift request — used by mid mode to park a row as
+    'mid_handoff' so it isn't re-claimed while it's being filled manually."""
+    client = get_client()
+    client.table("shift_requests").update(
+        {"status": status, "updated_at": "now()"}
+    ).eq("id", request_id).execute()
+    logger.info("Request %s status -> %s", request_id, status)
+
+
 def set_dev_outcome(request_id: int, outcome: str) -> None:
     """Dev-only: store the nurse's outcome on the request row so the orchestrator
     can read it back and reply accurately. Bypasses the guard on purpose."""
@@ -651,7 +675,7 @@ def get_pending_admin_approval() -> dict | None:
 # --- SMS sending (Twilio) ---
 
 def dev_testers() -> set:
-    """Recognised tester numbers in dev (comma-separated KLARRA_DEV_PHONES,
+    """Recognised tester numbers in dev/mid (comma-separated KLARRA_DEV_PHONES,
     plus the primary KLARRA_DEV_PHONE)."""
     raw = os.environ.get("KLARRA_DEV_PHONES", "")
     s = {p.strip() for p in raw.split(",") if p.strip()}
@@ -661,9 +685,40 @@ def dev_testers() -> set:
     return s
 
 
+_facility_phone_cache: set | None = None
+
+
+def facility_phone_numbers(refresh: bool = False) -> set:
+    """Every number registered in facility_phones. Cached for the process lifetime
+    (refresh=True re-reads). Used by the mid-mode transport guard."""
+    global _facility_phone_cache
+    if _facility_phone_cache is None or refresh:
+        try:
+            client = get_client()
+            r = client.table("facility_phones").select("phone").execute()
+            _facility_phone_cache = {row["phone"] for row in (r.data or []) if row.get("phone")}
+        except Exception:
+            logger.exception("Could not load facility phone numbers")
+            return set()
+    return _facility_phone_cache
+
+
+def _mid_allows(to: str) -> bool:
+    """MID transport guard: only dev testers and registered facility numbers may be
+    contacted. Everything else — most importantly nurses — is blocked here, so a
+    mistake upstream still can't reach a nurse."""
+    if to in dev_testers():
+        return True
+    if to in facility_phone_numbers():
+        return True
+    return to in facility_phone_numbers(refresh=True)  # number added since boot
+
+
 def send_sms(to: str, body: str) -> None:
-    """Send an SMS via Twilio. In dev, allow sends to known testers (to their own
-    number); redirect anything else to the primary dev phone (or block)."""
+    """Send an SMS via Twilio.
+    dev  — allow sends to known testers; redirect anything else to the primary dev phone.
+    mid  — allow testers and registered facility numbers; BLOCK everything else (nurses).
+    live — send as addressed."""
     if DEV and to not in dev_testers():
         dev_to = os.environ.get("KLARRA_DEV_PHONE")
         if not dev_to:
@@ -671,6 +726,10 @@ def send_sms(to: str, body: str) -> None:
             return
         logger.warning("[DEV] redirect SMS %s -> %s", to, dev_to)
         to = dev_to
+    elif MID and not _mid_allows(to):
+        logger.warning("[MID] blocked SMS to non-facility/non-tester number %s: %s",
+                       to, body[:60])
+        return
     from twilio.rest import Client as TwilioClient
     tw = TwilioClient(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
     tw.messages.create(to=to, from_=os.environ["TWILIO_PHONE_NUMBER"], body=body)
@@ -679,7 +738,7 @@ def send_sms(to: str, body: str) -> None:
 
 def place_alert_call(to: str) -> None:
     """Place a short alert call via Twilio that hangs up immediately once answered —
-    a ring-based nudge to check the SMS offer just sent. Same DEV redirect as send_sms."""
+    a ring-based nudge to check the SMS offer just sent. Same mode rules as send_sms."""
     if DEV and to not in dev_testers():
         dev_to = os.environ.get("KLARRA_DEV_PHONE")
         if not dev_to:
@@ -687,6 +746,9 @@ def place_alert_call(to: str) -> None:
             return
         logger.warning("[DEV] redirect alert call %s -> %s", to, dev_to)
         to = dev_to
+    elif MID and not _mid_allows(to):
+        logger.warning("[MID] blocked alert call to non-facility/non-tester number %s", to)
+        return
     from twilio.rest import Client as TwilioClient
     tw = TwilioClient(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
     tw.calls.create(
