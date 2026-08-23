@@ -8,6 +8,16 @@ two never race on the same shift_requests row.
 sms_webhook.py routes nurse YES/NO replies into sms_nurse_offers and Paul's OK into
 sms_shift_state — that's what this orchestrator polls for.
 
+KLARRA_MODE=mid changes the whole shape of this: the nurse cascade is skipped
+entirely. The dev phones get the full request immediately so Paul/Vidhu can fill it
+by hand, and 30 seconds later the facility is texted the name of the top-ranked
+candidate — so the facility experiences a fast automatic fill while a human is
+actually doing the work behind it. See handle_request_mid().
+
+NOTE ON MID: the name goes to the facility at 30s whether or not that nurse has
+agreed to anything. If they later decline, the facility has already been told they're
+covering it and someone has to walk that back manually.
+
 Run:  python agent/sms_orchestrator.py
 """
 
@@ -36,6 +46,8 @@ ADMIN_PHONE = os.environ.get("KLARRA_DEV_PHONE")
 REMINDER_INTERVAL_SECONDS = 300  # 5 min
 MAX_REMINDERS = 2
 
+MID_FACILITY_DELAY_SECONDS = 30  # mid: pause before naming the nurse to the facility
+
 
 def _offer_status(offer_id: str) -> str | None:
     client = db.get_client()
@@ -61,6 +73,12 @@ def _compact_time(t: str) -> str:
     return t.replace(":", "") if t else t
 
 
+def _shift_time_desc(req: dict) -> str:
+    if req.get("start_time") and req.get("end_time"):
+        return f"{_compact_time(req['start_time'])} - {_compact_time(req['end_time'])}"
+    return req["shift_type"]
+
+
 def offer_message(nurse: dict, req: dict) -> str:
     nice_date = _short_date(req["date"])
     if req.get("start_time") and req.get("end_time"):
@@ -72,6 +90,15 @@ def offer_message(nurse: dict, req: dict) -> str:
         f"on {nice_date} {time_desc}. Please reply YES if you would like it. "
         f"Please reply NO if you would prefer to pass. Thank you"
     )
+
+
+def text_admins(body: str) -> None:
+    """Text every dev/admin number (KLARRA_DEV_PHONES + KLARRA_DEV_PHONE)."""
+    for phone in db.dev_testers():
+        try:
+            db.send_sms(phone, body)
+        except Exception:
+            logger.exception("Failed to text admin %s", phone)
 
 
 def text_offer_outcome(nurse: dict, req: dict, outcome: str) -> None:
@@ -188,7 +215,87 @@ def request_admin_approval(req: dict, nurse: dict) -> bool:
                           admin_reminder_count=reminders_sent)
 
 
+# --- MID MODE -------------------------------------------------------------
+
+def handle_request_mid(req: dict):
+    """
+    Mid mode: no nurse cascade at all.
+
+      1. Rank the real candidate pool (read-only — nobody is contacted).
+      2. Text every dev phone the full request immediately, with the ranked
+         shortlist, so Paul/Vidhu can go and fill it by hand.
+      3. Wait 30s, then text the facility naming the TOP-RANKED candidate —
+         regardless of whether that nurse has agreed to anything.
+      4. Park the row as 'mid_handoff' so it isn't re-claimed. The actual booking
+         is recorded manually in Bubble.
+
+    db.send_sms blocks any number that isn't a dev tester or a registered facility
+    number while KLARRA_MODE=mid, so a nurse cannot be contacted from this path.
+    """
+    fac = req["facilities"]
+    logger.info("[MID] handling request %s: %s %s %s at %s",
+                req["id"], req["role"], req["shift_type"], req["date"], fac["name"])
+
+    pool = db.get_candidate_pool(fac["slug"], req["date"], req["shift_type"], req["role"])
+    ranked: list[dict] = []
+    if pool:
+        ranked, _reason = rank_pool(pool, req)
+        ranked = rotate_top10(ranked)
+
+    # 1. Admins get the request straight away.
+    header = (
+        f"MID — shift request in, fill this one manually.\n"
+        f"Facility: {fac['name']}\n"
+        f"Date: {db.pretty_date(req['date'])}\n"
+        f"Shift: {_shift_time_desc(req)}\n"
+        f"Role: {req['role']}\n"
+        f"From: {req['facility_callback_number']}\n"
+    )
+    if ranked:
+        header += "Ranked:\n"
+        for i, n in enumerate(ranked[:10], 1):
+            header += f"{i} - {n['first_name']}: {int(n.get('reliability') or 0)}\n"
+        header += (
+            f"\nFacility will be told {ranked[0]['first_name']} is covering it "
+            f"in {MID_FACILITY_DELAY_SECONDS}s."
+        )
+    else:
+        header += "\nNo eligible candidates — facility gets a holding message."
+    text_admins(header.strip())
+
+    # 2. Pause, then tell the facility.
+    time.sleep(MID_FACILITY_DELAY_SECONDS)
+
+    callback = req.get("facility_callback_number")
+    if ranked and callback:
+        top = ranked[0]
+        db.send_sms(
+            callback,
+            f"Good news — {top['first_name']} is covering the "
+            f"{req['shift_type'].lower()} shift on {db.pretty_date(req['date'])}."
+        )
+        logger.info("[MID] told %s that %s is covering request %s",
+                    callback, top["first_name"], req["id"])
+    elif callback:
+        db.send_sms(
+            callback,
+            f"Thanks — we're confirming someone for the {req['shift_type'].lower()} "
+            f"shift on {db.pretty_date(req['date'])} now and will come back to you shortly."
+        )
+        text_admins(f"MID — no candidates for request {req['id']} ({fac['name']}, "
+                    f"{db.pretty_date(req['date'])} {req['shift_type']}). "
+                    f"Facility got a holding message.")
+
+    # 3. Park it — filled by hand in Bubble, not by this loop.
+    db.mark_request_status(req["id"], "mid_handoff")
+
+
+# --- LIVE / DEV MODE ------------------------------------------------------
+
 def handle_request(req: dict):
+    if db.MID:
+        return handle_request_mid(req)
+
     fac = req["facilities"]
     logger.info("SMS-filling request %s: %s %s %s at %s",
                 req["id"], req["role"], req["shift_type"], req["date"], fac["name"])
@@ -246,7 +353,8 @@ def handle_request(req: dict):
 
 
 def main():
-    logger.info("SMS orchestrator running. Polling every %ss.", POLL_SECONDS)
+    logger.info("SMS orchestrator running (KLARRA_MODE=%s). Polling every %ss.",
+                db.KLARRA_MODE, POLL_SECONDS)
     while True:
         try:
             req = db.claim_next_sms_request()
