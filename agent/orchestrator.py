@@ -39,10 +39,52 @@ AGENT_NAME = "knightingale-outbound"
 SKILL = (Path(__file__).parent.parent / "skills" / "nurse-selection.md").read_text()
 POLL_SECONDS = 5
 
+# Ranking-failure alerting: text the admins when the model can't rank, but at most
+# once per cooldown so a sustained outage doesn't flood the phone.
+RANK_ALERT_COOLDOWN_SECONDS = 1800  # 30 min
+_last_rank_alert_at = 0.0
 
-def rank_pool(pool: list[dict], req: dict) -> list[dict]:
+
+def _fallback_order(pool: list[dict]) -> list[dict]:
+    """Deterministic order to use when the model can't rank: most reliable first,
+    then alphabetical for stable ties. Beats raw Supabase row order, which is
+    arbitrary — a degraded night should still put sensible people first."""
+    return sorted(
+        pool,
+        key=lambda n: (-(n.get("reliability") or 0), (n.get("first_name") or "").lower()),
+    )
+
+
+def _alert_rank_failure(req: dict, err: Exception) -> None:
+    """Tell the admins that ranking degraded, so an unranked night is visible rather
+    than silent. Throttled by RANK_ALERT_COOLDOWN_SECONDS."""
+    global _last_rank_alert_at
+    now = time.time()
+    if now - _last_rank_alert_at < RANK_ALERT_COOLDOWN_SECONDS:
+        return
+    _last_rank_alert_at = now
+    body = (
+        "Klarra: nurse ranking unavailable.\n"
+        f"Reason: {type(err).__name__}\n"
+        f"Request: {req.get('id')} ({req.get('facilities', {}).get('name', '?')}, "
+        f"{db.pretty_date(req.get('date', ''))} {req.get('shift_type', '?')})\n\n"
+        "Falling back to reliability order. Check OpenAI billing/quota."
+    )
+    for phone in db.dev_testers():
+        try:
+            db.send_sms(phone, body)
+        except Exception:
+            logger.exception("Failed to send rank-failure alert to %s", phone)
+
+
+def rank_pool(pool: list[dict], req: dict) -> tuple[list[dict], str]:
     """Ask the model to order the eligible pool per the decision skill. Returns
-    (ranked_pool, reason_for_top_pick). Falls back to original order on any error."""
+    (ranked_pool, reason_for_top_pick).
+
+    On any failure — quota exhausted, API down, unparseable response — falls back to
+    reliability order and alerts the admins. The fallback used to be the pool's raw
+    order, which meant a silent quota failure produced a 'top-ranked' nurse that was
+    really just whichever row Supabase returned first."""
     client = openai_sdk.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
     prompt = (
         f"{SKILL}\n\n---\nYou are ranking nurses for this shift: "
@@ -71,9 +113,12 @@ def rank_pool(pool: list[dict], req: dict) -> list[dict]:
                 ranked.append(n)
         logger.info("Ranked order: %s", [n["first_name"] for n in ranked])
         return ranked, reason
-    except Exception:
-        logger.exception("Ranking failed; using pool order")
-        return pool, ""
+    except Exception as err:
+        logger.exception("Ranking failed; falling back to reliability order")
+        _alert_rank_failure(req, err)
+        fallback = _fallback_order(pool)
+        logger.info("Fallback order: %s", [n["first_name"] for n in fallback])
+        return fallback, "ranking unavailable — ordered by reliability"
 
 
 def rotate_top10(ranked: list[dict]) -> list[dict]:
