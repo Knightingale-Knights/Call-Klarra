@@ -48,6 +48,32 @@ def pretty_date(d: str) -> str:
         return str(d)
 
 
+def normalise_phone(raw: str | None) -> str | None:
+    """Normalise an Australian number to E.164 (+61XXXXXXXXX).
+
+    Twilio always sends and expects E.164, but Bubble stores numbers however they
+    were typed ('0412 345 678', '0412345678'). Nurse YES/NO routing matches the
+    Twilio 'From' string against nurses.phone exactly, so a mismatch in format means
+    a reply silently fails to route. Everything written or looked up goes through
+    here so both sides agree.
+
+    Anything that doesn't look like an AU number is returned unchanged rather than
+    mangled — bad data stays visibly bad instead of becoming a plausible wrong number.
+    """
+    if not raw:
+        return raw
+    digits = "".join(c for c in str(raw) if c.isdigit())
+    if str(raw).strip().startswith("+"):
+        return "+" + digits
+    if len(digits) == 10 and digits.startswith("0"):        # 0412345678
+        return "+61" + digits[1:]
+    if len(digits) == 11 and digits.startswith("61"):       # 61412345678
+        return "+" + digits
+    if len(digits) == 9 and digits[0] in "2345789":         # 412345678
+        return "+61" + digits
+    return str(raw).strip()
+
+
 _client: Client | None = None
 
 
@@ -67,7 +93,7 @@ def _get_or_create_dev_nurse(role: str) -> dict | None:
     so the hardcoded stand-in candidate has a genuine nurse_id — satisfies real
     foreign key constraints (e.g. sms_nurse_offers.nurse_id) instead of a fake
     sentinel that only worked for update-based writes."""
-    dev_phone = os.environ.get("KLARRA_DEV_PHONE")
+    dev_phone = normalise_phone(os.environ.get("KLARRA_DEV_PHONE"))
     if not dev_phone:
         return None
     client = get_client()
@@ -254,7 +280,7 @@ def facility_by_phone(phone: str) -> dict | None:
     resp = (
         client.table("facility_phones")
         .select("facility_id, facilities(id, name, slug, complexity)")
-        .eq("phone", phone)
+        .eq("phone", normalise_phone(phone))
         .limit(1)
         .execute()
     )
@@ -615,6 +641,7 @@ def get_active_offer_by_phone(phone: str) -> dict | None:
     """Find this nurse's most recent unresolved (offered/alerted) SMS offer, if any —
     used by sms_webhook to route a YES/NO reply to the right offer row."""
     client = get_client()
+    phone = normalise_phone(phone)
     nurse = client.table("nurses").select("id, first_name").eq("phone", phone).limit(1).execute()
     if not nurse.data:
         return None
@@ -639,6 +666,7 @@ def get_latest_offer_by_phone(phone: str) -> dict | None:
     a sensible reply to a late YES/NO that arrived after the offer window closed,
     instead of falling through to the generic unrecognised-number message."""
     client = get_client()
+    phone = normalise_phone(phone)
     nurse = client.table("nurses").select("id, first_name").eq("phone", phone).limit(1).execute()
     if not nurse.data:
         return None
@@ -678,8 +706,8 @@ def dev_testers() -> set:
     """Recognised tester numbers in dev/mid (comma-separated KLARRA_DEV_PHONES,
     plus the primary KLARRA_DEV_PHONE)."""
     raw = os.environ.get("KLARRA_DEV_PHONES", "")
-    s = {p.strip() for p in raw.split(",") if p.strip()}
-    primary = os.environ.get("KLARRA_DEV_PHONE")
+    s = {normalise_phone(p.strip()) for p in raw.split(",") if p.strip()}
+    primary = normalise_phone(os.environ.get("KLARRA_DEV_PHONE"))
     if primary:
         s.add(primary)
     return s
@@ -696,7 +724,8 @@ def facility_phone_numbers(refresh: bool = False) -> set:
         try:
             client = get_client()
             r = client.table("facility_phones").select("phone").execute()
-            _facility_phone_cache = {row["phone"] for row in (r.data or []) if row.get("phone")}
+            _facility_phone_cache = {normalise_phone(row["phone"])
+                                     for row in (r.data or []) if row.get("phone")}
         except Exception:
             logger.exception("Could not load facility phone numbers")
             return set()
@@ -707,6 +736,7 @@ def _mid_allows(to: str) -> bool:
     """MID transport guard: only dev testers and registered facility numbers may be
     contacted. Everything else — most importantly nurses — is blocked here, so a
     mistake upstream still can't reach a nurse."""
+    to = normalise_phone(to)
     if to in dev_testers():
         return True
     if to in facility_phone_numbers():
@@ -719,6 +749,7 @@ def send_sms(to: str, body: str) -> None:
     dev  — allow sends to known testers; redirect anything else to the primary dev phone.
     mid  — allow testers and registered facility numbers; BLOCK everything else (nurses).
     live — send as addressed."""
+    to = normalise_phone(to)
     if DEV and to not in dev_testers():
         dev_to = os.environ.get("KLARRA_DEV_PHONE")
         if not dev_to:
@@ -739,6 +770,7 @@ def send_sms(to: str, body: str) -> None:
 def place_alert_call(to: str) -> None:
     """Place a short alert call via Twilio that hangs up immediately once answered —
     a ring-based nudge to check the SMS offer just sent. Same mode rules as send_sms."""
+    to = normalise_phone(to)
     if DEV and to not in dev_testers():
         dev_to = os.environ.get("KLARRA_DEV_PHONE")
         if not dev_to:
@@ -779,7 +811,8 @@ def upsert_nurse(bubble_id: str, first_name: str, last_name: str, phone: str,
     client = get_client()
     existing = client.table("nurses").select("id").eq("bubble_user_id", bubble_id).limit(1).execute()
     payload = {
-        "first_name": first_name, "last_name": last_name, "phone": phone,
+        "first_name": first_name, "last_name": last_name,
+        "phone": normalise_phone(phone),
         "role": role, "address": address, "bubble_user_id": bubble_id,
     }
     if existing.data:
