@@ -8,6 +8,12 @@ two never race on the same shift_requests row.
 sms_webhook.py routes nurse YES/NO replies into sms_nurse_offers and Paul's OK into
 sms_shift_state — that's what this orchestrator polls for.
 
+Role escalation: if nobody at the requested level takes the shift, the loop moves up
+db.escalation_ladder() (PCA -> EN -> RN) and appends that tier's candidates below the
+exhausted ones, texting the admins each time it steps up. A higher tier usually bills
+at a higher rate, so escalation only happens after every candidate at the current level
+has declined or not replied.
+
 KLARRA_MODE=mid changes the whole shape of this: the nurse cascade is skipped
 entirely. The dev phones get the full request immediately so Paul/Vidhu can fill it
 by hand, and 30 seconds later the facility is texted the name of the top-ranked
@@ -142,6 +148,20 @@ def send_fyi(req: dict, nurse: dict, ranked: list[dict]) -> None:
         db.send_sms(ADMIN_PHONE, body.strip())
     except Exception:
         logger.exception("Failed to send SMS FYI")
+
+
+def notify_escalation(req: dict, new_role: str) -> None:
+    """Tell the admins the shift has moved up a rung. Escalation normally means a
+    higher billing rate than the facility asked for, so it should never happen
+    silently."""
+    body = (
+        f"Escalating shift — no {req['role']} took it.\n"
+        f"Now offering to: {new_role}\n"
+        f"Facility: {req['facilities']['name']}\n"
+        f"Date: {db.pretty_date(req['date'])}\n"
+        f"Shift: {_shift_time_desc(req)}"
+    )
+    text_admins(body)
 
 
 def offer_nurse(offer: dict, req: dict) -> str:
@@ -300,38 +320,56 @@ def handle_request(req: dict):
     logger.info("SMS-filling request %s: %s %s %s at %s",
                 req["id"], req["role"], req["shift_type"], req["date"], fac["name"])
 
-    pool = db.get_candidate_pool(fac["slug"], req["date"], req["shift_type"], req["role"])
-    if not pool:
-        logger.info("No eligible nurses for request %s", req["id"])
-        db.mark_request_unfilled(req["id"])
-        db.send_sms(req["facility_callback_number"],
-                    f"Sorry, no one was available for the {req['shift_type'].lower()} "
-                    f"shift on {db.pretty_date(req['date'])} yet. We'll keep trying.")
-        if db.DEV:
-            db.mark_request_done_dev(req["id"])
-        return
-
-    ranked, reason = rank_pool(pool, req)
-    ranked = rotate_top10(ranked)
-    db.create_sms_offers(req["id"], ranked)
+    ladder = db.escalation_ladder(req["role"])
+    ranked: list[dict] = []
+    tier_index = 0
+    tried_any = False
 
     while True:
         offer = db.get_next_pending_offer(req["id"])
-        if not offer:
-            logger.info("SMS offer pool exhausted for request %s", req["id"])
-            db.mark_request_unfilled(req["id"])
-            db.mark_sms_state(req["id"], "no_availability")
-            db.send_sms(req["facility_callback_number"],
-                        f"Sorry, no one was available for the {req['shift_type'].lower()} "
-                        f"shift on {db.pretty_date(req['date'])} yet. We'll keep trying.")
-            if ADMIN_PHONE:
-                db.send_sms(ADMIN_PHONE, f"No one accepted request {req['id']} "
-                            f"({fac['name']}, {db.pretty_date(req['date'])} "
-                            f"{req['shift_type']}).")
-            if db.DEV:
-                db.mark_request_done_dev(req["id"])
-            return
 
+        if not offer:
+            # Current tier is exhausted (or we haven't loaded one yet). Move up the
+            # ladder until a tier actually has candidates, then keep going.
+            escalated = False
+            while tier_index < len(ladder):
+                role = ladder[tier_index]
+                tier_index += 1
+                pool = db.get_candidate_pool(fac["slug"], req["date"],
+                                             req["shift_type"], role)
+                if not pool:
+                    logger.info("No %s candidates for request %s", role, req["id"])
+                    continue
+                tier_ranked, _reason = rank_pool(pool, req)
+                tier_ranked = rotate_top10(tier_ranked)
+                db.create_sms_offers(req["id"], tier_ranked)
+                ranked = ranked + [n for n in tier_ranked if n not in ranked]
+                if tried_any:
+                    notify_escalation(req, role)
+                logger.info("Request %s now offering at %s tier (%d candidates)",
+                            req["id"], role, len(tier_ranked))
+                escalated = True
+                break
+
+            if escalated:
+                offer = db.get_next_pending_offer(req["id"])
+
+            if not offer:
+                logger.info("All tiers exhausted for request %s", req["id"])
+                db.mark_request_unfilled(req["id"])
+                db.mark_sms_state(req["id"], "no_availability")
+                db.send_sms(req["facility_callback_number"],
+                            f"Sorry, no one was available for the {req['shift_type'].lower()} "
+                            f"shift on {db.pretty_date(req['date'])} yet. We'll keep trying.")
+                if ADMIN_PHONE:
+                    db.send_sms(ADMIN_PHONE, f"No one accepted request {req['id']} "
+                                f"({fac['name']}, {db.pretty_date(req['date'])} "
+                                f"{req['shift_type']}, {req['role']} + escalations).")
+                if db.DEV:
+                    db.mark_request_done_dev(req["id"])
+                return
+
+        tried_any = True
         outcome = offer_nurse(offer, req)
         if outcome == "accepted":
             nurse = offer["nurses"]
@@ -349,7 +387,7 @@ def handle_request(req: dict):
             if db.DEV:
                 db.mark_request_done_dev(req["id"])
             return
-        # declined or no_reply -> loop continues to the next pending offer
+        # declined or no_reply -> next pending offer, or the next tier up
 
 
 def main():
