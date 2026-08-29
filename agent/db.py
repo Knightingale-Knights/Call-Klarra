@@ -235,6 +235,29 @@ def insert_learned_decision(situation_text: str, ruling: str,
     logger.info("Saved learned decision: %s", situation_text[:60])
 
 
+# --- Role escalation ---------------------------------------------------------
+# If nobody at the requested level takes a shift, Klarra works UP the ladder:
+# a PCA shift can be covered by an EN, and an EN shift by an RN. It never works
+# down (an RN shift is never offered to a PCA), and DSW sits outside the ladder
+# entirely — disability support is a separate stream, not a lower rung of aged care.
+#
+# Escalating usually means a higher billing rate, so the orchestrators only move to
+# the next tier once everyone at the current tier has declined or not replied, and
+# they text the admins when they do.
+ROLE_ESCALATION = {
+    "PCA": ["PCA", "EN", "RN"],
+    "EN": ["EN", "RN"],
+    "RN": ["RN"],
+    "DSW": ["DSW"],
+}
+
+
+def escalation_ladder(role: str) -> list[str]:
+    """Roles to try, in order, for a shift requested at `role`. Unknown roles get
+    themselves only — never guess an escalation path we haven't defined."""
+    return ROLE_ESCALATION.get((role or "").strip().upper(), [role])
+
+
 # --- Facility identification by caller number (Step 15) ---
 
 def list_facilities() -> list[dict]:
@@ -544,38 +567,50 @@ def create_sms_offers(shift_request_id: int, ranked_pool: list[dict]) -> None:
     flow itself (not real nurses/facilities/shifts), so there's nothing to protect by
     blocking them; blocking them would just break dev testing entirely.
 
-    Idempotent: if a cascade already exists for this request (e.g. a crashed or
-    reprocessed attempt), skips re-creating it instead of erroring on the duplicate key.
+    Safe to call more than once for the same request. The header row is created only
+    on the first call; later calls APPEND their nurses below the existing ones, which
+    is how role escalation adds an EN tier under an exhausted PCA tier. Nurses already
+    holding an offer for this request are skipped, so a re-run or an overlapping pool
+    can't double-text anyone.
     """
     client = get_client()
-    existing = (
+    existing_state = (
         client.table("sms_shift_state")
         .select("shift_request_id")
         .eq("shift_request_id", shift_request_id)
         .limit(1)
         .execute()
     )
-    if existing.data:
-        logger.info("SMS offer cascade already exists for request %s, skipping create",
-                    shift_request_id)
-        return
-    client.table("sms_shift_state").insert({
-        "shift_request_id": shift_request_id,
-        "status": "offering",
-    }).execute()
-    rows = [
-        {
+    if not existing_state.data:
+        client.table("sms_shift_state").insert({
+            "shift_request_id": shift_request_id,
+            "status": "offering",
+        }).execute()
+
+    prior = (
+        client.table("sms_nurse_offers")
+        .select("nurse_id, rank_position")
+        .eq("shift_request_id", shift_request_id)
+        .execute()
+    )
+    already = {r["nurse_id"] for r in (prior.data or [])}
+    next_rank = max((r["rank_position"] or 0) for r in prior.data) + 1 if prior.data else 1
+
+    rows = []
+    for n in ranked_pool:
+        if n["nurse_id"] in already:
+            continue
+        rows.append({
             "shift_request_id": shift_request_id,
             "nurse_id": n["nurse_id"],
-            "rank_position": i,
+            "rank_position": next_rank,
             "status": "pending",
-        }
-        for i, n in enumerate(ranked_pool, 1)
-    ]
+        })
+        next_rank += 1
     if rows:
         client.table("sms_nurse_offers").insert(rows).execute()
-    logger.info("Created SMS offer cascade for request %s (%d nurses)",
-                shift_request_id, len(rows))
+    logger.info("SMS offer cascade for request %s: added %d nurses (%d already offered)",
+                shift_request_id, len(rows), len(already))
 
 
 def get_next_pending_offer(shift_request_id: int) -> dict | None:
