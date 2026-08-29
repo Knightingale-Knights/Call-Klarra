@@ -29,6 +29,54 @@ BASE = "https://knightingale.com.au/api/1.1/obj"
 TOKEN = os.environ["BUBBLE_API_TOKEN"]
 HEADERS = {"Authorization": f"Bearer {TOKEN}"}
 
+# Roles we staff, most senior first. A carer is stored under ONE role — the highest
+# they hold — so someone qualified as both EN and PCA is only offered EN shifts.
+# If dual-qualified carers need to see both, this becomes a roles[] column and a
+# change to get_candidate_pool; single role is deliberate for now.
+ROLE_PRIORITY = ["RN", "EN", "PCA", "DSW"]
+
+# How Bubble's free-text role values map onto the four above. Anything not listed
+# here is not a staffable role for Klarra (Chef, Admin, etc.) and the carer is skipped.
+ROLE_ALIASES = {
+    "RN": "RN",
+    "REGISTERED NURSE": "RN",
+    "EN": "EN",
+    "ENROLLED NURSE": "EN",
+    "PCA": "PCA",
+    "PERSONAL CARE ASSISTANT": "PCA",
+    "PERSONAL CARE WORKER": "PCA",
+    "PCW": "PCA",
+    "AIN": "PCA",
+    "DSW": "DSW",
+    "DISABILITY SUPPORT WORKER": "DSW",
+    "SUPPORT WORKER": "DSW",
+}
+
+_unmapped_roles: set[str] = set()
+
+
+def pick_role(roles_list) -> str | None:
+    """Take the highest-priority staffable role from Bubble's roles array.
+
+    Returns None if the carer holds no role we staff — that carer is skipped, which
+    is why PCAs and DSWs were previously absent from Supabase entirely: the old
+    version only recognised EN and RN, so everyone else silently fell out of the sync.
+    """
+    if not roles_list:
+        return None
+    found = set()
+    for raw in roles_list:
+        key = str(raw).strip().upper()
+        mapped = ROLE_ALIASES.get(key)
+        if mapped:
+            found.add(mapped)
+        else:
+            _unmapped_roles.add(str(raw).strip())
+    for role in ROLE_PRIORITY:
+        if role in found:
+            return role
+    return None
+
 
 def fetch_all(datatype: str, constraints: list | None = None) -> list[dict]:
     """Page through a Bubble data type, respecting its 100-per-call limit."""
@@ -50,18 +98,6 @@ def fetch_all(datatype: str, constraints: list | None = None) -> list[dict]:
     return results
 
 
-def pick_role(roles_list) -> str | None:
-    """Take EN or RN from the roles array; ignore others (DSW, AIN, etc.)."""
-    if not roles_list:
-        return None
-    upper = [str(r).upper() for r in roles_list]
-    if "RN" in upper:
-        return "RN"
-    if "EN" in upper:
-        return "EN"
-    return None
-
-
 def sync_nurses():
     users = fetch_all("user", constraints=[
         {"key": "account type", "constraint_type": "equals", "value": "carer"},
@@ -69,11 +105,18 @@ def sync_nurses():
     ])
     logger.info("Fetched %d carers from Bubble", len(users))
     synced = 0
+    skipped_no_role = 0
+    skipped_no_phone = 0
+    by_role: dict[str, int] = {}
     for u in users:
         role = pick_role(u.get("roles"))
         phone = u.get("phone number")
-        if not role or not phone:
-            continue  # need a callable phone and a staffable role
+        if not role:
+            skipped_no_role += 1
+            continue
+        if not phone:
+            skipped_no_phone += 1
+            continue
         addr = (u.get("address") or {}).get("address") if isinstance(u.get("address"), dict) else None
         nid = db.upsert_nurse(
             bubble_id=u["_id"],
@@ -86,8 +129,15 @@ def sync_nurses():
         slugs = [db.FACILITY_NAME_TO_SLUG[n] for n in (u.get("work locations") or [])
                  if n in db.FACILITY_NAME_TO_SLUG]
         db.set_nurse_approvals(nid, slugs)
+        by_role[role] = by_role.get(role, 0) + 1
         synced += 1
-    logger.info("Synced %d nurses", synced)
+    logger.info("Synced %d nurses (%s)", synced,
+                ", ".join(f"{r}: {c}" for r, c in sorted(by_role.items())) or "none")
+    logger.info("Skipped: %d no staffable role, %d no phone",
+                skipped_no_role, skipped_no_phone)
+    if _unmapped_roles:
+        logger.warning("Unmapped Bubble roles seen (add to ROLE_ALIASES if staffable): %s",
+                       ", ".join(sorted(_unmapped_roles)))
 
 
 def sync_availability():
