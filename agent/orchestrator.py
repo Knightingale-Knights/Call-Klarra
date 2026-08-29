@@ -9,7 +9,8 @@ Loop:
      accepted/declined/no_answer outcome (read from call_events).
      - accepted -> mark filled, call the facility back with the good news, stop.
      - else     -> next nurse.
-  5. Pool exhausted -> mark unfilled, call the facility back.
+  5. Pool exhausted -> escalate up the role ladder (PCA -> EN -> RN) and repeat;
+     all tiers exhausted -> mark unfilled, call the facility back.
 
 Run:  python agent/orchestrator.py
 (Needs the outbound worker running too: python agent/outbound.py dev)
@@ -229,36 +230,81 @@ def _logged_at(req: dict) -> float:
 
 
 async def handle_request(lk: api.LiveKitAPI, req: dict):
+    """Fill a shift, escalating up the role ladder if nobody at the requested level
+    takes it (PCA -> EN -> RN). Each tier is fully exhausted before the next is tried,
+    and stepping up texts the admins — a higher tier usually bills at a higher rate."""
     fac = req["facilities"]
     logger.info("Filling request %s: %s %s %s at %s",
                 req["id"], req["role"], req["shift_type"], req["date"], fac["name"])
 
-    pool = db.get_candidate_pool(fac["slug"], req["date"], req["shift_type"], req["role"])
-    if not pool:
-        logger.info("No eligible nurses for request %s", req["id"])
-        db.mark_request_unfilled(req["id"])
-        await notify_facility(lk, req, filled=False, nurse_name=None)
-        if db.DEV:
-            db.mark_request_done_dev(req["id"])
-        return
+    ladder = db.escalation_ladder(req["role"])
+    tried_any = False
+    waited_afterhours = False
 
-    ranked, reason = rank_pool(pool, req)
-    ranked = rotate_top10(ranked)
+    for role in ladder:
+        pool = db.get_candidate_pool(fac["slug"], req["date"], req["shift_type"], role)
+        if not pool:
+            logger.info("No %s candidates for request %s", role, req["id"])
+            continue
 
-    if is_afterhours():
-        await _handle_afterhours(lk, req, ranked, reason)
-    else:
-        await _handle_daytime(lk, req, ranked, reason)
+        if tried_any:
+            notify_escalation(req, role)
+        logger.info("Request %s now trying %s tier (%d candidates)",
+                    req["id"], role, len(pool))
+
+        ranked, reason = rank_pool(pool, req)
+        ranked = rotate_top10(ranked)
+        tried_any = True
+
+        if is_afterhours():
+            filled = await _handle_afterhours(lk, req, ranked, reason,
+                                              skip_wait=waited_afterhours)
+            waited_afterhours = True
+        else:
+            filled = await _handle_daytime(lk, req, ranked, reason)
+
+        if filled:
+            if db.DEV:
+                db.mark_request_done_dev(req["id"])
+            return
+
+    logger.info("All tiers exhausted for request %s", req["id"])
+    db.mark_request_unfilled(req["id"])
+    await notify_facility(lk, req, filled=False, nurse_name=None)
+    if db.DEV:
+        db.mark_request_done_dev(req["id"])
 
 
-async def _handle_afterhours(lk, req, ranked, reason):
+def notify_escalation(req: dict, new_role: str) -> None:
+    """Tell the admins the shift has moved up a rung, so a higher-rate carer is never
+    offered a shift without anyone knowing."""
+    body = (
+        f"Escalating shift — no {req['role']} took it.\n"
+        f"Now offering to: {new_role}\n"
+        f"Facility: {req['facilities']['name']}\n"
+        f"Date: {db.pretty_date(req['date'])}\n"
+        f"Shift: {req['shift_type']}"
+    )
+    for phone in db.dev_testers():
+        try:
+            db.send_sms(phone, body)
+        except Exception:
+            logger.exception("Failed to send escalation alert to %s", phone)
+
+
+async def _handle_afterhours(lk, req, ranked, reason, skip_wait: bool = False) -> bool:
     """Wait 3 min from when the shift was logged, then assign the top available
-    candidate (no nurse call — availability = assignment) and call the facility back."""
-    elapsed = time.time() - _logged_at(req)
-    remaining = CALLBACK_DELAY_SECONDS - elapsed
-    if remaining > 0:
-        logger.info("Afterhours: holding %ds before facility callback", int(remaining))
-        await asyncio.sleep(remaining)
+    candidate (no nurse call — availability = assignment) and call the facility back.
+
+    Returns True if the shift was filled. Returns False if every candidate in this
+    tier was taken, so the caller can escalate; the caller owns the unfilled path.
+    skip_wait avoids re-serving the 3-minute hold on a second or third tier."""
+    if not skip_wait:
+        elapsed = time.time() - _logged_at(req)
+        remaining = CALLBACK_DELAY_SECONDS - elapsed
+        if remaining > 0:
+            logger.info("Afterhours: holding %ds before facility callback", int(remaining))
+            await asyncio.sleep(remaining)
 
     # Try each ranked nurse in order; skip any that got taken in the meantime
     # (conditional update only succeeds if their availability is still 'pending').
@@ -271,25 +317,22 @@ async def _handle_afterhours(lk, req, ranked, reason):
                     candidate["first_name"], req["id"])
 
     if not top:
-        logger.info("All candidates taken for request %s", req["id"])
-        db.mark_request_unfilled(req["id"])
-        await notify_facility(lk, req, filled=False, nurse_name=None)
-        if db.DEV:
-            db.mark_request_done_dev(req["id"])
-        return
+        logger.info("All candidates in this tier taken for request %s", req["id"])
+        return False
 
     logger.info("Selected %s for request %s (%s)", top["first_name"], req["id"], reason)
 
     db.mark_request_filled(req["id"], top["nurse_id"])
     await notify_facility(lk, req, filled=True, nurse_name=top["first_name"])
     send_fyi(req, top, reason, ranked=ranked)
-    if db.DEV:
-        db.mark_request_done_dev(req["id"])
+    return True
 
 
-async def _handle_daytime(lk, req, ranked, reason):
+async def _handle_daytime(lk, req, ranked, reason) -> bool:
     """Call ranked nurses one at a time until one accepts. Availability is only
-    flipped to 'assigned' on accept, via the conditional write (race-safe)."""
+    flipped to 'assigned' on accept, via the conditional write (race-safe).
+
+    Returns True if the shift was filled, False if this tier is exhausted."""
     for candidate in ranked:
         logger.info("Calling %s for request %s", candidate["first_name"], req["id"])
         outcome = await call_one_nurse(lk, candidate, req)
@@ -302,19 +345,14 @@ async def _handle_daytime(lk, req, ranked, reason):
                 db.mark_request_filled(req["id"], candidate["nurse_id"])
                 await notify_facility(lk, req, filled=True, nurse_name=candidate["first_name"])
                 send_fyi(req, candidate, reason, ranked=ranked)
-                if db.DEV:
-                    db.mark_request_done_dev(req["id"])
-                return
+                return True
             logger.info("Nurse %s accepted but slot was already taken, trying next",
                         candidate["first_name"])
         else:
             logger.info("Nurse %s outcome: %s, trying next", candidate["first_name"], outcome)
 
-    logger.info("All candidates exhausted for request %s", req["id"])
-    db.mark_request_unfilled(req["id"])
-    await notify_facility(lk, req, filled=False, nurse_name=None)
-    if db.DEV:
-        db.mark_request_done_dev(req["id"])
+    logger.info("Tier exhausted for request %s", req["id"])
+    return False
 
 
 def send_fyi(req, nurse, reason, ranked=None):
