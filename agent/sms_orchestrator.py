@@ -8,6 +8,12 @@ two never race on the same shift_requests row.
 sms_webhook.py routes nurse YES/NO replies into sms_nurse_offers and Paul's OK into
 sms_shift_state — that's what this orchestrator polls for.
 
+Late replies: offers go out every ~40s, but a nurse's YES is honoured whenever it
+arrives, as long as nobody else has claimed the shift (sms_webhook does the claiming
+via db.claim_shift). This loop watches for that claim between and during offers and
+stops the cascade as soon as one lands, so a carer who takes five minutes to look at
+their phone can still get the shift.
+
 Role escalation: if nobody at the requested level takes the shift, the loop moves up
 db.escalation_ladder() (PCA -> EN -> RN) and appends that tier's candidates below the
 exhausted ones, texting the admins each time it steps up. A higher tier usually bills
@@ -164,6 +170,21 @@ def notify_escalation(req: dict, new_role: str) -> None:
     text_admins(body)
 
 
+def claimed_nurse(req: dict) -> dict | None:
+    """If someone has claimed this shift (via a YES to sms_webhook), return that nurse.
+
+    A claim can land at any moment — including from a nurse whose offer window closed
+    minutes ago, since late replies are honoured while the shift is unfilled. So every
+    wait loop checks for it rather than only watching the current candidate's offer."""
+    state = db.get_sms_state(req["id"])
+    if not state or state.get("status") != "claimed":
+        return None
+    nurse_id = state.get("confirmed_nurse_id")
+    if not nurse_id:
+        return None
+    return db.get_nurse(nurse_id)
+
+
 def offer_nurse(offer: dict, req: dict) -> str:
     """Text one nurse the offer, alert-call them, wait for a reply. Returns the
     resulting offer status: accepted, declined, or no_reply. Texts Paul the outcome
@@ -183,6 +204,8 @@ def offer_nurse(offer: dict, req: dict) -> str:
         if status in ("accepted", "declined"):
             text_offer_outcome(nurse, req, status)
             return status
+        if claimed_nurse(req):
+            return "claimed"
 
     db.place_alert_call(nurse["phone"])
     db.mark_offer(offer["id"], "alerted", alert_called_at="now()")
@@ -195,7 +218,11 @@ def offer_nurse(offer: dict, req: dict) -> str:
         if status in ("accepted", "declined"):
             text_offer_outcome(nurse, req, status)
             return status
+        if claimed_nurse(req):
+            return "claimed"
 
+    # Window closed for this candidate, but their offer row stays readable — a YES
+    # arriving later still claims the shift if nobody else has taken it.
     db.mark_offer(offer["id"], "no_reply")
     text_offer_outcome(nurse, req, "no_reply")
     return "no_reply"
@@ -326,6 +353,25 @@ def handle_request(req: dict):
     tried_any = False
 
     while True:
+        winner = claimed_nurse(req)
+        if winner:
+            logger.info("Request %s claimed by nurse %s before next offer",
+                        req["id"], winner["id"])
+            db.skip_remaining_offers(req["id"])
+            if request_admin_approval(req, winner):
+                db.assign_availability(winner["id"], req["date"], req["shift_type"])
+                db.mark_request_filled(req["id"], winner["id"])
+                db.mark_sms_state(req["id"], "confirmed", confirmed_nurse_id=winner["id"],
+                                  admin_approved_at="now()")
+                db.send_sms(req["facility_callback_number"],
+                            f"Good news — {winner['first_name']} is covering the "
+                            f"{req['shift_type'].lower()} shift on "
+                            f"{db.pretty_date(req['date'])}.")
+                send_fyi(req, winner, ranked)
+            if db.DEV:
+                db.mark_request_done_dev(req["id"])
+            return
+
         offer = db.get_next_pending_offer(req["id"])
 
         if not offer:
@@ -371,8 +417,15 @@ def handle_request(req: dict):
 
         tried_any = True
         outcome = offer_nurse(offer, req)
-        if outcome == "accepted":
-            nurse = offer["nurses"]
+
+        # Someone has said yes — either this candidate, or another nurse replying
+        # late while we were working down the list. Either way the cascade stops here.
+        winner = claimed_nurse(req)
+        if outcome in ("accepted", "claimed") or winner:
+            nurse = winner or offer["nurses"]
+            db.skip_remaining_offers(req["id"], except_offer_id=offer["id"])
+            if outcome == "claimed":
+                text_offer_outcome(nurse, req, "accepted (replied late)")
             approved = request_admin_approval(req, nurse)
             if approved:
                 db.assign_availability(nurse["id"], req["date"], req["shift_type"])
