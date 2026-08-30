@@ -15,9 +15,10 @@ Routing order matters, and is deliberately this order:
      KLARRA_DEV_PHONE) — without this priority, a nurse's genuine YES/NO gets
      swallowed by the facility-request parser instead of reaching the offer.
   3. Recognised facility -> shift-request parsing.
-  4. Not a facility, but has past (non-active) offer history -> "already sorted"
-     reply, so a late YES/NO doesn't fall through to the generic unrecognised-number
-     message.
+  4. Not a facility, but has past offer history -> a late YES still claims the shift
+     if nobody else has, otherwise they're told another carer got it. Carers reply on
+     their own schedule and a YES a few minutes after the offer is normal, so it is
+     never dropped just because the cascade has moved on.
   5. Otherwise -> afterhours chat / unrecognised-number fallback.
 
 Run:  python agent/sms_webhook.py
@@ -43,6 +44,11 @@ logger = logging.getLogger("knightingale-sms")
 
 app = Flask(__name__)
 
+# Roles Knightingale staffs. Must match the values sync_bubble.py writes to
+# nurses.role — get_candidate_pool matches on this string exactly, so a request
+# parsed as a role no carer holds finds an empty pool.
+STAFFED_ROLES = ["RN", "EN", "PCA", "DSW"]
+
 ACK_REPLIES = [
     "Absolutely, working on this — one moment.",
     "Sure, we're on it.",
@@ -59,7 +65,12 @@ def _today_melb() -> str:
 
 
 def parse_request(text: str) -> dict | None:
-    """Use Claude to pull date/shift/role/times/facility from the text. Returns dict or None."""
+    """Use Claude to pull date/shift/role/times/facility from the text. Returns dict or None.
+
+    The role list here must stay in step with STAFFED_ROLES. It previously offered only
+    EN|RN, which meant a PCA request was silently coerced to the nearest allowed value
+    and sent to the wrong carers — so the prompt now names every staffed role and is
+    told to error rather than guess when the role is something else."""
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     msg = client.messages.create(
         model="claude-sonnet-4-6",
@@ -67,14 +78,20 @@ def parse_request(text: str) -> dict | None:
         messages=[{
             "role": "user",
             "content": (
-                "Extract a nursing shift request from this SMS. Knightingale only staffs "
-                "EN and RN; treat anything like AIN/assistant as EN. Respond ONLY with JSON: "
-                '{"date":"YYYY-MM-DD","shift_type":"Morning|Afternoon|Night","role":"EN|RN",'
+                "Extract a care shift request from this SMS. Knightingale staffs four roles: "
+                "RN (registered nurse), EN (enrolled nurse), PCA (personal care assistant — "
+                "also called AIN, PCW, or care worker), and DSW (disability support worker — "
+                "also called support worker). Respond ONLY with JSON: "
+                '{"date":"YYYY-MM-DD","shift_type":"Morning|Afternoon|Night",'
+                '"role":"RN|EN|PCA|DSW",'
                 '"start_time":"HH:MM or null","end_time":"HH:MM or null",'
                 '"facility":"site name as written in the SMS, or null if none is mentioned"}. '
+                "Use the role the SMS actually asks for. Never substitute a different role "
+                "because one seems close — if the requested role is not one of the four "
+                "above, or no role is stated, respond {\"error\":\"role\"}. "
                 "start_time/end_time are 24-hour HH:MM if the SMS states or clearly implies "
                 "specific times (e.g. '2-10pm', 'from 14:00'), otherwise null — do not guess. "
-                "If you cannot determine date, shift_type, and role, respond {\"error\":\"...\"}. "
+                "If you cannot determine date or shift_type, respond {\"error\":\"...\"}. "
                 f"Today is {_today_melb()} (Australia/Melbourne). SMS: \"{text}\""
             ),
         }],
@@ -86,6 +103,13 @@ def parse_request(text: str) -> dict | None:
         return None
     if "error" in data:
         return None
+    # Belt and braces: never log a request for a role we don't staff, even if the
+    # model returns one anyway.
+    role = str(data.get("role") or "").strip().upper()
+    if role not in STAFFED_ROLES:
+        logger.warning("Parsed unstaffed role %r from SMS: %s", data.get("role"), text)
+        return None
+    data["role"] = role
     return data
 
 
@@ -235,30 +259,53 @@ def handle_admin_reply(body: str) -> Response | None:
     return twiml_reply("Reply OK to confirm the shift, or I'll keep waiting.")
 
 
-def handle_active_offer_reply(offer: dict, body: str) -> Response:
-    """A nurse's reply while their offer is still open (offered/alerted)."""
+def _too_late_reply(offer: dict) -> str:
+    """Told to a nurse whose YES arrived after someone else claimed the shift."""
+    name = offer.get("nurse_first_name") or "there"
+    role = (offer.get("shift_requests") or {}).get("role") or "carer"
+    return (f"Sorry {name}, I had another {role} reply and accept the shift. "
+            f"Will do my best to get you on the next one!")
+
+
+def handle_offer_reply(offer: dict, body: str) -> Response:
+    """A nurse replying to a shift offer.
+
+    Offers go out every ~40s, but people reply on their own schedule — a YES five
+    minutes later is completely normal behaviour, and used to be met with 'that's
+    already been sorted' even when the shift was still wide open. So a YES is honoured
+    whenever the shift is unclaimed, regardless of whether this nurse's own offer
+    window has closed; db.claim_shift settles ties atomically, first reply wins.
+    """
     answer = _parse_yes_no(body)
+    req = offer.get("shift_requests") or {}
+    request_id = req.get("id") or offer.get("shift_request_id")
+
     if answer == "yes":
-        db.mark_offer(offer["id"], "accepted", replied_at="now()")
-        return twiml_reply("Great, thanks! You'll see it in the app shortly.")
+        if request_id and db.claim_shift(request_id, offer["nurse_id"], offer["id"]):
+            db.skip_remaining_offers(request_id, except_offer_id=offer["id"])
+            return twiml_reply("Great, thanks! You'll see it in the app shortly.")
+        return twiml_reply(_too_late_reply(offer))
+
     if answer == "no":
-        db.mark_offer(offer["id"], "declined", replied_at="now()")
+        if offer.get("status") in ("offered", "alerted"):
+            db.mark_offer(offer["id"], "declined", replied_at="now()")
         return twiml_reply("No worries, thanks for letting us know.")
-    return twiml_reply("Sorry, I didn't catch that — reply YES or NO for the shift.")
+
+    if offer.get("status") in ("offered", "alerted"):
+        return twiml_reply("Sorry, I didn't catch that — reply YES or NO for the shift.")
+    return None
 
 
 def handle_late_nurse_reply(phone: str, body: str) -> Response | None:
     """A known nurse (has offer history) replying with no active offer right now, and
-    this number isn't a recognised facility either. Returns None if this phone has
-    never received an SMS offer at all (caller should fall through)."""
+    this number isn't a recognised facility either. Their most recent offer is still
+    worth honouring if that shift hasn't been claimed yet — see handle_offer_reply.
+    Returns None if this phone has never received an SMS offer at all, or the reply
+    isn't a yes/no (caller should fall through)."""
     latest = db.get_latest_offer_by_phone(phone)
     if not latest:
         return None
-    return twiml_reply(
-        "Thanks for the reply — that shift's already been sorted, so there's "
-        "nothing to action there. We'll text you next time something suitable "
-        "comes up."
-    )
+    return handle_offer_reply(latest, body)
 
 
 @app.route("/sms", methods=["POST"])
@@ -285,7 +332,9 @@ def sms():
     # module docstring for why this ordering matters.
     active_offer = db.get_active_offer_by_phone(from_number)
     if active_offer:
-        return handle_active_offer_reply(active_offer, body)
+        offer_response = handle_offer_reply(active_offer, body)
+        if offer_response is not None:
+            return offer_response
 
     facility = db.facility_by_phone(from_number)
 
@@ -314,7 +363,10 @@ def sms():
 
     parsed = parse_request(body)
     if not parsed:
-        return twiml_reply("Sorry, I couldn't read that. Please text the date, shift (morning/afternoon/night) and role (EN/RN).")
+        return twiml_reply(
+            "Sorry, I couldn't read that. Please text the date, shift "
+            "(morning/afternoon/night) and role (RN/EN/PCA/DSW)."
+        )
 
     target_facility_id = facility["id"]
     if facility["slug"] == "collins":
