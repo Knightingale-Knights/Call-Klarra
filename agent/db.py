@@ -682,7 +682,7 @@ def get_active_offer_by_phone(phone: str) -> dict | None:
         return None
     r = (
         client.table("sms_nurse_offers")
-        .select("*, shift_requests(id, facility_id, facility_callback_number, date, shift_type)")
+        .select("*, shift_requests(id, facility_id, facility_callback_number, date, shift_type, role, status)")
         .eq("nurse_id", nurse.data[0]["id"])
         .in_("status", ["offered", "alerted"])
         .order("created_at", desc=True)
@@ -707,7 +707,7 @@ def get_latest_offer_by_phone(phone: str) -> dict | None:
         return None
     r = (
         client.table("sms_nurse_offers")
-        .select("*, shift_requests(id, facility_id, facility_callback_number, date, shift_type)")
+        .select("*, shift_requests(id, facility_id, facility_callback_number, date, shift_type, role, status)")
         .eq("nurse_id", nurse.data[0]["id"])
         .order("created_at", desc=True)
         .limit(1)
@@ -718,6 +718,60 @@ def get_latest_offer_by_phone(phone: str) -> dict | None:
     row = r.data[0]
     row["nurse_first_name"] = nurse.data[0]["first_name"]
     return row
+
+
+def get_nurse(nurse_id: int) -> dict | None:
+    """Fetch one nurse row by id."""
+    client = get_client()
+    r = (client.table("nurses").select("id, first_name, last_name, phone, role")
+         .eq("id", nurse_id).limit(1).execute())
+    return r.data[0] if r.data else None
+
+
+def claim_shift(shift_request_id: int, nurse_id: int, offer_id: str) -> bool:
+    """Atomically award a shift to the nurse who just said YES.
+
+    Offers are sent every ~40s but carers reply on their own schedule, so several
+    people can have a live offer at once and a YES can arrive long after that
+    candidate's turn has passed. Whoever replies first should get it — but only once.
+
+    The guard is a conditional update on sms_shift_state: the row moves to 'claimed'
+    only if it is still 'offering'. Postgres serialises that, so exactly one caller
+    sees rows come back and everyone else loses cleanly. The offer row alone can't
+    be the guard — two nurses hold two different offer rows and would both succeed.
+
+    Returns True if this nurse won the shift.
+    """
+    client = get_client()
+    won = (
+        client.table("sms_shift_state")
+        .update({"status": "claimed", "confirmed_nurse_id": nurse_id,
+                 "updated_at": "now()"})
+        .eq("shift_request_id", shift_request_id)
+        .eq("status", "offering")
+        .execute()
+    )
+    if not won.data:
+        return False
+    client.table("sms_nurse_offers").update(
+        {"status": "accepted", "replied_at": "now()"}
+    ).eq("id", offer_id).execute()
+    logger.info("Nurse %s claimed request %s (offer %s)", nurse_id, shift_request_id, offer_id)
+    return True
+
+
+def skip_remaining_offers(shift_request_id: int, except_offer_id: str | None = None) -> None:
+    """Close out every offer still pending/offered/alerted once the shift is claimed,
+    so a nurse whose offer is still technically open doesn't get accepted later."""
+    client = get_client()
+    q = (client.table("sms_nurse_offers")
+         .update({"status": "skipped"})
+         .eq("shift_request_id", shift_request_id)
+         .in_("status", ["pending", "offered", "alerted"]))
+    if except_offer_id:
+        q = q.neq("id", except_offer_id)
+    q.execute()
+    logger.info("Skipped remaining offers for request %s", shift_request_id)
 
 
 def get_pending_admin_approval() -> dict | None:
