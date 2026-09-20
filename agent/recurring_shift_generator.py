@@ -1,43 +1,19 @@
 """
-Shift sync webhook — receives a one-off shift created/edited in Bubble and pushes it
-into Supabase, keyed on the shift's own Bubble _id so an edit updates instead of
-duplicating.
+Recurring shift generator — runs weekly. For every active recurring_shift_template,
+creates that week's Shift in Bubble (with the same fields Paul's manual "Create a new
+Shift" workflow sets), then pushes it into Supabase, keyed on the new shift's Bubble
+_id, and flips the nurse's availability the same way shift_sync_webhook.py does.
 
-If the shift is flagged recurring, also finds or creates a matching
-recurring_shift_templates row (participant + nurse + weekday + start time). On
-creation, the template also captures the fixed billing/address details (coordinator,
-participant address, NDIS code, hours, rate, wage, revenue) from THIS shift, since
-Paul confirmed these stay the same for a given recurring shift going forward.
+Cadence: each template's NEXT shift date is always the last shift generated for that
+template, plus 7 days — not "the matching weekday in whatever week the cron happens to
+run" — so the schedule is anchored to actual shift history and stays correct even if
+a run is skipped or run late. A template always has at least one shift (the one that
+originally triggered it), so the "no shift yet" fallback below should be rare.
 
-Either way, flips the nurse's Supabase availability row to 'assigned' for that
-date/shift_type, then pushes that change back to Bubble's own Availability record
-(available=false) so the Bubble UI stays in sync.
+Idempotent: if a template already has a shift for its target date (e.g. the cron ran
+twice, or was re-triggered manually), it's skipped rather than duplicated.
 
-Bubble workflow contract (on shift created/edited), POST form fields:
-  shift_bubble_id       - the Shift thing's own _id
-  nurse_bubble_id       - the assigned carer's _id
-  date                  - YYYY-MM-DD
-  start_time            - Bubble's own numeric time format, e.g. 900, 1430
-  end_time              - same numeric format
-  status                - confirmed|completed|cancelled (Bubble's shift status)
-  recurring             - "yes"/"no" (Bubble's own dropdown value) or "true"/"false"
-  facility_slug         - one of the known facility slugs, OR
-  participant_bubble_id - the Participant thing's _id (send exactly one of these two)
-
-  Only needed when recurring is true (captured once, on the template):
-  coordinator_bubble_id - the participant's coordinator's _id
-  participant_address   - the participant's address, as text
-  ndis_code_bubble_id   - the NDIS Pricing item's _id
-  ndis_code_text        - the NDIS item's display code/name
-  hours                 - hours for this shift (number)
-  rate                  - the NDIS item's price (number)
-  wage                  - the carer's pay rate (number)
-  revenue               - the item's hourly revenue rate (number)
-
-shift_type (Morning/Afternoon/Night) is derived from start_time here, so Bubble
-doesn't need to compute or send it.
-
-Run:  python agent/shift_sync_webhook.py
+Run:  python agent/recurring_shift_generator.py
 """
 
 import os
@@ -48,32 +24,34 @@ import certifi
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 
 from dotenv import load_dotenv
-from flask import Flask, request, jsonify
 import requests
 
 import db
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("shift-sync")
-
-app = Flask(__name__)
+logger = logging.getLogger("recurring-shift-generator")
 
 BUBBLE_BASE = "https://knightingale.com.au/api/1.1/obj"
 BUBBLE_TOKEN = os.environ["BUBBLE_API_TOKEN"]
 BUBBLE_HEADERS = {"Authorization": f"Bearer {BUBBLE_TOKEN}"}
 
 
-def num_to_hhmm(n) -> str:
-    """Bubble's numeric time (900, 1430) -> 'HH:MM'."""
-    n = int(n)
-    h, m = n // 100, n % 100
-    return f"{h:02d}:{m:02d}"
+def hhmm(t) -> str:
+    """Supabase returns a `time` column as 'HH:MM:SS' (or already 'HH:MM') —
+    normalise to 'HH:MM'."""
+    return str(t)[:5]
 
 
-def shift_type_from_start(n) -> str:
-    """Classify a shift by its start hour — same convention as sync_bubble.py."""
-    h = int(n) // 100
+def hhmm_to_bubble_num(t) -> int:
+    """'09:00' -> 900, '14:30' -> 1430 — matches sync_bubble.py's reading convention,
+    so a shift this script creates reads back the same way the nightly sync expects."""
+    h, m = hhmm(t).split(":")
+    return int(h) * 100 + int(m)
+
+
+def shift_type_from_start(t) -> str:
+    h = int(hhmm(t).split(":")[0])
     if h < 12:
         return "Morning"
     if h < 18:
@@ -82,9 +60,8 @@ def shift_type_from_start(n) -> str:
 
 
 def build_timestamps(date_str: str, start_hhmm: str, end_hhmm: str) -> tuple[str, str]:
-    """Turn a date + two HH:MM times into full timestamptz strings (Melbourne, +10),
-    same convention sync_bubble.py uses. An overnight shift (end <= start) rolls the
-    end timestamp to the next calendar day."""
+    """Same convention as shift_sync_webhook.py / sync_bubble.py: Melbourne (+10),
+    end rolls to the next day if it's an overnight shift."""
     start_ts = f"{date_str} {start_hhmm}:00+10"
     if end_hhmm <= start_hhmm:
         y, m, d = map(int, date_str.split("-"))
@@ -96,7 +73,6 @@ def build_timestamps(date_str: str, start_hhmm: str, end_hhmm: str) -> tuple[str
 
 
 def push_availability_to_bubble(availability_bubble_id: str, available: bool) -> None:
-    """PATCH the Availability record's own 'available' field back in Bubble."""
     try:
         r = requests.patch(
             f"{BUBBLE_BASE}/availability/{availability_bubble_id}",
@@ -110,98 +86,123 @@ def push_availability_to_bubble(availability_bubble_id: str, available: bool) ->
                          availability_bubble_id)
 
 
-def _num(v):
-    """Best-effort float parse for optional numeric form fields; None if blank/absent."""
-    if v is None or v == "":
+def next_target_date(template: dict) -> str:
+    """This template's next shift date: last generated date + 7 days, or — only if
+    it somehow has no shifts yet — the next occurrence of its weekday from today."""
+    last = db.latest_shift_date_for_template(template["id"])
+    if last:
+        y, m, d = map(int, str(last)[:10].split("-"))
+        return (_date(y, m, d) + timedelta(days=7)).isoformat()
+    today = _date.today()
+    days_ahead = (template["day_of_week"] - today.weekday()) % 7 or 7
+    return (today + timedelta(days=days_ahead)).isoformat()
+
+
+def create_bubble_shift(template: dict, target_date: str) -> str | None:
+    """Create the Shift object in Bubble with the same fields as Paul's manual
+    'Create a new Shift' workflow, using this template's stored, fixed values.
+    Returns the new shift's Bubble _id, or None on failure."""
+    carer_bubble_id = db.nurse_bubble_id(template["nurse_id"])
+    participant_bid = db.participant_bubble_id(template["participant_id"])
+    if not (carer_bubble_id and participant_bid):
+        logger.error("Template %s: missing carer or participant Bubble id, skipping",
+                     template["id"])
         return None
+
+    hours = template.get("hours") or 0
+    rate = template.get("rate") or 0
+    wage_rate = template.get("wage") or 0
+    revenue_rate = template.get("revenue_rate") or 0
+
+    payload = {
+        "accepted": "yes",
+        "cancelled": "no",
+        "attended": "no",
+        "invoiced": "no",
+        "carer": carer_bubble_id,
+        "participant": participant_bid,
+        "coordinator": template.get("coordinator_bubble_id"),
+        "address": template.get("participant_address"),
+        # Melbourne midnight, expressed with the same fixed +10 offset used
+        # elsewhere in this codebase (ignores daylight saving, same as
+        # build_timestamps) — sending UTC midnight here instead would display as
+        # 10am/11am in Bubble, since Bubble shows dates in local time.
+        "date": f"{target_date}T00:00:00+10:00",
+        "start time": hhmm_to_bubble_num(template["start_time"]),
+        "end time": hhmm_to_bubble_num(template["end_time"]),
+        "hours": hours,
+        "ndis": template.get("ndis_code_bubble_id"),
+        "rate": rate,
+        "fee": hours * rate,
+        "wage": hours * wage_rate,
+        "revenue": hours * revenue_rate,
+        "roles": ["DSW"],
+        # Assumption: Bubble's recurring field is a yes/no text value, same
+        # convention as accepted/cancelled/attended/invoiced above.
+        "recurring": "yes",
+    }
     try:
-        return float(v)
-    except ValueError:
+        r = requests.post(f"{BUBBLE_BASE}/shift", headers=BUBBLE_HEADERS,
+                          json=payload, timeout=20)
+        if not r.ok:
+            logger.error("Bubble rejected shift create for template %s: %s %s\nPayload: %s",
+                        template["id"], r.status_code, r.text, payload)
+            return None
+        return r.json().get("id")
+    except Exception:
+        logger.exception("Failed to create Bubble shift for template %s", template["id"])
         return None
 
 
-@app.route("/shift-sync", methods=["POST"])
-def shift_sync():
-    f = request.form
-    shift_bubble_id = f.get("shift_bubble_id")
-    nurse_bubble_id = f.get("nurse_bubble_id")
-    date = f.get("date")
-    start_time_num = f.get("start_time")
-    end_time_num = f.get("end_time")
-    status = f.get("status", "confirmed")
-    recurring = f.get("recurring", "").strip().lower() in ("true", "yes")
-    facility_slug = f.get("facility_slug") or None
-    participant_bubble_id = f.get("participant_bubble_id") or None
+def generate_for_template(template: dict) -> None:
+    target_date = next_target_date(template)
 
-    if not (shift_bubble_id and nurse_bubble_id and date
-            and start_time_num and end_time_num):
-        return jsonify({"error": "missing required field"}), 400
+    if db.shift_exists_for_template(template["id"], target_date):
+        logger.info("Template %s: shift for %s already exists, skipping",
+                    template["id"], target_date)
+        return
 
-    try:
-        start_hhmm = num_to_hhmm(start_time_num)
-        end_hhmm = num_to_hhmm(end_time_num)
-    except (TypeError, ValueError):
-        return jsonify({"error": "start_time/end_time must be numeric (e.g. 900)"}), 400
+    new_bubble_id = create_bubble_shift(template, target_date)
+    if not new_bubble_id:
+        return
 
-    shift_type = shift_type_from_start(start_time_num)
-
-    nurse_id = db.nurse_id_by_bubble(nurse_bubble_id)
-    if not nurse_id:
-        return jsonify({"error": f"unknown nurse_bubble_id {nurse_bubble_id}"}), 404
-
-    facility_id = db.facility_id_by_slug(facility_slug) if facility_slug else None
-    participant_id = (db.participant_id_by_bubble(participant_bubble_id)
-                      if participant_bubble_id else None)
-    if not facility_id and not participant_id:
-        return jsonify({"error": "must supply facility_slug or participant_bubble_id"}), 400
-
-    recurring_template_id = None
-    if recurring and participant_id:
-        try:
-            day_of_week = datetime.strptime(date, "%Y-%m-%d").weekday()
-        except ValueError:
-            return jsonify({"error": f"bad date {date}"}), 400
-        nurse = db.get_nurse(nurse_id)
-        recurring_template_id = db.find_or_create_recurring_template(
-            participant_id=participant_id,
-            nurse_id=nurse_id,
-            role=(nurse or {}).get("role", ""),
-            day_of_week=day_of_week,
-            start_time=start_hhmm,
-            end_time=end_hhmm,
-            coordinator_bubble_id=f.get("coordinator_bubble_id") or None,
-            participant_address=f.get("participant_address") or None,
-            ndis_code_bubble_id=f.get("ndis_code_bubble_id") or None,
-            ndis_code_text=f.get("ndis_code_text") or None,
-            hours=_num(f.get("hours")),
-            rate=_num(f.get("rate")),
-            wage=_num(f.get("wage")),
-            revenue_rate=_num(f.get("revenue")),
-        )
-
-    start_ts, end_ts = build_timestamps(date, start_hhmm, end_hhmm)
+    start_ts, end_ts = build_timestamps(
+        target_date, hhmm(template["start_time"]), hhmm(template["end_time"])
+    )
+    shift_type = shift_type_from_start(template["start_time"])
 
     db.upsert_shift_from_push(
-        bubble_shift_id=shift_bubble_id,
-        nurse_id=nurse_id,
-        date=date,
+        bubble_shift_id=new_bubble_id,
+        nurse_id=template["nurse_id"],
+        date=target_date,
         shift_type=shift_type,
         start_time=start_ts,
         end_time=end_ts,
-        status=status,
-        facility_id=facility_id,
-        participant_id=participant_id,
-        recurring_template_id=recurring_template_id,
+        status="confirmed",
+        participant_id=template["participant_id"],
+        recurring_template_id=template["id"],
     )
 
-    db.assign_availability(nurse_id, date, shift_type)
-    avail_bubble_id = db.get_availability_bubble_id(nurse_id, date, shift_type)
+    db.assign_availability(template["nurse_id"], target_date, shift_type)
+    avail_bubble_id = db.get_availability_bubble_id(
+        template["nurse_id"], target_date, shift_type
+    )
     if avail_bubble_id:
         push_availability_to_bubble(avail_bubble_id, available=False)
 
-    logger.info("Synced shift %s (nurse=%s %s %s)", shift_bubble_id, nurse_id, date, shift_type)
-    return jsonify({"ok": True, "recurring_template_id": recurring_template_id})
+    logger.info("Generated shift %s for template %s (%s %s)",
+                new_bubble_id, template["id"], target_date, shift_type)
+
+
+def main():
+    templates = db.get_active_recurring_templates()
+    logger.info("Found %d active recurring templates", len(templates))
+    for t in templates:
+        try:
+            generate_for_template(t)
+        except Exception:
+            logger.exception("Failed generating shift for template %s", t.get("id"))
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5001)))
+    main()
