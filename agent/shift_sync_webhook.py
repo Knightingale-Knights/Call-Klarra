@@ -4,14 +4,17 @@ into Supabase, keyed on the shift's own Bubble _id so an edit updates instead of
 duplicating.
 
 If the shift is flagged recurring, also finds or creates a matching
-recurring_shift_templates row (participant + nurse + weekday + start time).
+recurring_shift_templates row (participant + nurse + weekday + start time). On
+creation, the template also captures the fixed billing/address details (coordinator,
+participant address, NDIS code, hours, rate, wage, revenue) from THIS shift, since
+Paul confirmed these stay the same for a given recurring shift going forward.
 
 Either way, flips the nurse's Supabase availability row to 'assigned' for that
 date/shift_type, then pushes that change back to Bubble's own Availability record
 (available=false) so the Bubble UI stays in sync.
 
 Bubble workflow contract (on shift created/edited), POST form fields:
-  shift_bubble_id      - the Shift thing's own _id
+  shift_bubble_id       - the Shift thing's own _id
   nurse_bubble_id       - the assigned carer's _id
   date                  - YYYY-MM-DD
   start_time            - Bubble's own numeric time format, e.g. 900, 1430
@@ -20,6 +23,16 @@ Bubble workflow contract (on shift created/edited), POST form fields:
   recurring             - "yes"/"no" (Bubble's own dropdown value) or "true"/"false"
   facility_slug         - one of the known facility slugs, OR
   participant_bubble_id - the Participant thing's _id (send exactly one of these two)
+
+  Only needed when recurring is true (captured once, on the template):
+  coordinator_bubble_id - the participant's coordinator's _id
+  participant_address   - the participant's address, as text
+  ndis_code_bubble_id   - the NDIS Pricing item's _id
+  ndis_code_text        - the NDIS item's display code/name
+  hours                 - hours for this shift (number)
+  rate                  - the NDIS item's price (number)
+  wage                  - the carer's pay rate (number)
+  revenue_rate          - the item's hourly revenue rate (number)
 
 shift_type (Morning/Afternoon/Night) is derived from start_time here, so Bubble
 doesn't need to compute or send it.
@@ -97,6 +110,16 @@ def push_availability_to_bubble(availability_bubble_id: str, available: bool) ->
                          availability_bubble_id)
 
 
+def _num(v):
+    """Best-effort float parse for optional numeric form fields; None if blank/absent."""
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except ValueError:
+        return None
+
+
 @app.route("/shift-sync", methods=["POST"])
 def shift_sync():
     f = request.form
@@ -146,6 +169,14 @@ def shift_sync():
             day_of_week=day_of_week,
             start_time=start_hhmm,
             end_time=end_hhmm,
+            coordinator_bubble_id=f.get("coordinator_bubble_id") or None,
+            participant_address=f.get("participant_address") or None,
+            ndis_code_bubble_id=f.get("ndis_code_bubble_id") or None,
+            ndis_code_text=f.get("ndis_code_text") or None,
+            hours=_num(f.get("hours")),
+            rate=_num(f.get("rate")),
+            wage=_num(f.get("wage")),
+            revenue_rate=_num(f.get("revenue_rate")),
         )
 
     start_ts, end_ts = build_timestamps(date, start_hhmm, end_hhmm)
