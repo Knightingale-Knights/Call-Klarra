@@ -27,7 +27,7 @@ Run:  python agent/shift_sync_webhook.py
 
 import os
 import logging
-from datetime import datetime
+from datetime import date as _date, datetime, timedelta
 
 import certifi
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
@@ -47,6 +47,20 @@ app = Flask(__name__)
 BUBBLE_BASE = "https://knightingale.com.au/api/1.1/obj"
 BUBBLE_TOKEN = os.environ["BUBBLE_API_TOKEN"]
 BUBBLE_HEADERS = {"Authorization": f"Bearer {BUBBLE_TOKEN}"}
+
+
+def build_timestamps(date_str: str, start_hhmm: str, end_hhmm: str) -> tuple[str, str]:
+    """Turn a date + two HH:MM times into full timestamptz strings (Melbourne, +10),
+    same convention sync_bubble.py uses. An overnight shift (end <= start) rolls the
+    end timestamp to the next calendar day."""
+    start_ts = f"{date_str} {start_hhmm}:00+10"
+    if end_hhmm <= start_hhmm:
+        y, m, d = map(int, date_str.split("-"))
+        end_date = (_date(y, m, d) + timedelta(days=1)).isoformat()
+    else:
+        end_date = date_str
+    end_ts = f"{end_date} {end_hhmm}:00+10"
+    return start_ts, end_ts
 
 
 def push_availability_to_bubble(availability_bubble_id: str, available: bool) -> None:
@@ -108,13 +122,15 @@ def shift_sync():
             end_time=end_time,
         )
 
+    start_ts, end_ts = build_timestamps(date, start_time, end_time)
+
     db.upsert_shift_from_push(
         bubble_shift_id=shift_bubble_id,
         nurse_id=nurse_id,
         date=date,
         shift_type=shift_type,
-        start_time=start_time,
-        end_time=end_time,
+        start_time=start_ts,
+        end_time=end_ts,
         status=status,
         facility_id=facility_id,
         participant_id=participant_id,
