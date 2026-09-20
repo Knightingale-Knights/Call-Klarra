@@ -1218,7 +1218,8 @@ def find_or_create_recurring_template(participant_id: int, nurse_id: int, role: 
                                       hours: float | None = None,
                                       rate: float | None = None,
                                       wage: float | None = None,
-                                      revenue_rate: float | None = None) -> int:
+                                      revenue_rate: float | None = None,
+                                      end_crosses_midnight: bool = False) -> int:
     """Return the id of an existing active template matching this participant,
     nurse, weekday and start time, or create one. Checking first keeps a shift
     edited twice (or a Bubble retry) from spawning duplicate templates.
@@ -1226,7 +1227,13 @@ def find_or_create_recurring_template(participant_id: int, nurse_id: int, role: 
     The billing/address fields (coordinator, address, NDIS code, hours, rate,
     wage, revenue) are captured once, on creation, from whatever the originating
     shift used — Paul confirmed these stay fixed for a given recurring shift, so
-    they are never re-fetched or overwritten on later calls."""
+    they are never re-fetched or overwritten on later calls.
+
+    end_crosses_midnight records whether the ORIGINAL Bubble end time used
+    Bubble's >=2400 past-midnight convention (e.g. 2430 for 12:30am) rather than
+    wrapping to 0030 — Paul wants this preserved exactly when the generator
+    recreates the shift in Bubble each week, not silently converted to the
+    wrapped form."""
     client = get_client()
     existing = (client.table("recurring_shift_templates").select("id")
                 .eq("participant_id", participant_id).eq("nurse_id", nurse_id)
@@ -1250,6 +1257,7 @@ def find_or_create_recurring_template(participant_id: int, nurse_id: int, role: 
         "rate": rate,
         "wage": wage,
         "revenue_rate": revenue_rate,
+        "end_crosses_midnight": end_crosses_midnight,
     }).execute()
     new_id = resp.data[0]["id"]
     logger.info("Created recurring_shift_template %s (participant=%s nurse=%s day=%s)",
