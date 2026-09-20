@@ -65,9 +65,14 @@ BUBBLE_HEADERS = {"Authorization": f"Bearer {BUBBLE_TOKEN}"}
 
 
 def num_to_hhmm(n) -> str:
-    """Bubble's numeric time (900, 1430) -> 'HH:MM'."""
+    """Bubble's numeric time (900, 1430) -> 'HH:MM'. Bubble represents a time past
+    midnight on an overnight shift as >=2400 (e.g. 2430 for 12:30am) rather than
+    wrapping — Postgres's `time` type only accepts 00:00-23:59, so the hour is
+    wrapped mod 24 here. build_timestamps' end<=start comparison still correctly
+    detects this as crossing into the next day once wrapped."""
     n = int(n)
     h, m = n // 100, n % 100
+    h = h % 24
     return f"{h:02d}:{m:02d}"
 
 
@@ -177,6 +182,7 @@ def shift_sync():
             rate=_num(f.get("rate")),
             wage=_num(f.get("wage")),
             revenue_rate=_num(f.get("revenue")),
+            end_crosses_midnight=int(end_time_num) >= 2400,
         )
 
     start_ts, end_ts = build_timestamps(date, start_hhmm, end_hhmm)
