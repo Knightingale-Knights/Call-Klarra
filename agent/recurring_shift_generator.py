@@ -154,17 +154,20 @@ def create_bubble_shift(template: dict, target_date: str) -> str | None:
         return None
 
 
-def generate_for_template(template: dict) -> None:
+def generate_for_template(template: dict) -> int | None:
+    """Returns the nurse_id if a shift was actually generated this run, else None
+    (already existed for this date, or creation failed) — main() uses this to know
+    which nurses to send the weekly roster-check text to."""
     target_date = next_target_date(template)
 
     if db.shift_exists_for_template(template["id"], target_date):
         logger.info("Template %s: shift for %s already exists, skipping",
                     template["id"], target_date)
-        return
+        return None
 
     new_bubble_id = create_bubble_shift(template, target_date)
     if not new_bubble_id:
-        return
+        return None
 
     start_ts, end_ts = build_timestamps(
         target_date, hhmm(template["start_time"]), hhmm(template["end_time"])
@@ -192,16 +195,43 @@ def generate_for_template(template: dict) -> None:
 
     logger.info("Generated shift %s for template %s (%s %s)",
                 new_bubble_id, template["id"], target_date, shift_type)
+    return template["nurse_id"]
+
+
+def send_roster_reminder(nurse_id: int) -> None:
+    """One text per nurse, regardless of how many recurring shifts they got this
+    run — asks them to check the roster and flag anything that looks wrong."""
+    nurse = db.get_nurse(nurse_id)
+    if not nurse or not nurse.get("phone"):
+        logger.warning("Skipping roster reminder for nurse %s: no phone on file", nurse_id)
+        return
+    name = nurse.get("first_name") or "there"
+    body = (f"Hi {name}, it's Klarra from Knightingale. Next week's roster is up. "
+            f"Please check your shifts and let Paul know if anything looks off. "
+            f"He will instruct me on how to fix it. If everything looks good, you "
+            f"don't need to do anything. Have fun shifts \U0001F642")
+    try:
+        db.send_sms(nurse["phone"], body)
+        logger.info("Sent roster reminder to nurse %s", nurse_id)
+    except Exception:
+        logger.exception("Failed to send roster reminder to nurse %s", nurse_id)
 
 
 def main():
     templates = db.get_active_recurring_templates()
     logger.info("Found %d active recurring templates", len(templates))
+    notified_nurses = set()
     for t in templates:
         try:
-            generate_for_template(t)
+            nurse_id = generate_for_template(t)
+            if nurse_id:
+                notified_nurses.add(nurse_id)
         except Exception:
             logger.exception("Failed generating shift for template %s", t.get("id"))
+
+    logger.info("Sending roster reminders to %d nurse(s)", len(notified_nurses))
+    for nurse_id in notified_nurses:
+        send_roster_reminder(nurse_id)
 
 
 if __name__ == "__main__":
