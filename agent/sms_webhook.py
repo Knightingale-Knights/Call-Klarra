@@ -2,23 +2,31 @@
 SMS webhook — receives a facility's text, parses the shift request, logs it, replies.
 The orchestrator picks it up and (for sms) texts the facility the result.
 
-Also routes two other kinds of inbound SMS for the SMS nurse-offer workflow:
-  - A nurse replying YES/NO to an active offer -> updates sms_nurse_offers.
+Also routes:
+  - Two ad hoc admin commands from Paul's number: an availability query ("who can
+    do EN AM Wednesday") and a targeted single-nurse text ("text Maria for the PM
+    shift Thursday at Port Melbourne"), independent of the ranked cascade and of any
+    shift_request.
+  - A nurse replying YES/NO to an active offer (ranked cascade, or an ad hoc
+    single-nurse offer) -> updates sms_nurse_offers / sms_adhoc_offers.
   - Paul replying OK to an admin-approval request -> updates sms_shift_state.
 
 Routing order matters, and is deliberately this order:
+  0. Paul's ad hoc admin commands (availability query / text a specific nurse) —
+     checked first on his number, ahead of a pending approval, since they're a
+     distinct explicit intent and shouldn't get swallowed by the approval gate.
   1. Admin approval reply (narrow: only fires if there's a real pending approval).
-  2. An ACTIVE nurse offer (offered/alerted) on this number — wins over facility
+  2. An ACTIVE offer (cascade or ad hoc) on this number — wins over facility
      identity, because it means we are actively expecting a YES/NO from this exact
      number right now. This matters because in dev/test setups one phone number can
      simultaneously be a registered facility AND the stand-in nurse (both sharing
      KLARRA_DEV_PHONE) — without this priority, a nurse's genuine YES/NO gets
      swallowed by the facility-request parser instead of reaching the offer.
   3. Recognised facility -> shift-request parsing.
-  4. Not a facility, but has past offer history -> a late YES still claims the shift
-     if nobody else has, otherwise they're told another carer got it. Carers reply on
-     their own schedule and a YES a few minutes after the offer is normal, so it is
-     never dropped just because the cascade has moved on.
+  4. Not a facility, but has past cascade-offer history -> a late YES still claims
+     the shift if nobody else has, otherwise they're told another carer got it.
+     (A late ad hoc reply is already caught by step 2 — an ad hoc offer stays
+     'active' until answered.)
   5. Otherwise -> afterhours chat / unrecognised-number fallback.
 
 Run:  python agent/sms_webhook.py
@@ -111,6 +119,49 @@ def parse_request(text: str) -> dict | None:
         return None
     data["role"] = role
     return data
+
+
+def parse_admin_command(text: str) -> dict:
+    """
+    Classify a text from Paul (the admin number) as one of two ad hoc commands, or
+    neither. Both are separate from the normal facility shift-request flow and from
+    the ranked SMS cascade — Command A just answers a question, Command B texts
+    exactly one named carer with no ranking or shift_request involved.
+    """
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    msg = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=300,
+        messages=[{
+            "role": "user",
+            "content": (
+                "This text is from Paul, the admin of Knightingale (an aged-care/NDIS "
+                "staffing agency), to Klarra, his scheduling assistant. Decide which of "
+                "two specific commands it is, or neither.\n\n"
+                "Command A - AVAILABILITY QUERY: a question asking which carers of a "
+                "role can do a shift. No specific carer is named. Roles: RN, EN, PCA, "
+                "DSW. Shift blocks: AM=Morning, PM=Afternoon, NS=Night. Respond ONLY: "
+                '{"type":"availability","role":"RN|EN|PCA|DSW",'
+                '"shift_type":"Morning|Afternoon|Night","date":"YYYY-MM-DD"}\n\n'
+                "Command B - TEXT A SPECIFIC NURSE: asks to text ONE named carer (a "
+                "person's first name or full name appears) about a shift. Respond "
+                'ONLY: {"type":"text_nurse","nurse_name":"as written",'
+                '"facility":"site name as written, or null if not mentioned",'
+                '"date":"YYYY-MM-DD","shift_type":"Morning|Afternoon|Night"}\n\n'
+                "If it's a normal shift request reporting a role/date/site that needs "
+                "covering — no named carer, not phrased as a question — or anything "
+                "else, respond ONLY {\"type\":\"none\"}.\n\n"
+                "Only use a YYYY-MM-DD date you can actually resolve from the message; "
+                "if the date is unclear, respond {\"type\":\"none\"}.\n\n"
+                f"Today is {_today_melb()} (Australia/Melbourne). Message: \"{text}\""
+            ),
+        }],
+    )
+    raw = msg.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"type": "none"}
 
 
 def twiml_reply(text: str) -> Response:
@@ -259,6 +310,68 @@ def handle_admin_reply(body: str) -> Response | None:
     return twiml_reply("Reply OK to confirm the shift, or I'll keep waiting.")
 
 
+def handle_availability_query(parsed: dict) -> Response:
+    """Answer Paul's "who can do X" ad hoc query — a plain list, not a ranked pool,
+    and not tied to any facility or shift_request."""
+    role = str(parsed.get("role") or "").strip().upper()
+    shift_type = parsed.get("shift_type")
+    date = parsed.get("date")
+    if role not in STAFFED_ROLES or not shift_type or not date:
+        return twiml_reply(
+            "Sorry, I need a role (RN/EN/PCA/DSW), a shift (AM/PM/NS) and a date to "
+            "check availability."
+        )
+    nurses = db.get_available_nurses(date, shift_type, role)
+    if not nurses:
+        return twiml_reply(f"No {role} carers available {shift_type} on {db.pretty_date(date)}.")
+    names = ", ".join(n["first_name"] for n in nurses)
+    return twiml_reply(f"{role} available {shift_type} {db.pretty_date(date)}: {names}")
+
+
+def adhoc_offer_message(nurse: dict, facility: dict, date: str, shift_type: str) -> str:
+    return (
+        f"Hi {nurse['first_name']}, I've got a shift at {facility['name']} "
+        f"on {db.short_date(date)} ({shift_type}). Please reply YES if you would "
+        f"like it. Please reply NO if you would prefer to pass. Thank you"
+    )
+
+
+def handle_text_nurse_command(parsed: dict) -> Response:
+    """Text exactly one named carer about one shift. No ranking, no shift_request —
+    db.send_sms already respects KLARRA_MODE, so this is blocked in mid (nurses are
+    never contacted in mid) and redirected to the dev phone in dev, same as everywhere
+    else."""
+    name = parsed.get("nurse_name")
+    date = parsed.get("date")
+    shift_type = parsed.get("shift_type")
+    facility_name = parsed.get("facility")
+
+    if not (name and date and shift_type):
+        return twiml_reply("Sorry, I need the carer's name, a date and a shift (AM/PM/NS).")
+
+    nurse, candidates = db.find_nurse_by_name(name)
+    if candidates:
+        opts = ", ".join(f"{c['first_name']} {c['last_name']}" for c in candidates)
+        return twiml_reply(f"A few carers match '{name}': {opts}. Which one?")
+    if not nurse:
+        return twiml_reply(f"Couldn't find a carer named '{name}'.")
+
+    facility = db.find_facility_by_name(facility_name) if facility_name else None
+    if not facility:
+        return twiml_reply("Which site is this shift at?")
+
+    msg = adhoc_offer_message(nurse, facility, date, shift_type)
+    db.create_adhoc_offer(
+        nurse_id=nurse["id"], facility_id=facility["id"], facility_name=facility["name"],
+        date=date, shift_type=shift_type, message=msg,
+    )
+    db.send_sms(nurse["phone"], msg)
+    return twiml_reply(
+        f"Texted {nurse['first_name']} about the {shift_type} shift at "
+        f"{facility['name']} on {db.pretty_date(date)}. I'll let you know."
+    )
+
+
 def _too_late_reply(offer: dict) -> str:
     """Told to a nurse whose YES arrived after someone else claimed the shift."""
     name = offer.get("nurse_first_name") or "there"
@@ -308,6 +421,34 @@ def handle_late_nurse_reply(phone: str, body: str) -> Response | None:
     return handle_offer_reply(latest, body)
 
 
+def handle_adhoc_offer_reply(offer: dict, body: str) -> Response:
+    """A nurse replying to a targeted single-nurse offer. Unlike the cascade, there's
+    no shift to lose to someone else — just record the answer and tell Paul."""
+    answer = _parse_yes_no(body)
+    nurse_name = (offer.get("nurses") or {}).get("first_name") or "Carer"
+    if answer not in ("yes", "no"):
+        return twiml_reply("Sorry, I didn't catch that — reply YES or NO for the shift.")
+
+    status = "accepted" if answer == "yes" else "declined"
+    db.mark_adhoc_offer(offer["id"], status, replied_at="now()")
+
+    late_note = (" (this came in after I'd flagged no response)"
+                 if offer.get("timeout_alerted") else "")
+    admin_text = (
+        f"{nurse_name} {status} the {offer['shift_type']} shift at "
+        f"{offer.get('facility_name') or 'the facility'} on "
+        f"{db.pretty_date(offer['date'])}{late_note}."
+    )
+    try:
+        db.send_sms(ADMIN_PHONE, admin_text)
+    except Exception:
+        logger.exception("Failed to notify admin of adhoc offer reply")
+
+    if answer == "yes":
+        return twiml_reply("Great, thanks! Confirmed.")
+    return twiml_reply("No worries, thanks for letting us know.")
+
+
 @app.route("/sms", methods=["POST"])
 def sms():
     from_number = request.form.get("From")
@@ -320,21 +461,34 @@ def sms():
             ["No problem.", "My pleasure.", "Easy.", "No worries.", "Anytime.", "All good."]
         ))
 
-    # Paul confirming a pending shift approval — checked before anything else,
-    # since his number is also the Collins callback number (and, in dev/test setups,
-    # may also match a stand-in nurse record).
     if _is_admin_number(from_number):
+        # Ad hoc admin commands take priority over everything else on his number,
+        # including a pending approval — they're a distinct, explicit intent.
+        cmd = parse_admin_command(body)
+        if cmd.get("type") == "availability":
+            return handle_availability_query(cmd)
+        if cmd.get("type") == "text_nurse":
+            return handle_text_nurse_command(cmd)
+
+        # Paul confirming a pending shift approval — checked before facility/offer
+        # routing, since his number is also the Collins callback number (and, in
+        # dev/test setups, may also match a stand-in nurse record).
         admin_response = handle_admin_reply(body)
         if admin_response is not None:
             return admin_response
 
-    # An ACTIVE nurse offer on this number wins over facility identity — see the
+    # An ACTIVE cascade offer on this number wins over facility identity — see the
     # module docstring for why this ordering matters.
     active_offer = db.get_active_offer_by_phone(from_number)
     if active_offer:
         offer_response = handle_offer_reply(active_offer, body)
         if offer_response is not None:
             return offer_response
+
+    # Same priority for an active ad hoc single-nurse offer.
+    active_adhoc = db.get_active_adhoc_offer_by_phone(from_number)
+    if active_adhoc:
+        return handle_adhoc_offer_reply(active_adhoc, body)
 
     facility = db.facility_by_phone(from_number)
 
