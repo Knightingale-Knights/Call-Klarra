@@ -123,10 +123,10 @@ def parse_request(text: str) -> dict | None:
 
 def parse_admin_command(text: str) -> dict:
     """
-    Classify a text from Paul (the admin number) as one of two ad hoc commands, or
-    neither. Both are separate from the normal facility shift-request flow and from
-    the ranked SMS cascade — Command A just answers a question, Command B texts
-    exactly one named carer with no ranking or shift_request involved.
+    Classify a text from Paul (the admin number) as one of three ad hoc commands, or
+    neither. All are separate from the normal facility shift-request flow and from
+    the ranked SMS cascade — Commands A and C just answer a question, Command B
+    texts exactly one named carer with no ranking or shift_request involved.
     """
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     msg = client.messages.create(
@@ -148,6 +148,11 @@ def parse_admin_command(text: str) -> dict:
                 'ONLY: {"type":"text_nurse","nurse_name":"as written",'
                 '"facility":"site name as written, or null if not mentioned",'
                 '"date":"YYYY-MM-DD","shift_type":"Morning|Afternoon|Night"}\n\n'
+                "Command C - NURSE AVAILABILITY CHECK: a question asking whether ONE "
+                "named carer is available, WITHOUT asking to text them. Respond ONLY: "
+                '{"type":"nurse_availability","nurse_name":"as written",'
+                '"date":"YYYY-MM-DD","shift_type":"Morning|Afternoon|Night or null '
+                'if no shift mentioned"}\n\n'
                 "If it's a normal shift request reporting a role/date/site that needs "
                 "covering — no named carer, not phrased as a question — or anything "
                 "else, respond ONLY {\"type\":\"none\"}.\n\n"
@@ -372,6 +377,36 @@ def handle_text_nurse_command(parsed: dict) -> Response:
     )
 
 
+def handle_nurse_availability_query(parsed: dict) -> Response:
+    """Answer "is {nurse} available" for a named carer, optionally for one shift
+    block. Not tied to any facility or shift_request."""
+    name = parsed.get("nurse_name")
+    date = parsed.get("date")
+    shift_type = parsed.get("shift_type")
+
+    if not (name and date):
+        return twiml_reply("Sorry, I need the carer's name and a date.")
+
+    nurse, candidates = db.find_nurse_by_name(name)
+    if candidates:
+        opts = ", ".join(f"{c['first_name']} {c['last_name']}" for c in candidates)
+        return twiml_reply(f"A few carers match '{name}': {opts}. Which one?")
+    if not nurse:
+        return twiml_reply(f"Couldn't find a carer named '{name}'.")
+
+    blocks = db.get_nurse_availability(nurse["id"], date)
+
+    if shift_type:
+        word = "is" if shift_type in blocks else "isn't"
+        return twiml_reply(f"{nurse['first_name']} {word} available {shift_type} "
+                            f"{db.pretty_date(date)}.")
+
+    if not blocks:
+        return twiml_reply(f"{nurse['first_name']} isn't available on {db.pretty_date(date)}.")
+    return twiml_reply(f"{nurse['first_name']} available {', '.join(blocks)} "
+                        f"on {db.pretty_date(date)}.")
+
+
 def _too_late_reply(offer: dict) -> str:
     """Told to a nurse whose YES arrived after someone else claimed the shift."""
     name = offer.get("nurse_first_name") or "there"
@@ -469,6 +504,8 @@ def sms():
             return handle_availability_query(cmd)
         if cmd.get("type") == "text_nurse":
             return handle_text_nurse_command(cmd)
+        if cmd.get("type") == "nurse_availability":
+            return handle_nurse_availability_query(cmd)
 
         # Paul confirming a pending shift approval — checked before facility/offer
         # routing, since his number is also the Collins callback number (and, in
