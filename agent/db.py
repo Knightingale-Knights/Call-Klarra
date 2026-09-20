@@ -740,6 +740,17 @@ def get_nurse(nurse_id: int) -> dict | None:
     return r.data[0] if r.data else None
 
 
+def nurse_bubble_id(nurse_id: int) -> str | None:
+    """Look up a nurse's Bubble _id by their Supabase id — used when the generator
+    needs to name the carer on a Shift object it's creating in Bubble."""
+    client = get_client()
+    r = (client.table("nurses").select("bubble_user_id")
+         .eq("id", nurse_id).limit(1).execute())
+    if not r.data:
+        return None
+    return r.data[0].get("bubble_user_id")
+
+
 def claim_shift(shift_request_id: int, nurse_id: int, offer_id: str) -> bool:
     """Atomically award a shift to the nurse who just said YES.
 
@@ -1077,6 +1088,18 @@ def participant_id_by_bubble(bubble_id: str) -> int | None:
     return r.data[0]["id"] if r.data else None
 
 
+def participant_bubble_id(participant_id: int) -> str | None:
+    """Look up a participant's Bubble _id by their Supabase id — used when the
+    generator needs to name the participant on a Shift object it's creating in
+    Bubble."""
+    client = get_client()
+    r = (client.table("participants").select("bubble_id")
+         .eq("id", participant_id).limit(1).execute())
+    if not r.data:
+        return None
+    return r.data[0].get("bubble_id")
+
+
 def upsert_availability(nurse_id: int, date: str, shift_type: str, bubble_id: str | None = None) -> None:
     """Insert availability if not already present (unique on nurse+date+shift).
     If it already exists, backfill bubble_id when missing."""
@@ -1228,3 +1251,17 @@ def shift_exists_for_template(recurring_template_id: int, date: str) -> bool:
          .eq("recurring_template_id", recurring_template_id).eq("date", date)
          .limit(1).execute())
     return bool(r.data)
+
+
+def latest_shift_date_for_template(recurring_template_id: int) -> str | None:
+    """Most recent date a shift was generated for this template — the generator
+    always creates the NEXT one exactly 7 days after this, so the cadence is
+    anchored to the actual shift history rather than to whatever day the cron
+    happens to run on. Returns None only if the template has no shifts at all
+    (shouldn't normally happen, since a template is created alongside the shift
+    that triggered it)."""
+    client = get_client()
+    r = (client.table("shifts").select("date")
+         .eq("recurring_template_id", recurring_template_id)
+         .order("date", desc=True).limit(1).execute())
+    return r.data[0]["date"] if r.data else None
