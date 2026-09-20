@@ -48,6 +48,18 @@ def pretty_date(d: str) -> str:
         return str(d)
 
 
+def short_date(d: str) -> str:
+    """Format 'YYYY-MM-DD' as 'Tue 28th'. Returns input unchanged on failure."""
+    from datetime import datetime
+    try:
+        dt = datetime.strptime(str(d)[:10], "%Y-%m-%d")
+        day = dt.day
+        suffix = "th" if 11 <= day % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+        return dt.strftime("%a ") + f"{day}{suffix}"
+    except Exception:
+        return str(d)
+
+
 def normalise_phone(raw: str | None) -> str | None:
     """Normalise an Australian number to E.164 (+61XXXXXXXXX).
 
@@ -787,6 +799,131 @@ def get_pending_admin_approval() -> dict | None:
         .execute()
     )
     return r.data[0] if r.data else None
+
+
+# --- Availability lookup (ad hoc admin query) ---
+
+def get_available_nurses(date: str, shift_type: str, role: str) -> list[dict]:
+    """
+    Carers of a given role who are free for a date + shift block (Morning/Afternoon/
+    Night) — for Paul's "who can do X" query. Not tied to any facility or
+    shift_request, and not ranked, just the eligible list. Excludes anyone with an
+    existing shift that day in any block. Backed by the get_available_nurses()
+    Supabase function.
+    """
+    client = get_client()
+    resp = client.rpc(
+        "get_available_nurses",
+        {"p_date": date, "p_shift_type": shift_type, "p_role": role},
+    ).execute()
+    return resp.data or []
+
+
+# --- Ad hoc single-nurse offers ---
+# Separate from the ranked SMS cascade (sms_nurse_offers/sms_shift_state): Paul names
+# one specific carer for a specific shift, Klarra texts only that carer, and there's
+# no shift_request or ranking involved at all.
+
+def find_nurse_by_name(name: str) -> tuple[dict | None, list[dict]]:
+    """
+    Fuzzy-match a typed carer name against nurses. Returns (nurse, candidates):
+    exactly one is populated — a single confident match, or a short list when more
+    than one carer plausibly matches (e.g. two carers named Maria), so the caller can
+    ask Paul which one he means instead of guessing.
+    """
+    if not name:
+        return None, []
+    client = get_client()
+    resp = client.table("nurses").select("id, first_name, last_name, phone, role").execute()
+    all_nurses = resp.data or []
+    needle = name.lower().strip()
+
+    full_matches = [n for n in all_nurses
+                    if f"{n['first_name']} {n['last_name']}".lower().strip() == needle]
+    if len(full_matches) == 1:
+        return full_matches[0], []
+
+    first_matches = [n for n in all_nurses if (n["first_name"] or "").lower().strip() == needle]
+    if len(first_matches) == 1:
+        return first_matches[0], []
+    if len(first_matches) > 1:
+        return None, first_matches
+
+    import difflib
+    by_full = {f"{n['first_name']} {n['last_name']}".lower().strip(): n for n in all_nurses}
+    close = difflib.get_close_matches(needle, by_full.keys(), n=3, cutoff=0.6)
+    if len(close) == 1:
+        return by_full[close[0]], []
+    if len(close) > 1:
+        return None, [by_full[c] for c in close]
+
+    return None, []
+
+
+def create_adhoc_offer(nurse_id: int, facility_id: int | None, facility_name: str,
+                       date: str, shift_type: str, message: str) -> str:
+    """Log a targeted single-nurse offer and return its id."""
+    client = get_client()
+    resp = client.table("sms_adhoc_offers").insert({
+        "nurse_id": nurse_id,
+        "facility_id": facility_id,
+        "facility_name": facility_name,
+        "date": date,
+        "shift_type": shift_type,
+        "message": message,
+        "status": "offered",
+        "offered_at": "now()",
+    }).execute()
+    return resp.data[0]["id"]
+
+
+def mark_adhoc_offer(offer_id: str, status: str | None = None, **fields) -> None:
+    """Update an ad hoc offer's status and/or any of replied_at / timeout_alerted."""
+    client = get_client()
+    payload = {**fields}
+    if status is not None:
+        payload["status"] = status
+    client.table("sms_adhoc_offers").update(payload).eq("id", offer_id).execute()
+    logger.info("Adhoc offer %s -> %s", offer_id, status)
+
+
+def get_active_adhoc_offer_by_phone(phone: str) -> dict | None:
+    """This nurse's most recent unanswered ad hoc offer, if any — used to route a
+    YES/NO reply. Stays 'active' indefinitely until answered, so a reply long after
+    the 15-min timeout alert still lands here."""
+    client = get_client()
+    phone = normalise_phone(phone)
+    nurse = client.table("nurses").select("id, first_name").eq("phone", phone).limit(1).execute()
+    if not nurse.data:
+        return None
+    r = (
+        client.table("sms_adhoc_offers")
+        .select("*, nurses(id, first_name)")
+        .eq("nurse_id", nurse.data[0]["id"])
+        .eq("status", "offered")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return r.data[0] if r.data else None
+
+
+def get_adhoc_offers_needing_timeout_alert(minutes: int = 15) -> list[dict]:
+    """Ad hoc offers still unanswered `minutes` after being sent, not yet flagged to
+    Paul. The orchestrator polls this to send the one-off 'no response yet' alert;
+    the offer itself stays open so a later reply is still caught and reported."""
+    from datetime import datetime, timedelta, timezone
+    client = get_client()
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+    r = (
+        client.table("sms_adhoc_offers")
+        .select("*, nurses(first_name)")
+        .eq("status", "offered")
+        .eq("timeout_alerted", False)
+        .lte("offered_at", cutoff)
+        .execute()
+    )
+    return r.data or []
 
 
 # --- SMS sending (Twilio) ---
