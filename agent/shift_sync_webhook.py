@@ -14,13 +14,15 @@ Bubble workflow contract (on shift created/edited), POST form fields:
   shift_bubble_id      - the Shift thing's own _id
   nurse_bubble_id       - the assigned carer's _id
   date                  - YYYY-MM-DD
-  shift_type            - Morning|Afternoon|Night
-  start_time            - HH:MM (24h)
-  end_time              - HH:MM (24h)
+  start_time            - Bubble's own numeric time format, e.g. 900, 1430
+  end_time              - same numeric format
   status                - confirmed|completed|cancelled (Bubble's shift status)
-  recurring             - "true" or "false"
+  recurring             - "yes"/"no" (Bubble's own dropdown value) or "true"/"false"
   facility_slug         - one of the known facility slugs, OR
   participant_bubble_id - the Participant thing's _id (send exactly one of these two)
+
+shift_type (Morning/Afternoon/Night) is derived from start_time here, so Bubble
+doesn't need to compute or send it.
 
 Run:  python agent/shift_sync_webhook.py
 """
@@ -47,6 +49,23 @@ app = Flask(__name__)
 BUBBLE_BASE = "https://knightingale.com.au/api/1.1/obj"
 BUBBLE_TOKEN = os.environ["BUBBLE_API_TOKEN"]
 BUBBLE_HEADERS = {"Authorization": f"Bearer {BUBBLE_TOKEN}"}
+
+
+def num_to_hhmm(n) -> str:
+    """Bubble's numeric time (900, 1430) -> 'HH:MM'."""
+    n = int(n)
+    h, m = n // 100, n % 100
+    return f"{h:02d}:{m:02d}"
+
+
+def shift_type_from_start(n) -> str:
+    """Classify a shift by its start hour — same convention as sync_bubble.py."""
+    h = int(n) // 100
+    if h < 12:
+        return "Morning"
+    if h < 18:
+        return "Afternoon"
+    return "Night"
 
 
 def build_timestamps(date_str: str, start_hhmm: str, end_hhmm: str) -> tuple[str, str]:
@@ -84,17 +103,24 @@ def shift_sync():
     shift_bubble_id = f.get("shift_bubble_id")
     nurse_bubble_id = f.get("nurse_bubble_id")
     date = f.get("date")
-    shift_type = f.get("shift_type")
-    start_time = f.get("start_time")
-    end_time = f.get("end_time")
+    start_time_num = f.get("start_time")
+    end_time_num = f.get("end_time")
     status = f.get("status", "confirmed")
-    recurring = f.get("recurring", "false").strip().lower() == "true"
+    recurring = f.get("recurring", "").strip().lower() in ("true", "yes")
     facility_slug = f.get("facility_slug") or None
     participant_bubble_id = f.get("participant_bubble_id") or None
 
-    if not (shift_bubble_id and nurse_bubble_id and date and shift_type
-            and start_time and end_time):
+    if not (shift_bubble_id and nurse_bubble_id and date
+            and start_time_num and end_time_num):
         return jsonify({"error": "missing required field"}), 400
+
+    try:
+        start_hhmm = num_to_hhmm(start_time_num)
+        end_hhmm = num_to_hhmm(end_time_num)
+    except (TypeError, ValueError):
+        return jsonify({"error": "start_time/end_time must be numeric (e.g. 900)"}), 400
+
+    shift_type = shift_type_from_start(start_time_num)
 
     nurse_id = db.nurse_id_by_bubble(nurse_bubble_id)
     if not nurse_id:
@@ -118,11 +144,11 @@ def shift_sync():
             nurse_id=nurse_id,
             role=(nurse or {}).get("role", ""),
             day_of_week=day_of_week,
-            start_time=start_time,
-            end_time=end_time,
+            start_time=start_hhmm,
+            end_time=end_hhmm,
         )
 
-    start_ts, end_ts = build_timestamps(date, start_time, end_time)
+    start_ts, end_ts = build_timestamps(date, start_hhmm, end_hhmm)
 
     db.upsert_shift_from_push(
         bubble_shift_id=shift_bubble_id,
