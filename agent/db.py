@@ -819,6 +819,24 @@ def get_available_nurses(date: str, shift_type: str, role: str) -> list[dict]:
     return resp.data or []
 
 
+def get_nurse_availability(nurse_id: int, date: str) -> list[str]:
+    """Shift blocks (Morning/Afternoon/Night) this nurse is free for on this date —
+    marked pending and not already committed to a shift that day in any block.
+    For Paul's "is {nurse} available" ad hoc query."""
+    client = get_client()
+    avail = (client.table("availability").select("shift_type")
+             .eq("nurse_id", nurse_id).eq("date", date).eq("status", "pending")
+             .execute())
+    blocks = [r["shift_type"] for r in (avail.data or [])]
+    if not blocks:
+        return []
+    conflict = (client.table("shifts").select("id")
+                .eq("nurse_id", nurse_id).eq("date", date).limit(1).execute())
+    if conflict.data:
+        return []
+    return blocks
+
+
 # --- Ad hoc single-nurse offers ---
 # Separate from the ranked SMS cascade (sms_nurse_offers/sms_shift_state): Paul names
 # one specific carer for a specific shift, Klarra texts only that carer, and there's
