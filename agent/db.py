@@ -1210,10 +1210,23 @@ def upsert_shift_from_push(bubble_shift_id: str, nurse_id: int, date: str,
 
 def find_or_create_recurring_template(participant_id: int, nurse_id: int, role: str,
                                       day_of_week: int, start_time: str,
-                                      end_time: str) -> int:
+                                      end_time: str,
+                                      coordinator_bubble_id: str | None = None,
+                                      participant_address: str | None = None,
+                                      ndis_code_bubble_id: str | None = None,
+                                      ndis_code_text: str | None = None,
+                                      hours: float | None = None,
+                                      rate: float | None = None,
+                                      wage: float | None = None,
+                                      revenue_rate: float | None = None) -> int:
     """Return the id of an existing active template matching this participant,
     nurse, weekday and start time, or create one. Checking first keeps a shift
-    edited twice (or a Bubble retry) from spawning duplicate templates."""
+    edited twice (or a Bubble retry) from spawning duplicate templates.
+
+    The billing/address fields (coordinator, address, NDIS code, hours, rate,
+    wage, revenue) are captured once, on creation, from whatever the originating
+    shift used — Paul confirmed these stay fixed for a given recurring shift, so
+    they are never re-fetched or overwritten on later calls."""
     client = get_client()
     existing = (client.table("recurring_shift_templates").select("id")
                 .eq("participant_id", participant_id).eq("nurse_id", nurse_id)
@@ -1229,6 +1242,14 @@ def find_or_create_recurring_template(participant_id: int, nurse_id: int, role: 
         "start_time": start_time,
         "end_time": end_time,
         "active": True,
+        "coordinator_bubble_id": coordinator_bubble_id,
+        "participant_address": participant_address,
+        "ndis_code_bubble_id": ndis_code_bubble_id,
+        "ndis_code_text": ndis_code_text,
+        "hours": hours,
+        "rate": rate,
+        "wage": wage,
+        "revenue_rate": revenue_rate,
     }).execute()
     new_id = resp.data[0]["id"]
     logger.info("Created recurring_shift_template %s (participant=%s nurse=%s day=%s)",
