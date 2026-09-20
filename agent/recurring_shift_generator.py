@@ -144,7 +144,10 @@ def create_bubble_shift(template: dict, target_date: str) -> str | None:
     try:
         r = requests.post(f"{BUBBLE_BASE}/shift", headers=BUBBLE_HEADERS,
                           json=payload, timeout=20)
-        r.raise_for_status()
+        if not r.ok:
+            logger.error("Bubble rejected shift create for template %s: %s %s\nPayload: %s",
+                        template["id"], r.status_code, r.text, payload)
+            return None
         return r.json().get("id")
     except Exception:
         logger.exception("Failed to create Bubble shift for template %s", template["id"])
