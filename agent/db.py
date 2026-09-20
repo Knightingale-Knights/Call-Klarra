@@ -819,24 +819,6 @@ def get_available_nurses(date: str, shift_type: str, role: str) -> list[dict]:
     return resp.data or []
 
 
-def get_nurse_availability(nurse_id: int, date: str) -> list[str]:
-    """Shift blocks (Morning/Afternoon/Night) this nurse is free for on this date —
-    marked pending and not already committed to a shift that day in any block.
-    For Paul's "is {nurse} available" ad hoc query."""
-    client = get_client()
-    avail = (client.table("availability").select("shift_type")
-             .eq("nurse_id", nurse_id).eq("date", date).eq("status", "pending")
-             .execute())
-    blocks = [r["shift_type"] for r in (avail.data or [])]
-    if not blocks:
-        return []
-    conflict = (client.table("shifts").select("id")
-                .eq("nurse_id", nurse_id).eq("date", date).limit(1).execute())
-    if conflict.data:
-        return []
-    return blocks
-
-
 # --- Ad hoc single-nurse offers ---
 # Separate from the ranked SMS cascade (sms_nurse_offers/sms_shift_state): Paul names
 # one specific carer for a specific shift, Klarra texts only that carer, and there's
@@ -1088,6 +1070,13 @@ def nurse_id_by_bubble(bubble_id: str) -> int | None:
     return r.data[0]["id"] if r.data else None
 
 
+def participant_id_by_bubble(bubble_id: str) -> int | None:
+    """Look up a participant's Supabase id by their Bubble _id."""
+    client = get_client()
+    r = client.table("participants").select("id").eq("bubble_id", bubble_id).limit(1).execute()
+    return r.data[0]["id"] if r.data else None
+
+
 def upsert_availability(nurse_id: int, date: str, shift_type: str, bubble_id: str | None = None) -> None:
     """Insert availability if not already present (unique on nurse+date+shift).
     If it already exists, backfill bubble_id when missing."""
@@ -1106,6 +1095,18 @@ def upsert_availability(nurse_id: int, date: str, shift_type: str, bubble_id: st
         "nurse_id": nurse_id, "date": date, "shift_type": shift_type, "status": "pending",
         "bubble_id": bubble_id,
     }).execute()
+
+
+def get_availability_bubble_id(nurse_id: int, date: str, shift_type: str) -> str | None:
+    """Look up the Bubble _id stored against this nurse's availability row, so a
+    status change made here can be pushed back to that same Bubble record."""
+    client = get_client()
+    r = (client.table("availability").select("bubble_id")
+         .eq("nurse_id", nurse_id).eq("date", date).eq("shift_type", shift_type)
+         .limit(1).execute())
+    if not r.data:
+        return None
+    return r.data[0].get("bubble_id")
 
 
 # --- Shift history sync ---
@@ -1130,7 +1131,11 @@ def upsert_shift(bubble_shift_id: str, nurse_id: int, facility_id: int,
                  date: str, shift_type: str, start_time: str, end_time: str,
                  status: str) -> None:
     """Insert a worked shift if not already present (keyed by bubble shift id stored
-    nowhere yet — so we dedupe on nurse+facility+date+start)."""
+    nowhere yet — so we dedupe on nurse+facility+date+start).
+
+    This is used by the nightly historical sync only. New shifts pushed live from
+    Bubble on create/edit go through upsert_shift_from_push instead, which is keyed
+    on bubble_shift_id and can update in place."""
     if _blocked(f"upsert_shift nurse={nurse_id} {date}"):
         return
     client = get_client()
@@ -1144,3 +1149,82 @@ def upsert_shift(bubble_shift_id: str, nurse_id: int, facility_id: int,
         "shift_type": shift_type, "start_time": start_time, "end_time": end_time,
         "status": status,
     }).execute()
+
+
+def upsert_shift_from_push(bubble_shift_id: str, nurse_id: int, date: str,
+                           shift_type: str, start_time: str, end_time: str,
+                           status: str, facility_id: int | None = None,
+                           participant_id: int | None = None,
+                           recurring_template_id: int | None = None) -> None:
+    """Insert or update a shift pushed live from Bubble on create/edit (one-off or
+    recurring-generated), keyed on bubble_shift_id so an edited shift updates in
+    place instead of creating a duplicate row."""
+    if _blocked(f"upsert_shift_from_push {bubble_shift_id}"):
+        return
+    client = get_client()
+    payload = {
+        "nurse_id": nurse_id,
+        "facility_id": facility_id,
+        "participant_id": participant_id,
+        "date": date,
+        "shift_type": shift_type,
+        "start_time": start_time,
+        "end_time": end_time,
+        "status": status,
+        "bubble_shift_id": bubble_shift_id,
+        "recurring_template_id": recurring_template_id,
+    }
+    existing = (client.table("shifts").select("id")
+                .eq("bubble_shift_id", bubble_shift_id).limit(1).execute())
+    if existing.data:
+        client.table("shifts").update(payload).eq("id", existing.data[0]["id"]).execute()
+    else:
+        client.table("shifts").insert(payload).execute()
+    logger.info("Upserted shift %s (nurse=%s, %s %s)", bubble_shift_id, nurse_id, date, shift_type)
+
+
+# --- Recurring shift templates ---
+
+def find_or_create_recurring_template(participant_id: int, nurse_id: int, role: str,
+                                      day_of_week: int, start_time: str,
+                                      end_time: str) -> int:
+    """Return the id of an existing active template matching this participant,
+    nurse, weekday and start time, or create one. Checking first keeps a shift
+    edited twice (or a Bubble retry) from spawning duplicate templates."""
+    client = get_client()
+    existing = (client.table("recurring_shift_templates").select("id")
+                .eq("participant_id", participant_id).eq("nurse_id", nurse_id)
+                .eq("day_of_week", day_of_week).eq("start_time", start_time)
+                .eq("active", True).limit(1).execute())
+    if existing.data:
+        return existing.data[0]["id"]
+    resp = client.table("recurring_shift_templates").insert({
+        "participant_id": participant_id,
+        "nurse_id": nurse_id,
+        "role": role,
+        "day_of_week": day_of_week,
+        "start_time": start_time,
+        "end_time": end_time,
+        "active": True,
+    }).execute()
+    new_id = resp.data[0]["id"]
+    logger.info("Created recurring_shift_template %s (participant=%s nurse=%s day=%s)",
+                new_id, participant_id, nurse_id, day_of_week)
+    return new_id
+
+
+def get_active_recurring_templates() -> list[dict]:
+    """All active recurring templates, for the weekly generator to walk through."""
+    client = get_client()
+    r = client.table("recurring_shift_templates").select("*").eq("active", True).execute()
+    return r.data or []
+
+
+def shift_exists_for_template(recurring_template_id: int, date: str) -> bool:
+    """True if this template already generated a shift for this date — the
+    generator's dedup check so a re-run of the weekly job doesn't double-book."""
+    client = get_client()
+    r = (client.table("shifts").select("id")
+         .eq("recurring_template_id", recurring_template_id).eq("date", date)
+         .limit(1).execute())
+    return bool(r.data)
