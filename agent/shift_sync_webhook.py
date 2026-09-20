@@ -32,7 +32,7 @@ Bubble workflow contract (on shift created/edited), POST form fields:
   hours                 - hours for this shift (number)
   rate                  - the NDIS item's price (number)
   wage                  - the carer's pay rate (number)
-  revenue_rate          - the item's hourly revenue rate (number)
+  revenue               - the item's hourly revenue rate (number)
 
 shift_type (Morning/Afternoon/Night) is derived from start_time here, so Bubble
 doesn't need to compute or send it.
@@ -176,7 +176,7 @@ def shift_sync():
             hours=_num(f.get("hours")),
             rate=_num(f.get("rate")),
             wage=_num(f.get("wage")),
-            revenue_rate=_num(f.get("revenue_rate")),
+            revenue_rate=_num(f.get("revenue")),
         )
 
     start_ts, end_ts = build_timestamps(date, start_hhmm, end_hhmm)
