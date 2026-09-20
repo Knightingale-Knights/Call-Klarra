@@ -123,7 +123,11 @@ def create_bubble_shift(template: dict, target_date: str) -> str | None:
         "participant": participant_bid,
         "coordinator": template.get("coordinator_bubble_id"),
         "address": template.get("participant_address"),
-        "date": f"{target_date}T00:00:00Z",
+        # Melbourne midnight, expressed with the same fixed +10 offset used
+        # elsewhere in this codebase (ignores daylight saving, same as
+        # build_timestamps) — sending UTC midnight here instead would display as
+        # 10am/11am in Bubble, since Bubble shows dates in local time.
+        "date": f"{target_date}T00:00:00+10:00",
         "start time": hhmm_to_bubble_num(template["start_time"]),
         "end time": hhmm_to_bubble_num(template["end_time"]),
         "hours": hours,
