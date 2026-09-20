@@ -129,7 +129,9 @@ def create_bubble_shift(template: dict, target_date: str) -> str | None:
         # 10am/11am in Bubble, since Bubble shows dates in local time.
         "date": f"{target_date}T00:00:00+10:00",
         "start time": hhmm_to_bubble_num(template["start_time"]),
-        "end time": hhmm_to_bubble_num(template["end_time"]),
+        "end time": (hhmm_to_bubble_num(template["end_time"]) + 2400
+                     if template.get("end_crosses_midnight")
+                     else hhmm_to_bubble_num(template["end_time"])),
         "hours": hours,
         "ndis": template.get("ndis_code_bubble_id"),
         "rate": rate,
