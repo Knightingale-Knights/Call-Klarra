@@ -5,8 +5,14 @@ before telling the facility. Runs ALONGSIDE the voice orchestrator on its own
 poll loop, claiming only source='sms' rows (via claim_next_sms_request) so the
 two never race on the same shift_requests row.
 
-sms_webhook.py routes nurse YES/NO replies into sms_nurse_offers and Paul's OK into
-sms_shift_state — that's what this orchestrator polls for.
+Also polls for ad hoc single-nurse offers (sms_webhook.py's targeted-text command)
+that have gone unanswered for 15 minutes, and alerts Paul once per offer. The offer
+stays open after that alert, so a later reply still reaches sms_webhook and gets
+reported to Paul as usual.
+
+sms_webhook.py routes nurse YES/NO replies into sms_nurse_offers (cascade) or
+sms_adhoc_offers (targeted), and Paul's OK into sms_shift_state — that's what this
+orchestrator polls for.
 
 Late replies: offers go out every ~40s, but a nurse's YES is honoured whenever it
 arrives, as long as nobody else has claimed the shift (sms_webhook does the claiming
@@ -60,24 +66,14 @@ MAX_REMINDERS = 2
 
 MID_FACILITY_DELAY_SECONDS = 30  # mid: pause before naming the nurse to the facility
 
+ADHOC_TIMEOUT_MINUTES = 15     # ad hoc single-nurse offer: alert Paul if unanswered
+
 
 def _offer_status(offer_id: str) -> str | None:
     client = db.get_client()
     r = (client.table("sms_nurse_offers").select("status")
          .eq("id", offer_id).limit(1).execute())
     return r.data[0]["status"] if r.data else None
-
-
-def _short_date(d: str) -> str:
-    """Format 'YYYY-MM-DD' as 'Tue 28th'. Returns input unchanged on failure."""
-    from datetime import datetime
-    try:
-        dt = datetime.strptime(str(d)[:10], "%Y-%m-%d")
-        day = dt.day
-        suffix = "th" if 11 <= day % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
-        return dt.strftime("%a ") + f"{day}{suffix}"
-    except Exception:
-        return str(d)
 
 
 def _compact_time(t: str) -> str:
@@ -92,7 +88,7 @@ def _shift_time_desc(req: dict) -> str:
 
 
 def offer_message(nurse: dict, req: dict) -> str:
-    nice_date = _short_date(req["date"])
+    nice_date = db.short_date(req["date"])
     if req.get("start_time") and req.get("end_time"):
         time_desc = f"from {_compact_time(req['start_time'])} - {_compact_time(req['end_time'])}"
     else:
@@ -443,11 +439,30 @@ def handle_request(req: dict):
         # declined or no_reply -> next pending offer, or the next tier up
 
 
+# --- Ad hoc single-nurse offer timeout ------------------------------------
+
+def check_adhoc_timeouts():
+    """Alert Paul once for any ad hoc single-nurse offer that's been sitting
+    unanswered for ADHOC_TIMEOUT_MINUTES. The offer stays open afterward, so a
+    later reply still reaches sms_webhook and gets reported to him as usual."""
+    for offer in db.get_adhoc_offers_needing_timeout_alert(ADHOC_TIMEOUT_MINUTES):
+        nurse_name = (offer.get("nurses") or {}).get("first_name", "Carer")
+        body = (
+            f"No response yet from {nurse_name} for the {offer['shift_type']} shift "
+            f"at {offer.get('facility_name') or 'the facility'} on "
+            f"{db.pretty_date(offer['date'])} ({ADHOC_TIMEOUT_MINUTES} min). "
+            f"Still watching, will let you know if they reply."
+        )
+        text_admins(body)
+        db.mark_adhoc_offer(offer["id"], timeout_alerted=True)
+
+
 def main():
     logger.info("SMS orchestrator running (KLARRA_MODE=%s). Polling every %ss.",
                 db.KLARRA_MODE, POLL_SECONDS)
     while True:
         try:
+            check_adhoc_timeouts()
             req = db.claim_next_sms_request()
             if req:
                 handle_request(req)
