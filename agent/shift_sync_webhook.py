@@ -43,6 +43,7 @@ Run:  python agent/shift_sync_webhook.py
 import os
 import logging
 from datetime import date as _date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import certifi
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
@@ -86,17 +87,33 @@ def shift_type_from_start(n) -> str:
     return "Night"
 
 
+def melbourne_utc_offset_hours(date_str: str) -> int:
+    """The correct UTC offset for Melbourne on THIS specific calendar date (10 for
+    AEST, 11 for AEDT), using real daylight-saving rules — not a hardcoded seasonal
+    constant. This matters because a shift generated today can be dated for a day
+    that's already on the other side of the DST transition (e.g. generating next
+    Monday's shift while today is still AEST, but Monday is already AEDT)."""
+    dt = datetime.strptime(date_str, "%Y-%m-%d").replace(
+        hour=0, minute=0, tzinfo=ZoneInfo("Australia/Melbourne")
+    )
+    return int(dt.utcoffset().total_seconds() // 3600)
+
+
 def build_timestamps(date_str: str, start_hhmm: str, end_hhmm: str) -> tuple[str, str]:
-    """Turn a date + two HH:MM times into full timestamptz strings (Melbourne, +10),
-    same convention sync_bubble.py uses. An overnight shift (end <= start) rolls the
-    end timestamp to the next calendar day."""
-    start_ts = f"{date_str} {start_hhmm}:00+10"
+    """Turn a date + two HH:MM times into full timestamptz strings, using the
+    correct Melbourne offset for each date involved. An overnight shift (end <=
+    start) rolls the end timestamp to the next calendar day, which can itself sit
+    on the other side of a DST transition — so the end offset is computed from
+    end_date, not assumed to match the start offset."""
+    start_offset = melbourne_utc_offset_hours(date_str)
+    start_ts = f"{date_str} {start_hhmm}:00+{start_offset}"
     if end_hhmm <= start_hhmm:
         y, m, d = map(int, date_str.split("-"))
         end_date = (_date(y, m, d) + timedelta(days=1)).isoformat()
     else:
         end_date = date_str
-    end_ts = f"{end_date} {end_hhmm}:00+10"
+    end_offset = melbourne_utc_offset_hours(end_date)
+    end_ts = f"{end_date} {end_hhmm}:00+{end_offset}"
     return start_ts, end_ts
 
 
