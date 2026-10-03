@@ -19,6 +19,7 @@ Run:  python agent/recurring_shift_generator.py
 import os
 import logging
 from datetime import date as _date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import certifi
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
@@ -59,16 +60,33 @@ def shift_type_from_start(t) -> str:
     return "Night"
 
 
+def melbourne_utc_offset_hours(date_str: str) -> int:
+    """The correct UTC offset for Melbourne on THIS specific calendar date (10 for
+    AEST, 11 for AEDT), using real daylight-saving rules — not a hardcoded seasonal
+    constant. This matters because a shift generated today can be dated for a day
+    that's already on the other side of the DST transition (e.g. generating next
+    Monday's shift while today is still AEST, but Monday is already AEDT)."""
+    dt = datetime.strptime(date_str, "%Y-%m-%d").replace(
+        hour=0, minute=0, tzinfo=ZoneInfo("Australia/Melbourne")
+    )
+    return int(dt.utcoffset().total_seconds() // 3600)
+
+
 def build_timestamps(date_str: str, start_hhmm: str, end_hhmm: str) -> tuple[str, str]:
-    """Same convention as shift_sync_webhook.py / sync_bubble.py: Melbourne (+10),
-    end rolls to the next day if it's an overnight shift."""
-    start_ts = f"{date_str} {start_hhmm}:00+10"
+    """Same convention as shift_sync_webhook.py / sync_bubble.py, but using the
+    correct Melbourne offset for each date involved rather than a hardcoded
+    seasonal constant. End rolls to the next day if it's an overnight shift, and
+    that end_date gets its own offset computed separately (it can land on the
+    other side of a DST transition from the start date)."""
+    start_offset = melbourne_utc_offset_hours(date_str)
+    start_ts = f"{date_str} {start_hhmm}:00+{start_offset}"
     if end_hhmm <= start_hhmm:
         y, m, d = map(int, date_str.split("-"))
         end_date = (_date(y, m, d) + timedelta(days=1)).isoformat()
     else:
         end_date = date_str
-    end_ts = f"{end_date} {end_hhmm}:00+10"
+    end_offset = melbourne_utc_offset_hours(end_date)
+    end_ts = f"{end_date} {end_hhmm}:00+{end_offset}"
     return start_ts, end_ts
 
 
@@ -123,11 +141,11 @@ def create_bubble_shift(template: dict, target_date: str) -> str | None:
         "participant": participant_bid,
         "coordinator": template.get("coordinator_bubble_id"),
         "address": template.get("participant_address"),
-        # Melbourne midnight, expressed with the same fixed +10 offset used
-        # elsewhere in this codebase (ignores daylight saving, same as
-        # build_timestamps) — sending UTC midnight here instead would display as
-        # 10am/11am in Bubble, since Bubble shows dates in local time.
-        "date": f"{target_date}T00:00:00+10:00",
+        # Melbourne midnight, expressed with the correct offset for THIS target
+        # date (see melbourne_utc_offset_hours) — sending UTC midnight here
+        # instead would display as 10am/11am in Bubble, since Bubble shows
+        # dates in local time.
+        "date": f"{target_date}T00:00:00+{melbourne_utc_offset_hours(target_date):02d}:00",
         "start time": hhmm_to_bubble_num(template["start_time"]),
         "end time": (hhmm_to_bubble_num(template["end_time"]) + 2400
                      if template.get("end_crosses_midnight")
