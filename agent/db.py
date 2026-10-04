@@ -1411,3 +1411,36 @@ def get_participant(participant_id: int) -> dict | None:
     client = get_client()
     r = client.table("participants").select("id, name").eq("id", participant_id).limit(1).execute()
     return r.data[0] if r.data else None
+
+
+# --- Editing an existing recurring series ---
+
+def get_shift_by_bubble_id(bubble_shift_id: str) -> dict | None:
+    """The Supabase shift for a Bubble shift id, if we already have it - used to tell
+    an EDIT of an existing shift apart from the creation of a new one."""
+    client = get_client()
+    r = (client.table("shifts").select("id, recurring_template_id")
+         .eq("bubble_shift_id", bubble_shift_id).limit(1).execute())
+    return r.data[0] if r.data else None
+
+
+def update_recurring_template(template_id: int, fields: dict) -> bool:
+    """Update an existing template in place (the shift's weekly series keeps its id).
+    Skipped, returning False, if the new participant/carer/weekday/start time would
+    match a DIFFERENT active template, because two identical series would generate
+    duplicate shifts every week."""
+    client = get_client()
+    clash = (client.table("recurring_shift_templates").select("id")
+             .eq("participant_id", fields["participant_id"])
+             .eq("nurse_id", fields["nurse_id"])
+             .eq("day_of_week", fields["day_of_week"])
+             .eq("start_time", fields["start_time"])
+             .eq("active", True).neq("id", template_id).limit(1).execute())
+    if clash.data:
+        logger.warning("Template %s not updated: template %s already covers that "
+                       "participant, carer, weekday and start time",
+                       template_id, clash.data[0]["id"])
+        return False
+    client.table("recurring_shift_templates").update(fields).eq("id", template_id).execute()
+    logger.info("Updated recurring_shift_template %s", template_id)
+    return True
