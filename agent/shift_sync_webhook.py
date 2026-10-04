@@ -219,6 +219,7 @@ def shift_sync():
                     "start_time": start_hhmm,
                     "end_time": end_hhmm,
                     "end_crosses_midnight": int(end_time_num) >= 2400,
+                    "start_crosses_midnight": int(start_time_num) >= 2400,
                 }
                 fields.update({k: v for k, v in optional.items() if v is not None})
                 if not db.update_recurring_template(existing_tid, fields):
@@ -234,6 +235,7 @@ def shift_sync():
                 start_time=start_hhmm,
                 end_time=end_hhmm,
                 end_crosses_midnight=int(end_time_num) >= 2400,
+                start_crosses_midnight=int(start_time_num) >= 2400,
                 **optional,
             )
     elif existing_tid:
