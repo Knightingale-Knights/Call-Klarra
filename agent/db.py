@@ -1294,3 +1294,106 @@ def latest_shift_date_for_template(recurring_template_id: int) -> str | None:
          .eq("recurring_template_id", recurring_template_id)
          .order("date", desc=True).limit(1).execute())
     return r.data[0]["date"] if r.data else None
+
+
+# --- Duplicate shift review (SMS confirmation flow) ---
+
+def find_duplicate_shift_pairs() -> list[tuple[dict, dict]]:
+    """Any two shifts sharing the same participant, date, start and end time —
+    grouped in Python rather than SQL since the client library doesn't do
+    GROUP BY/HAVING. Excludes nothing by itself; callers filter out pairs
+    already queued via already_reviewed_shift_ids()."""
+    client = get_client()
+    r = (client.table("shifts")
+         .select("id, nurse_id, participant_id, date, start_time, end_time, "
+                "recurring_template_id, bubble_shift_id")
+         .not_.is_("participant_id", "null")
+         .execute())
+    rows = r.data or []
+    groups: dict[tuple, list[dict]] = {}
+    for row in rows:
+        key = (row["participant_id"], row["date"], row["start_time"], row["end_time"])
+        groups.setdefault(key, []).append(row)
+    pairs = []
+    for rows_in_group in groups.values():
+        if len(rows_in_group) > 1:
+            for i in range(len(rows_in_group) - 1):
+                pairs.append((rows_in_group[i], rows_in_group[i + 1]))
+    return pairs
+
+
+def already_reviewed_shift_ids() -> set:
+    """Every shift id that's already part of a duplicate_shift_reviews row
+    (pending, sent, or resolved) — once a shift has been queued, don't flag it
+    again even if it turns up in a new pair."""
+    client = get_client()
+    r = client.table("duplicate_shift_reviews").select("shift_1_id, shift_2_id").execute()
+    ids = set()
+    for row in (r.data or []):
+        ids.add(row["shift_1_id"])
+        ids.add(row["shift_2_id"])
+    return ids
+
+
+def create_duplicate_review(shift_1_id: int, shift_2_id: int) -> int:
+    client = get_client()
+    resp = client.table("duplicate_shift_reviews").insert({
+        "shift_1_id": shift_1_id, "shift_2_id": shift_2_id, "status": "pending",
+    }).execute()
+    return resp.data[0]["id"]
+
+
+def get_sent_duplicate_review() -> dict | None:
+    """The one review currently awaiting Paul's 1/2 reply, if any — only one is
+    ever 'sent' at a time, so a bare '1' or '2' is unambiguous."""
+    client = get_client()
+    r = (client.table("duplicate_shift_reviews").select("*")
+         .eq("status", "sent").order("created_at").limit(1).execute())
+    return r.data[0] if r.data else None
+
+
+def get_next_pending_duplicate_review() -> dict | None:
+    client = get_client()
+    r = (client.table("duplicate_shift_reviews").select("*")
+         .eq("status", "pending").order("created_at").limit(1).execute())
+    return r.data[0] if r.data else None
+
+
+def mark_duplicate_review_sent(review_id: int) -> None:
+    client = get_client()
+    client.table("duplicate_shift_reviews").update(
+        {"status": "sent"}
+    ).eq("id", review_id).execute()
+
+
+def resolve_duplicate_review(review_id: int, kept_shift_id: int, deleted_shift_id: int) -> None:
+    client = get_client()
+    client.table("duplicate_shift_reviews").update({
+        "status": "resolved",
+        "kept_shift_id": kept_shift_id,
+        "deleted_shift_id": deleted_shift_id,
+    }).eq("id", review_id).execute()
+
+
+def get_shift(shift_id: int) -> dict | None:
+    client = get_client()
+    r = client.table("shifts").select("*").eq("id", shift_id).limit(1).execute()
+    return r.data[0] if r.data else None
+
+
+def delete_shift(shift_id: int) -> None:
+    client = get_client()
+    client.table("shifts").delete().eq("id", shift_id).execute()
+
+
+def deactivate_recurring_template(template_id: int) -> None:
+    client = get_client()
+    client.table("recurring_shift_templates").update(
+        {"active": False}
+    ).eq("id", template_id).execute()
+
+
+def get_participant(participant_id: int) -> dict | None:
+    client = get_client()
+    r = client.table("participants").select("id, name").eq("id", participant_id).limit(1).execute()
+    return r.data[0] if r.data else None
