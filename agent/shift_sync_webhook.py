@@ -9,6 +9,10 @@ creation, the template also captures the fixed billing/address details (coordina
 participant address, NDIS code, hours, rate, wage, revenue) from THIS shift, since
 Paul confirmed these stay the same for a given recurring shift going forward.
 
+EDITS: if the shift already belongs to a weekly series, an edit with Recurring = yes
+updates that series' template in place (no second series is created), as long as the
+shift is dated today or later. Recurring = no leaves the series alone.
+
 Either way, flips the nurse's Supabase availability row to 'assigned' for that
 date/shift_type, then pushes that change back to Bubble's own Availability record
 (available=false) so the Bubble UI stays in sync.
@@ -177,30 +181,67 @@ def shift_sync():
     if not facility_id and not participant_id:
         return jsonify({"error": "must supply facility_slug or participant_bubble_id"}), 400
 
+    # Is this an EDIT of a shift that already belongs to a weekly series?
+    existing_shift = db.get_shift_by_bubble_id(shift_bubble_id)
+    existing_tid = (existing_shift or {}).get("recurring_template_id")
+
     recurring_template_id = None
+    template_note = None
     if recurring and participant_id:
         try:
             day_of_week = datetime.strptime(date, "%Y-%m-%d").weekday()
         except ValueError:
             return jsonify({"error": f"bad date {date}"}), 400
         nurse = db.get_nurse(nurse_id)
-        recurring_template_id = db.find_or_create_recurring_template(
-            participant_id=participant_id,
-            nurse_id=nurse_id,
-            role=(nurse or {}).get("role", ""),
-            day_of_week=day_of_week,
-            start_time=start_hhmm,
-            end_time=end_hhmm,
-            coordinator_bubble_id=f.get("coordinator_bubble_id") or None,
-            participant_address=f.get("participant_address") or None,
-            ndis_code_bubble_id=f.get("ndis_code_bubble_id") or None,
-            ndis_code_text=f.get("ndis_code_text") or None,
-            hours=_num(f.get("hours")),
-            rate=_num(f.get("rate")),
-            wage=_num(f.get("wage")),
-            revenue_rate=_num(f.get("revenue")),
-            end_crosses_midnight=int(end_time_num) >= 2400,
-        )
+        optional = {
+            "coordinator_bubble_id": f.get("coordinator_bubble_id") or None,
+            "participant_address": f.get("participant_address") or None,
+            "ndis_code_bubble_id": f.get("ndis_code_bubble_id") or None,
+            "ndis_code_text": f.get("ndis_code_text") or None,
+            "hours": _num(f.get("hours")),
+            "rate": _num(f.get("rate")),
+            "wage": _num(f.get("wage")),
+            "revenue_rate": _num(f.get("revenue")),
+        }
+        if existing_tid:
+            # Edit of a shift already in a series: update THAT series in place
+            # instead of creating a second one. Past-dated shifts are left out so a
+            # correction to a worked shift (e.g. actual hours) can't change the
+            # shifts that will be generated from now on.
+            recurring_template_id = existing_tid
+            today = datetime.now(ZoneInfo("Australia/Melbourne")).strftime("%Y-%m-%d")
+            if date >= today:
+                fields = {
+                    "participant_id": participant_id,
+                    "nurse_id": nurse_id,
+                    "role": (nurse or {}).get("role", ""),
+                    "day_of_week": day_of_week,
+                    "start_time": start_hhmm,
+                    "end_time": end_hhmm,
+                    "end_crosses_midnight": int(end_time_num) >= 2400,
+                }
+                fields.update({k: v for k, v in optional.items() if v is not None})
+                if not db.update_recurring_template(existing_tid, fields):
+                    template_note = "series not updated: another series already matches"
+            else:
+                template_note = "past-dated shift: series left unchanged"
+        else:
+            recurring_template_id = db.find_or_create_recurring_template(
+                participant_id=participant_id,
+                nurse_id=nurse_id,
+                role=(nurse or {}).get("role", ""),
+                day_of_week=day_of_week,
+                start_time=start_hhmm,
+                end_time=end_hhmm,
+                end_crosses_midnight=int(end_time_num) >= 2400,
+                **optional,
+            )
+    elif existing_tid:
+        # Edited with Recurring = no (or no participant): keep the shift linked to
+        # its series and leave the series alone. Unlinking it would also make the
+        # generator lose track of the series' last date and recreate a shift that
+        # already exists.
+        recurring_template_id = existing_tid
 
     start_ts, end_ts = build_timestamps(date, start_hhmm, end_hhmm)
 
@@ -223,7 +264,8 @@ def shift_sync():
         push_availability_to_bubble(avail_bubble_id, available=False)
 
     logger.info("Synced shift %s (nurse=%s %s %s)", shift_bubble_id, nurse_id, date, shift_type)
-    return jsonify({"ok": True, "recurring_template_id": recurring_template_id})
+    return jsonify({"ok": True, "recurring_template_id": recurring_template_id,
+                    "note": template_note})
 
 
 if __name__ == "__main__":
