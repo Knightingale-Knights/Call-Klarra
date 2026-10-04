@@ -105,13 +105,20 @@ def push_availability_to_bubble(availability_bubble_id: str, available: bool) ->
 
 
 def next_target_date(template: dict) -> str:
-    """This template's next shift date: last generated date + 7 days, or — only if
-    it somehow has no shifts yet — the next occurrence of its weekday from today."""
+    """This template's next shift date: the series' last shift plus 7 days, moved
+    forward in whole weeks if that is not after today, so a shift is never created
+    in the past. Missed or late runs don't create a backlog either: you only ever get
+    the next future occurrence of that weekday. If the template somehow has no shifts
+    yet, it is the next occurrence of its weekday after today."""
+    today = datetime.now(ZoneInfo("Australia/Melbourne")).date()
     last = db.latest_shift_date_for_template(template["id"])
     if last:
         y, m, d = map(int, str(last)[:10].split("-"))
-        return (_date(y, m, d) + timedelta(days=7)).isoformat()
-    today = _date.today()
+        target = _date(y, m, d) + timedelta(days=7)
+        if target <= today:
+            weeks_behind = (today - target).days // 7 + 1
+            target += timedelta(days=7 * weeks_behind)
+        return target.isoformat()
     days_ahead = (template["day_of_week"] - today.weekday()) % 7 or 7
     return (today + timedelta(days=days_ahead)).isoformat()
 
