@@ -32,16 +32,18 @@ ADMIN_PHONE = "+61426512584"
 
 def describe_side(shift: dict) -> str:
     nurse = db.get_nurse(shift["nurse_id"])
-    name = (nurse or {}).get("first_name") or f"nurse {shift['nurse_id']}"
+    name = ((nurse or {}).get("first_name") or "").strip() or f"nurse {shift['nurse_id']}"
     recurring = "recurring" if shift.get("recurring_template_id") else "one-off"
     return f"{name} ({recurring})"
 
 
 def hhmm_from_timestamp(ts: str) -> str:
-    """Extract 'HH:MM' from a timestamptz string, regardless of whether it uses a
-    'T' or a space separator (Postgres/PostgREST can return either)."""
-    time_part = ts.split("T")[-1] if "T" in ts else ts.split(" ")[-1]
-    return time_part[:5]
+    """Extract Melbourne-local 'HH:MM' from a timestamptz string. Supabase returns
+    these in UTC, so converting is required or the text would show UTC times."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    return dt.astimezone(ZoneInfo("Australia/Melbourne")).strftime("%H:%M")
 
 
 def send_review_sms(review: dict) -> None:
