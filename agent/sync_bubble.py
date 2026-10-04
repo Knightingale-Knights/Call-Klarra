@@ -6,14 +6,33 @@ into Supabase so Klarra works from real, current data.
 
   - nurses:    User where account type=carer, active=true  -> nurses (+ approvals)
   - availability: Availability where available=true        -> availability
+  - shifts:    Shift (facility shifts)                      -> shifts
+
+INCREMENTAL: after the first run, each run only fetches records Bubble says were
+modified since the last SUCCESSFUL run (Bubble's built-in "Modified Date"), instead
+of re-reading and rewriting everything. The time of the last successful run is kept
+in the Supabase table sync_state. Rules that keep this safe:
+
+  - The run start time is saved only after all three steps finish, so a crash means
+    the next run retries from the old point (nothing is skipped).
+  - 10 minutes of overlap is added, so a record edited while a run was in progress
+    is not missed.
+  - A FULL sync (everything, as before) runs on the very first run, whenever the
+    last full sync is over 7 days old, and on demand (see below). The weekly full
+    run catches anything an incremental run can't see, e.g. a carer who becomes
+    eligible later while their older availability records are unchanged.
+  - If the sync_state table is missing, every run is simply a full sync.
+
+Force a full sync:  FULL_SYNC=1 environment variable, or:  python agent/sync_bubble.py --full
 
 Run on demand:   python agent/sync_bubble.py
-(Later: schedule it, or trigger per-signup from a Bubble workflow.)
 """
 
 import os
+import sys
 import logging
 import requests
+from datetime import datetime, timedelta, timezone
 
 import certifi
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
@@ -29,8 +48,13 @@ BASE = "https://knightingale.com.au/api/1.1/obj"
 TOKEN = os.environ["BUBBLE_API_TOKEN"]
 HEADERS = {"Authorization": f"Bearer {TOKEN}"}
 
-# Roles we staff, most senior first. A carer is stored under ONE role — the highest
-# they hold — so someone qualified as both EN and PCA is only offered EN shifts.
+FULL_SYNC_EVERY_DAYS = 7
+OVERLAP_MINUTES = 10
+STATE_LAST_RUN = "bubble_sync_last_run"
+STATE_LAST_FULL = "bubble_sync_last_full"
+
+# Roles we staff, most senior first. A carer is stored under ONE role - the highest
+# they hold - so someone qualified as both EN and PCA is only offered EN shifts.
 # If dual-qualified carers need to see both, this becomes a roles[] column and a
 # change to get_candidate_pool; single role is deliberate for now.
 ROLE_PRIORITY = ["RN", "EN", "PCA", "DSW"]
@@ -55,10 +79,63 @@ ROLE_ALIASES = {
 _unmapped_roles: set[str] = set()
 
 
+# --- Sync state (when did we last sync successfully) ---
+
+def get_state(name: str) -> datetime | None:
+    try:
+        r = (db.get_client().table("sync_state").select("value")
+             .eq("name", name).limit(1).execute())
+        if r.data:
+            return datetime.fromisoformat(r.data[0]["value"])
+    except Exception:
+        logger.warning("Could not read sync_state (is the table created?) - "
+                       "falling back to a full sync", exc_info=True)
+    return None
+
+
+def set_state(name: str, value: datetime) -> None:
+    try:
+        db.get_client().table("sync_state").upsert({
+            "name": name,
+            "value": value.isoformat(),
+            "updated_at": "now()",
+        }).execute()
+    except Exception:
+        logger.warning("Could not save sync_state - next run will be a full sync",
+                       exc_info=True)
+
+
+def decide_since(now: datetime) -> tuple[datetime | None, bool]:
+    """Returns (since, is_full). since=None means fetch everything."""
+    forced = "--full" in sys.argv or os.environ.get("FULL_SYNC", "").strip() in ("1", "true", "yes")
+    last_run = get_state(STATE_LAST_RUN)
+    last_full = get_state(STATE_LAST_FULL)
+    if forced:
+        logger.info("Full sync (forced)")
+        return None, True
+    if not last_run or not last_full:
+        logger.info("Full sync (no previous successful run recorded)")
+        return None, True
+    if now - last_full > timedelta(days=FULL_SYNC_EVERY_DAYS):
+        logger.info("Full sync (last full sync was over %d days ago)", FULL_SYNC_EVERY_DAYS)
+        return None, True
+    since = last_run - timedelta(minutes=OVERLAP_MINUTES)
+    logger.info("Incremental sync: records modified since %s", since.isoformat())
+    return since, False
+
+
+def modified_since(since: datetime | None) -> list:
+    """Bubble constraint list fragment for 'modified after since' (empty if full)."""
+    if since is None:
+        return []
+    stamp = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    return [{"key": "Modified Date", "constraint_type": "greater than", "value": stamp}]
+
+
 def pick_role(roles_list) -> str | None:
     """Take the highest-priority staffable role from Bubble's roles array.
 
-    Returns None if the carer holds no role we staff — that carer is skipped, which
+    Returns None if the carer holds no role we staff - that carer is skipped, which
     is why PCAs and DSWs were previously absent from Supabase entirely: the old
     version only recognised EN and RN, so everyone else silently fell out of the sync.
     """
@@ -98,11 +175,11 @@ def fetch_all(datatype: str, constraints: list | None = None) -> list[dict]:
     return results
 
 
-def sync_nurses():
+def sync_nurses(since: datetime | None = None):
     users = fetch_all("user", constraints=[
         {"key": "account type", "constraint_type": "equals", "value": "carer"},
         {"key": "active", "constraint_type": "equals", "value": "true"},
-    ])
+    ] + modified_since(since))
     logger.info("Fetched %d carers from Bubble", len(users))
     synced = 0
     skipped_no_role = 0
@@ -140,13 +217,13 @@ def sync_nurses():
                        ", ".join(sorted(_unmapped_roles)))
 
 
-def sync_availability():
+def sync_availability(since: datetime | None = None):
     from datetime import date as _date
     today = _date.today().isoformat()
     avails = fetch_all("availability", constraints=[
         {"key": "available", "constraint_type": "equals", "value": "true"},
         {"key": "date", "constraint_type": "greater than", "value": today},
-    ])
+    ] + modified_since(since))
     logger.info("Fetched %d future availability records from Bubble", len(avails))
     synced = 0
     for a in avails:
@@ -181,8 +258,8 @@ def shift_type_from_start(n) -> str:
     return "Night"
 
 
-def sync_shifts():
-    shifts = fetch_all("shift")
+def sync_shifts(since: datetime | None = None):
+    shifts = fetch_all("shift", constraints=modified_since(since) or None)
     logger.info("Fetched %d shifts from Bubble", len(shifts))
     synced = 0
     for s in shifts:
@@ -219,8 +296,14 @@ def sync_shifts():
 
 
 if __name__ == "__main__":
+    started = datetime.now(timezone.utc)
+    since, is_full = decide_since(started)
     logger.info("Starting Bubble sync...")
-    sync_nurses()
-    sync_availability()
-    sync_shifts()
+    sync_nurses(since)
+    sync_availability(since)
+    sync_shifts(since)
+    # Only reached if all three steps finished without an error.
+    set_state(STATE_LAST_RUN, started)
+    if is_full:
+        set_state(STATE_LAST_FULL, started)
     logger.info("Done.")
