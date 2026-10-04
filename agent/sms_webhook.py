@@ -397,7 +397,7 @@ def _delete_bubble_shift(bubble_shift_id: str) -> None:
 
 def _describe_review_side(shift: dict) -> str:
     nurse = db.get_nurse(shift["nurse_id"])
-    name = (nurse or {}).get("first_name") or f"nurse {shift['nurse_id']}"
+    name = ((nurse or {}).get("first_name") or "").strip() or f"nurse {shift['nurse_id']}"
     recurring = "recurring" if shift.get("recurring_template_id") else "one-off"
     return f"{name} ({recurring})"
 
