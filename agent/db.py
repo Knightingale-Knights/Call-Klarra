@@ -1299,17 +1299,31 @@ def latest_shift_date_for_template(recurring_template_id: int) -> str | None:
 # --- Duplicate shift review (SMS confirmation flow) ---
 
 def find_duplicate_shift_pairs() -> list[tuple[dict, dict]]:
-    """Any two shifts sharing the same participant, date, start and end time —
+    """Any two FUTURE shifts sharing the same participant, date, start and end time,
     grouped in Python rather than SQL since the client library doesn't do
-    GROUP BY/HAVING. Excludes nothing by itself; callers filter out pairs
-    already queued via already_reviewed_shift_ids()."""
+    GROUP BY/HAVING. Callers filter out pairs already queued via
+    already_reviewed_shift_ids()."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    today = datetime.now(ZoneInfo("Australia/Melbourne")).strftime("%Y-%m-%d")
     client = get_client()
-    r = (client.table("shifts")
-         .select("id, nurse_id, participant_id, date, start_time, end_time, "
-                "recurring_template_id, bubble_shift_id")
-         .not_.is_("participant_id", "null")
-         .execute())
-    rows = r.data or []
+    # Future-dated shifts only: texting "1" or "2" deletes a shift in Bubble, and
+    # past shifts may already have been worked or invoiced.
+    rows, start, page = [], 0, 1000
+    while True:
+        r = (client.table("shifts")
+             .select("id, nurse_id, participant_id, date, start_time, end_time, "
+                     "recurring_template_id, bubble_shift_id")
+             .not_.is_("participant_id", "null")
+             .gt("date", today)
+             .order("id")
+             .range(start, start + page - 1)
+             .execute())
+        batch = r.data or []
+        rows.extend(batch)
+        if len(batch) < page:
+            break
+        start += page
     groups: dict[tuple, list[dict]] = {}
     for row in rows:
         key = (row["participant_id"], row["date"], row["start_time"], row["end_time"])
