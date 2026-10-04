@@ -403,10 +403,12 @@ def _describe_review_side(shift: dict) -> str:
 
 
 def _hhmm_from_timestamp(ts: str) -> str:
-    """Extract 'HH:MM' from a timestamptz string, regardless of whether it uses a
-    'T' or a space separator (Postgres/PostgREST can return either)."""
-    time_part = ts.split("T")[-1] if "T" in ts else ts.split(" ")[-1]
-    return time_part[:5]
+    """Extract Melbourne-local 'HH:MM' from a timestamptz string. Supabase returns
+    these in UTC, so converting is required or the text would show UTC times."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    return dt.astimezone(ZoneInfo("Australia/Melbourne")).strftime("%H:%M")
 
 
 def _send_next_duplicate_review() -> None:
@@ -451,17 +453,23 @@ def handle_duplicate_review_reply(body: str) -> Response | None:
     delete_id = review["shift_2_id"] if choice == "1" else review["shift_1_id"]
 
     losing_shift = db.get_shift(delete_id)
+    kept_shift = db.get_shift(keep_id)
     if losing_shift:
         if losing_shift.get("bubble_shift_id"):
             _delete_bubble_shift(losing_shift["bubble_shift_id"])
-        if losing_shift.get("recurring_template_id"):
-            db.deactivate_recurring_template(losing_shift["recurring_template_id"])
+        # Stop the losing shift's weekly series, but NOT if the kept shift belongs
+        # to that same template (same carer entered twice): that would stop the
+        # series you chose to keep.
+        losing_tid = losing_shift.get("recurring_template_id")
+        kept_tid = (kept_shift or {}).get("recurring_template_id")
+        if losing_tid and losing_tid != kept_tid:
+            db.deactivate_recurring_template(losing_tid)
         db.delete_shift(delete_id)
 
     db.resolve_duplicate_review(review["id"], keep_id, delete_id)
     _send_next_duplicate_review()
 
-    return twiml_reply(f"Got it — kept shift {choice}, removed the duplicate.")
+    return twiml_reply(f"Got it, kept shift {choice} and removed the duplicate.")
 
 
 def _too_late_reply(offer: dict) -> str:
