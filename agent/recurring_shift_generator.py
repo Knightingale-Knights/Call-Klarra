@@ -51,8 +51,23 @@ def hhmm_to_bubble_num(t) -> int:
     return int(h) * 100 + int(m)
 
 
-def shift_type_from_start(t) -> str:
-    h = int(hhmm(t).split(":")[0])
+def template_start_num(template: dict) -> int:
+    """The shift's start in Bubble's own number format. A template flagged
+    start_crosses_midnight originally used Bubble's 2400+ form (midnight is 2400,
+    not 0), and that exact form is restored here."""
+    n = hhmm_to_bubble_num(template["start_time"])
+    return n + 2400 if template.get("start_crosses_midnight") else n
+
+
+def template_end_num(template: dict) -> int:
+    n = hhmm_to_bubble_num(template["end_time"])
+    return n + 2400 if template.get("end_crosses_midnight") else n
+
+
+def shift_type_from_start(start_num: int) -> str:
+    """Morning/Afternoon/Night from Bubble's numeric start (same rule as the
+    webhook, so a 2400 midnight start is Night, not Morning)."""
+    h = int(start_num) // 100
     if h < 12:
         return "Morning"
     if h < 18:
@@ -153,10 +168,8 @@ def create_bubble_shift(template: dict, target_date: str) -> str | None:
         # instead would display as 10am/11am in Bubble, since Bubble shows
         # dates in local time.
         "date": f"{target_date}T00:00:00+{melbourne_utc_offset_hours(target_date):02d}:00",
-        "start time": hhmm_to_bubble_num(template["start_time"]),
-        "end time": (hhmm_to_bubble_num(template["end_time"]) + 2400
-                     if template.get("end_crosses_midnight")
-                     else hhmm_to_bubble_num(template["end_time"])),
+        "start time": template_start_num(template),
+        "end time": template_end_num(template),
         "hours": hours,
         "ndis": template.get("ndis_code_bubble_id"),
         "rate": rate,
@@ -199,7 +212,7 @@ def generate_for_template(template: dict) -> int | None:
     start_ts, end_ts = build_timestamps(
         target_date, hhmm(template["start_time"]), hhmm(template["end_time"])
     )
-    shift_type = shift_type_from_start(template["start_time"])
+    shift_type = shift_type_from_start(template_start_num(template))
 
     db.upsert_shift_from_push(
         bubble_shift_id=new_bubble_id,
