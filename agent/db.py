@@ -1219,7 +1219,8 @@ def find_or_create_recurring_template(participant_id: int, nurse_id: int, role: 
                                       rate: float | None = None,
                                       wage: float | None = None,
                                       revenue_rate: float | None = None,
-                                      end_crosses_midnight: bool = False) -> int:
+                                      end_crosses_midnight: bool = False,
+                                      start_crosses_midnight: bool = False) -> int:
     """Return the id of an existing active template matching this participant,
     nurse, weekday and start time, or create one. Checking first keeps a shift
     edited twice (or a Bubble retry) from spawning duplicate templates.
@@ -1258,6 +1259,7 @@ def find_or_create_recurring_template(participant_id: int, nurse_id: int, role: 
         "wage": wage,
         "revenue_rate": revenue_rate,
         "end_crosses_midnight": end_crosses_midnight,
+        "start_crosses_midnight": start_crosses_midnight,
     }).execute()
     new_id = resp.data[0]["id"]
     logger.info("Created recurring_shift_template %s (participant=%s nurse=%s day=%s)",
