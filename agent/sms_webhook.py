@@ -3,9 +3,6 @@ SMS webhook — receives a facility's text, parses the shift request, logs it, r
 The orchestrator picks it up and (for sms) texts the facility the result.
 
 Also routes:
-  - Paul's reply to a pending duplicate-shift review ('1' or '2') -> resolves it
-    (deletes the losing shift from Supabase and Bubble, deactivates its recurring
-    template if it had one) and immediately sends the next queued review, if any.
   - Two ad hoc admin commands from Paul's number: an availability query ("who can
     do EN AM Wednesday") and a targeted single-nurse text ("text Maria for the PM
     shift Thursday at Port Melbourne"), independent of the ranked cascade and of any
@@ -15,13 +12,10 @@ Also routes:
   - Paul replying OK to an admin-approval request -> updates sms_shift_state.
 
 Routing order matters, and is deliberately this order:
-  0a. Paul's reply to a pending duplicate-shift review — checked first on his
-      number, narrowest possible match (only fires on a bare '1'/'2' AND an
-      actual review currently awaiting his answer), so it can never accidentally
-      swallow anything else.
-  0b. Paul's ad hoc admin commands (availability query / text a specific nurse) —
-      checked next on his number, ahead of a pending approval, since they're a
-      distinct explicit intent and shouldn't get swallowed by the approval gate.
+  0. Paul's natural language admin agent (admin_agent.py: availability, text one or
+     more carers, replies; old fixed parser kept as fallback) —
+     checked first on his number, ahead of a pending approval, since they're a
+     distinct explicit intent and shouldn't get swallowed by the approval gate.
   1. Admin approval reply (narrow: only fires if there's a real pending approval).
   2. An ACTIVE offer (cascade or ad hoc) on this number — wins over facility
      identity, because it means we are actively expecting a YES/NO from this exact
@@ -40,6 +34,7 @@ Run:  python agent/sms_webhook.py
 """
 
 import os
+import re
 import json
 import random
 import logging
@@ -50,19 +45,15 @@ os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 from dotenv import load_dotenv
 from flask import Flask, request, Response
 import anthropic
-import requests
 
 import db
+import admin_agent
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("knightingale-sms")
 
 app = Flask(__name__)
-
-BUBBLE_BASE = "https://knightingale.com.au/api/1.1/obj"
-BUBBLE_TOKEN = os.environ["BUBBLE_API_TOKEN"]
-BUBBLE_HEADERS = {"Authorization": f"Bearer {BUBBLE_TOKEN}"}
 
 # Roles Knightingale staffs. Must match the values sync_bubble.py writes to
 # nurses.role — get_candidate_pool matches on this string exactly, so a request
@@ -135,10 +126,10 @@ def parse_request(text: str) -> dict | None:
 
 def parse_admin_command(text: str) -> dict:
     """
-    Classify a text from Paul (the admin number) as one of two ad hoc commands, or
-    neither. Both are separate from the normal facility shift-request flow and from
-    the ranked SMS cascade — Command A just answers a question, Command B texts
-    exactly one named carer with no ranking or shift_request involved.
+    Classify a text from Paul (the admin number) as one of three ad hoc commands, or
+    neither. All are separate from the normal facility shift-request flow and from
+    the ranked SMS cascade — Commands A and C just answer a question, Command B
+    texts exactly one named carer with no ranking or shift_request involved.
     """
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     msg = client.messages.create(
@@ -160,6 +151,11 @@ def parse_admin_command(text: str) -> dict:
                 'ONLY: {"type":"text_nurse","nurse_name":"as written",'
                 '"facility":"site name as written, or null if not mentioned",'
                 '"date":"YYYY-MM-DD","shift_type":"Morning|Afternoon|Night"}\n\n'
+                "Command C - NURSE AVAILABILITY CHECK: a question asking whether ONE "
+                "named carer is available, WITHOUT asking to text them. Respond ONLY: "
+                '{"type":"nurse_availability","nurse_name":"as written",'
+                '"date":"YYYY-MM-DD","shift_type":"Morning|Afternoon|Night or null '
+                'if no shift mentioned"}\n\n'
                 "If it's a normal shift request reporting a role/date/site that needs "
                 "covering — no named carer, not phrased as a question — or anything "
                 "else, respond ONLY {\"type\":\"none\"}.\n\n"
@@ -177,7 +173,8 @@ def parse_admin_command(text: str) -> dict:
 
 
 def twiml_reply(text: str) -> Response:
-    body = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{text}</Message></Response>'
+    from xml.sax.saxutils import escape
+    body = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{escape(text)}</Message></Response>'
     return Response(body, mimetype="text/xml")
 
 
@@ -384,92 +381,34 @@ def handle_text_nurse_command(parsed: dict) -> Response:
     )
 
 
-# --- Duplicate shift review reply ---
+def handle_nurse_availability_query(parsed: dict) -> Response:
+    """Answer "is {nurse} available" for a named carer, optionally for one shift
+    block. Not tied to any facility or shift_request."""
+    name = parsed.get("nurse_name")
+    date = parsed.get("date")
+    shift_type = parsed.get("shift_type")
 
-def _delete_bubble_shift(bubble_shift_id: str) -> None:
-    try:
-        r = requests.delete(f"{BUBBLE_BASE}/shift/{bubble_shift_id}",
-                            headers=BUBBLE_HEADERS, timeout=15)
-        r.raise_for_status()
-    except Exception:
-        logger.exception("Failed to delete Bubble shift %s", bubble_shift_id)
+    if not (name and date):
+        return twiml_reply("Sorry, I need the carer's name and a date.")
 
+    nurse, candidates = db.find_nurse_by_name(name)
+    if candidates:
+        opts = ", ".join(f"{c['first_name']} {c['last_name']}" for c in candidates)
+        return twiml_reply(f"A few carers match '{name}': {opts}. Which one?")
+    if not nurse:
+        return twiml_reply(f"Couldn't find a carer named '{name}'.")
 
-def _describe_review_side(shift: dict) -> str:
-    nurse = db.get_nurse(shift["nurse_id"])
-    name = ((nurse or {}).get("first_name") or "").strip() or f"nurse {shift['nurse_id']}"
-    recurring = "recurring" if shift.get("recurring_template_id") else "one-off"
-    return f"{name} ({recurring})"
+    blocks = db.get_nurse_availability(nurse["id"], date)
 
+    if shift_type:
+        word = "is" if shift_type in blocks else "isn't"
+        return twiml_reply(f"{nurse['first_name']} {word} available {shift_type} "
+                            f"{db.pretty_date(date)}.")
 
-def _hhmm_from_timestamp(ts: str) -> str:
-    """Extract Melbourne-local 'HH:MM' from a timestamptz string. Supabase returns
-    these in UTC, so converting is required or the text would show UTC times."""
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    return dt.astimezone(ZoneInfo("Australia/Melbourne")).strftime("%H:%M")
-
-
-def _send_next_duplicate_review() -> None:
-    """Send the next queued duplicate review, if any. Called right after resolving
-    one, so a whole backlog clears as a back-and-forth rather than waiting for the
-    next cron run."""
-    review = db.get_next_pending_duplicate_review()
-    if not review:
-        return
-    shift_1 = db.get_shift(review["shift_1_id"])
-    shift_2 = db.get_shift(review["shift_2_id"])
-    if not (shift_1 and shift_2):
-        db.resolve_duplicate_review(review["id"], review["shift_1_id"], review["shift_2_id"])
-        return
-    participant = db.get_participant(shift_1["participant_id"])
-    pname = (participant or {}).get("name") or f"participant {shift_1['participant_id']}"
-    body = (
-        f"Duplicate shift for {pname} on {db.pretty_date(shift_1['date'])}, "
-        f"{_hhmm_from_timestamp(shift_1['start_time'])}-"
-        f"{_hhmm_from_timestamp(shift_1['end_time'])}.\n"
-        f"1: {_describe_review_side(shift_1)}\n"
-        f"2: {_describe_review_side(shift_2)}\n"
-        f"Reply 1 or 2 to keep that one."
-    )
-    db.send_sms(ADMIN_PHONE, body)
-    db.mark_duplicate_review_sent(review["id"])
-
-
-def handle_duplicate_review_reply(body: str) -> Response | None:
-    """A bare '1' or '2' from Paul, when a duplicate review is actually awaiting
-    his answer. Returns None otherwise (caller falls through to normal handling) —
-    this never fires on a '1'/'2' sent for any other reason, since it also
-    requires a 'sent' review to exist."""
-    choice = body.strip()
-    if choice not in ("1", "2"):
-        return None
-    review = db.get_sent_duplicate_review()
-    if not review:
-        return None
-
-    keep_id = review["shift_1_id"] if choice == "1" else review["shift_2_id"]
-    delete_id = review["shift_2_id"] if choice == "1" else review["shift_1_id"]
-
-    losing_shift = db.get_shift(delete_id)
-    kept_shift = db.get_shift(keep_id)
-    if losing_shift:
-        if losing_shift.get("bubble_shift_id"):
-            _delete_bubble_shift(losing_shift["bubble_shift_id"])
-        # Stop the losing shift's weekly series, but NOT if the kept shift belongs
-        # to that same template (same carer entered twice): that would stop the
-        # series you chose to keep.
-        losing_tid = losing_shift.get("recurring_template_id")
-        kept_tid = (kept_shift or {}).get("recurring_template_id")
-        if losing_tid and losing_tid != kept_tid:
-            db.deactivate_recurring_template(losing_tid)
-        db.delete_shift(delete_id)
-
-    db.resolve_duplicate_review(review["id"], keep_id, delete_id)
-    _send_next_duplicate_review()
-
-    return twiml_reply(f"Got it, kept shift {choice} and removed the duplicate.")
+    if not blocks:
+        return twiml_reply(f"{nurse['first_name']} isn't available on {db.pretty_date(date)}.")
+    return twiml_reply(f"{nurse['first_name']} available {', '.join(blocks)} "
+                        f"on {db.pretty_date(date)}.")
 
 
 def _too_late_reply(offer: dict) -> str:
@@ -544,6 +483,14 @@ def handle_adhoc_offer_reply(offer: dict, body: str) -> Response:
     except Exception:
         logger.exception("Failed to notify admin of adhoc offer reply")
 
+    # Group offer: once everyone in the batch has answered, send one summary line.
+    try:
+        summary = admin_agent.batch_summary(offer.get("batch_id"))
+        if summary:
+            db.send_sms(ADMIN_PHONE, summary)
+    except Exception:
+        logger.exception("Failed to send batch summary")
+
     if answer == "yes":
         return twiml_reply("Great, thanks! Confirmed.")
     return twiml_reply("No worries, thanks for letting us know.")
@@ -562,19 +509,30 @@ def sms():
         ))
 
     if _is_admin_number(from_number):
-        # A pending duplicate-shift review takes absolute priority on his number —
-        # narrowest possible match (bare 1/2 AND a review actually awaiting reply).
-        dup_response = handle_duplicate_review_reply(body)
-        if dup_response is not None:
-            return dup_response
-
-        # Ad hoc admin commands take priority over everything else on his number,
-        # including a pending approval — they're a distinct, explicit intent.
-        cmd = parse_admin_command(body)
-        if cmd.get("type") == "availability":
-            return handle_availability_query(cmd)
-        if cmd.get("type") == "text_nurse":
-            return handle_text_nurse_command(cmd)
+        # A bare YES/NO while an offer is waiting on this number is a nurse-style
+        # reply (dev stand-in), not a command: skip the agent.
+        bare_reply = _parse_yes_no(body) and (
+            db.get_active_offer_by_phone(from_number)
+            or db.get_active_adhoc_offer_by_phone(from_number)
+        )
+        if not bare_reply:
+            # A plain "OK" with an approval pending is the approval, not a command.
+            if db.get_pending_admin_approval() and re.fullmatch(r"\s*ok(ay)?[!. ]*", body.lower()):
+                return handle_admin_reply(body)
+            try:
+                agent_reply = admin_agent.run(from_number, body)
+                if agent_reply:
+                    return twiml_reply(agent_reply)
+                # None: not an admin request, continue normal routing below.
+            except Exception:
+                logger.exception("Admin agent failed, using fixed command parser")
+                cmd = parse_admin_command(body)
+                if cmd.get("type") == "availability":
+                    return handle_availability_query(cmd)
+                if cmd.get("type") == "text_nurse":
+                    return handle_text_nurse_command(cmd)
+                if cmd.get("type") == "nurse_availability":
+                    return handle_nurse_availability_query(cmd)
 
         # Paul confirming a pending shift approval — checked before facility/offer
         # routing, since his number is also the Collins callback number (and, in
