@@ -210,13 +210,29 @@ def tool_check_availability(date, role=None, shift_type=None, **_):
     return {"date": date, "available_by_role": out}
 
 
+def _nurse_blocks(nurse_id: int, date: str) -> list[str]:
+    """Blocks this carer is free for on a date: pending availability rows, and none
+    at all if they already have any shift that day. Kept here so the agent does not
+    depend on a db.py helper."""
+    client = db.get_client()
+    avail = (client.table("availability").select("shift_type")
+             .eq("nurse_id", nurse_id).eq("date", date).eq("status", "pending")
+             .execute().data or [])
+    blocks = [r["shift_type"] for r in avail]
+    if not blocks:
+        return []
+    clash = (client.table("shifts").select("id")
+             .eq("nurse_id", nurse_id).eq("date", date).limit(1).execute().data)
+    return [] if clash else blocks
+
+
 def tool_check_nurse(nurse_name, date, **_):
     if not _valid_date(date):
         return {"error": "bad date"}
     nurse, err = _resolve_nurse(nurse_name)
     if err:
         return err
-    blocks = db.get_nurse_availability(nurse["id"], date)
+    blocks = _nurse_blocks(nurse["id"], date)
     return {"carer": f"{nurse['first_name']} {nurse['last_name']}",
             "date": date, "available_blocks": blocks}
 
