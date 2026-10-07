@@ -1,0 +1,429 @@
+"""
+Admin agent: lets Paul talk to Klarra in plain language by SMS.
+
+Replaces the fixed three-command parser for Paul's number. Claude is given a small
+set of tools and decides what to call, so Paul never has to follow a script:
+
+  check_availability   who is free (any role, any/all blocks, any date)
+  check_nurse          is one named carer free
+  offer_shift          text one OR MORE named carers to ask if they can work a shift
+  check_replies        who has said yes / no / nothing yet
+  not_an_admin_request hand the message back to the normal routing
+
+Conversation memory: the last few turns are kept per phone in admin_threads for
+THREAD_MINUTES, so "Which Maria?" -> "Maria Santos" works.
+
+Group offers share a batch_id on sms_adhoc_offers. When every carer in a batch has
+replied, sms_webhook texts Paul a one-line summary via batch_summary().
+
+KLARRA_MODE is respected: send_sms already redirects in dev and blocks nurses in mid.
+In mid, offer_shift refuses outright so Klarra never claims to have texted someone
+she didn't.
+"""
+
+import os
+import json
+import uuid
+import logging
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+import anthropic
+
+import db
+
+logger = logging.getLogger("knightingale-admin-agent")
+
+MODEL = "claude-sonnet-4-6"
+ROLES = ["RN", "EN", "PCA", "DSW"]
+BLOCKS = ["Morning", "Afternoon", "Night"]
+MAX_STEPS = 8
+THREAD_MINUTES = 30
+MAX_HISTORY = 10  # messages kept per thread (user + assistant)
+
+
+def _now_melb() -> datetime:
+    return datetime.now(ZoneInfo("Australia/Melbourne"))
+
+
+def _system() -> str:
+    now = _now_melb()
+    return (
+        "You are Klarra, the scheduling assistant for Knightingale, a Melbourne aged "
+        "care and NDIS staffing agency. You are texting with Paul, the director. "
+        f"Today is {now.strftime('%A %d %B %Y')} ({now.strftime('%Y-%m-%d')}), "
+        "Australia/Melbourne time. Resolve words like tomorrow, Friday, next Tuesday "
+        "to a YYYY-MM-DD date yourself.\n\n"
+        "Reply as an SMS: plain text, short, no markdown, never use em dashes. Paul "
+        "writes casually, so interpret loosely. Never invent names or availability, "
+        "always use the tools.\n\n"
+        "Roles: RN, EN, PCA, DSW (\"EN's\" means EN). Shift blocks: AM or morning = "
+        "Morning, PM or arvo or afternoon = Afternoon, NS or night or overnight = "
+        "Night.\n\n"
+        "What you can do:\n"
+        "1. Say who is available (check_availability). If Paul gives no role, check "
+        "all roles. If he gives no block, check all blocks and show each person's "
+        "blocks. Use first names, add a last initial only when two people share a "
+        "first name. Questions about availability never send any texts.\n"
+        "2. Say whether one named carer is available (check_nurse).\n"
+        "3. Text one or more named carers to ask if they can work a shift "
+        "(offer_shift). You need the carer names, the site, the date and the block. "
+        "If something is missing, ask for just that, one question. Texts are real, "
+        "so only call offer_shift when Paul clearly asked you to text or ask carers.\n"
+        "4. Report replies (check_replies) when Paul asks who has answered.\n"
+        "If a name matches several carers, ask which one. If a tool returns an error, "
+        "tell Paul plainly what went wrong.\n"
+        "After offer_shift succeeds, confirm briefly who was texted and that you will "
+        "tell him as replies come in.\n"
+        "You cannot create shifts in Bubble yet. If asked, say that is not built yet.\n"
+        "If the message is not addressed to you as an assistant, for example a "
+        "facility style request to fill a shift through the normal system such as "
+        "'EN morning shift tomorrow at Port Melbourne' stated as a need rather than a "
+        "question about who is free, call not_an_admin_request."
+    )
+
+
+TOOLS = [
+    {
+        "name": "check_availability",
+        "description": (
+            "List carers who are free on a date. Optional role (RN/EN/PCA/DSW) and "
+            "optional shift block. Omit role to check all roles, omit shift_type to "
+            "check all blocks. Excludes anyone already rostered that day. Not "
+            "facility-specific."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "YYYY-MM-DD"},
+                "role": {"type": "string", "enum": ROLES},
+                "shift_type": {"type": "string", "enum": BLOCKS},
+            },
+            "required": ["date"],
+        },
+    },
+    {
+        "name": "check_nurse",
+        "description": "Check which blocks one named carer is free on a date.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nurse_name": {"type": "string"},
+                "date": {"type": "string", "description": "YYYY-MM-DD"},
+            },
+            "required": ["nurse_name", "date"],
+        },
+    },
+    {
+        "name": "offer_shift",
+        "description": (
+            "Text one or more named carers asking if they can work a shift. Sends "
+            "real SMS. Their YES/NO replies are tracked and reported to Paul. Sends "
+            "nothing if any name is ambiguous or unknown."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nurse_names": {"type": "array", "items": {"type": "string"}},
+                "facility": {"type": "string", "description": "Site name as Paul said it"},
+                "date": {"type": "string", "description": "YYYY-MM-DD"},
+                "shift_type": {"type": "string", "enum": BLOCKS},
+            },
+            "required": ["nurse_names", "facility", "date", "shift_type"],
+        },
+    },
+    {
+        "name": "check_replies",
+        "description": (
+            "Show the status (accepted / declined / waiting) of shift offers texted "
+            "to carers. Optionally filter by shift date. Defaults to recent offers."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"date": {"type": "string", "description": "YYYY-MM-DD"}},
+        },
+    },
+    {
+        "name": "not_an_admin_request",
+        "description": (
+            "Call this if the message is not a request for you to do something here "
+            "and should be handled by the normal shift-request routing instead."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+]
+
+
+# --- helpers ---------------------------------------------------------------
+
+def _valid_date(d) -> bool:
+    try:
+        datetime.strptime(str(d), "%Y-%m-%d")
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_nurse(name: str) -> tuple[dict | None, dict | None]:
+    """Return (nurse, None) on a confident match, else (None, error_dict)."""
+    nurse, candidates = db.find_nurse_by_name(name)
+    if candidates:
+        return None, {
+            "name": name,
+            "problem": "ambiguous",
+            "matches": [f"{c['first_name']} {c['last_name']}" for c in candidates],
+        }
+    if not nurse:
+        return None, {"name": name, "problem": "not_found"}
+    return nurse, None
+
+
+def offer_message(nurse: dict, facility: dict, date: str, shift_type: str) -> str:
+    return (
+        f"Hi {nurse['first_name']}, I've got a shift at {facility['name']} "
+        f"on {db.short_date(date)} ({shift_type}). Please reply YES if you would "
+        f"like it. Please reply NO if you would prefer to pass. Thank you"
+    )
+
+
+# --- tools -----------------------------------------------------------------
+
+def tool_check_availability(date, role=None, shift_type=None, **_):
+    if not _valid_date(date):
+        return {"error": "bad date"}
+    roles = [role.upper()] if role else ROLES
+    blocks = [shift_type] if shift_type else BLOCKS
+    if any(r not in ROLES for r in roles) or any(b not in BLOCKS for b in blocks):
+        return {"error": "bad role or shift_type"}
+    out = {}
+    for r in roles:
+        people = {}
+        for b in blocks:
+            for n in db.get_available_nurses(date, b, r):
+                p = people.setdefault(n["nurse_id"], {
+                    "first_name": n["first_name"],
+                    "last_name": n["last_name"],
+                    "blocks": [],
+                })
+                p["blocks"].append(b)
+        out[r] = list(people.values())
+    return {"date": date, "available_by_role": out}
+
+
+def tool_check_nurse(nurse_name, date, **_):
+    if not _valid_date(date):
+        return {"error": "bad date"}
+    nurse, err = _resolve_nurse(nurse_name)
+    if err:
+        return err
+    blocks = db.get_nurse_availability(nurse["id"], date)
+    return {"carer": f"{nurse['first_name']} {nurse['last_name']}",
+            "date": date, "available_blocks": blocks}
+
+
+def tool_offer_shift(nurse_names, facility, date, shift_type, **_):
+    if db.MID:
+        return {"error": "KLARRA_MODE is mid, so carers cannot be contacted. Nothing sent."}
+    if not _valid_date(date) or shift_type not in BLOCKS:
+        return {"error": "bad date or shift_type"}
+    if not nurse_names:
+        return {"error": "no carers named"}
+
+    fac = db.find_facility_by_name(facility)
+    if not fac:
+        return {"error": f"could not match a site called '{facility}'"}
+
+    # Resolve everyone first so a single bad name sends nothing at all.
+    resolved, problems = [], []
+    for name in nurse_names:
+        nurse, err = _resolve_nurse(name)
+        if err:
+            problems.append(err)
+        else:
+            resolved.append(nurse)
+    if problems:
+        return {"error": "fix these names first, nothing was sent", "problems": problems}
+
+    client = db.get_client()
+    batch_id = str(uuid.uuid4())
+    sent, skipped, failed = [], [], []
+    seen = set()
+
+    for nurse in resolved:
+        if nurse["id"] in seen:
+            continue
+        seen.add(nurse["id"])
+
+        # Don't double-text a carer who already has this exact offer open.
+        open_offer = (
+            client.table("sms_adhoc_offers").select("id")
+            .eq("nurse_id", nurse["id"]).eq("date", date)
+            .eq("shift_type", shift_type).eq("status", "offered")
+            .limit(1).execute()
+        )
+        if open_offer.data:
+            skipped.append(nurse["first_name"])
+            continue
+
+        msg = offer_message(nurse, fac, date, shift_type)
+        row = client.table("sms_adhoc_offers").insert({
+            "nurse_id": nurse["id"],
+            "facility_id": fac["id"],
+            "facility_name": fac["name"],
+            "date": date,
+            "shift_type": shift_type,
+            "message": msg,
+            "status": "offered",
+            "offered_at": "now()",
+            "batch_id": batch_id,
+        }).execute()
+        offer_id = row.data[0]["id"]
+        try:
+            db.send_sms(nurse["phone"], msg)
+            sent.append(nurse["first_name"])
+        except Exception:
+            logger.exception("Failed to text %s", nurse["first_name"])
+            db.mark_adhoc_offer(offer_id, "failed")
+            failed.append(nurse["first_name"])
+
+    return {
+        "site": fac["name"], "date": date, "shift_type": shift_type,
+        "texted": sent, "already_asked_and_waiting": skipped, "text_failed": failed,
+    }
+
+
+def tool_check_replies(date=None, **_):
+    client = db.get_client()
+    q = client.table("sms_adhoc_offers").select("*, nurses(first_name, last_name)")
+    if date and _valid_date(date):
+        q = q.eq("date", date)
+    else:
+        since = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        q = q.gte("created_at", since)
+    rows = q.order("created_at", desc=True).limit(40).execute().data or []
+    label = {"offered": "waiting", "accepted": "yes", "declined": "no", "failed": "text failed"}
+    return {"offers": [{
+        "carer": (r.get("nurses") or {}).get("first_name"),
+        "site": r.get("facility_name"),
+        "date": r["date"],
+        "shift_type": r["shift_type"],
+        "status": label.get(r["status"], r["status"]),
+    } for r in rows]}
+
+
+TOOL_FUNCS = {
+    "check_availability": tool_check_availability,
+    "check_nurse": tool_check_nurse,
+    "offer_shift": tool_offer_shift,
+    "check_replies": tool_check_replies,
+}
+
+
+def _call(name: str, args: dict):
+    fn = TOOL_FUNCS.get(name)
+    if not fn:
+        return {"error": f"unknown tool {name}"}
+    try:
+        return fn(**(args or {}))
+    except Exception as e:
+        logger.exception("Tool %s failed", name)
+        return {"error": f"{name} failed: {e}"}
+
+
+# --- conversation memory ---------------------------------------------------
+
+def _load_history(phone: str) -> list:
+    try:
+        r = (db.get_client().table("admin_threads").select("messages, updated_at")
+             .eq("phone", phone).limit(1).execute())
+    except Exception:
+        logger.exception("Could not load admin thread")
+        return []
+    if not r.data:
+        return []
+    row = r.data[0]
+    try:
+        updated = datetime.fromisoformat(str(row["updated_at"]).replace("Z", "+00:00"))
+        if datetime.now(timezone.utc) - updated > timedelta(minutes=THREAD_MINUTES):
+            return []
+    except Exception:
+        return []
+    msgs = row.get("messages") or []
+    return [m for m in msgs if m.get("role") in ("user", "assistant") and m.get("content")]
+
+
+def _save_history(phone: str, messages: list) -> None:
+    messages = messages[-MAX_HISTORY:]
+    while messages and messages[0]["role"] != "user":
+        messages = messages[1:]
+    try:
+        db.get_client().table("admin_threads").upsert({
+            "phone": phone,
+            "messages": messages,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except Exception:
+        logger.exception("Could not save admin thread")
+
+
+# --- entry point -----------------------------------------------------------
+
+def run(phone: str, body: str) -> str | None:
+    """Handle one text from Paul. Returns the reply text, or None if the message
+    isn't for the admin agent (caller should continue normal routing)."""
+    history = _load_history(phone)
+    user_msg = {"role": "user", "content": body}
+    messages = history + [user_msg]
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+
+    for _ in range(MAX_STEPS):
+        resp = client.messages.create(
+            model=MODEL, max_tokens=700, system=_system(),
+            tools=TOOLS, messages=messages,
+        )
+        if resp.stop_reason != "tool_use":
+            text = "".join(b.text for b in resp.content if b.type == "text").strip()
+            if not text:
+                return None
+            _save_history(phone, history + [user_msg, {"role": "assistant", "content": text}])
+            return text
+
+        messages.append({"role": "assistant", "content": resp.content})
+        results = []
+        for block in resp.content:
+            if block.type != "tool_use":
+                continue
+            if block.name == "not_an_admin_request":
+                return None
+            logger.info("Admin agent tool %s %s", block.name, block.input)
+            result = _call(block.name, block.input)
+            results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": json.dumps(result, default=str),
+            })
+        messages.append({"role": "user", "content": results})
+
+    return "Sorry, that took too many steps. Can you try again?"
+
+
+# --- group reply summary ---------------------------------------------------
+
+def batch_summary(batch_id: str | None) -> str | None:
+    """One-line summary once every carer in a group offer has replied. Returns None
+    for single offers, missing batches, or while anyone is still outstanding."""
+    if not batch_id:
+        return None
+    rows = (db.get_client().table("sms_adhoc_offers")
+            .select("*, nurses(first_name)")
+            .eq("batch_id", batch_id).order("created_at").execute().data or [])
+    if len(rows) < 2 or any(r["status"] == "offered" for r in rows):
+        return None
+    parts = []
+    for r in rows:
+        name = (r.get("nurses") or {}).get("first_name") or "Carer"
+        word = {"accepted": "YES", "declined": "NO"}.get(r["status"], "text failed")
+        parts.append(f"{name} {word}")
+    first = rows[0]
+    return (f"All replied for {first.get('facility_name') or 'the site'} "
+            f"{first['shift_type']} {db.short_date(first['date'])}: {', '.join(parts)}.")
