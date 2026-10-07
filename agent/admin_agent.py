@@ -63,8 +63,9 @@ def _system() -> str:
         "What you can do:\n"
         "1. Say who is available (check_availability). If Paul gives no role, check "
         "all roles. If he gives no block, check all blocks and show each person's "
-        "blocks. Use first names, add a last initial only when two people share a "
-        "first name. Questions about availability never send any texts.\n"
+        "blocks. check_availability returns reply_text already formatted: send "
+        "reply_text exactly as given, nothing added or removed. Questions about "
+        "availability never send any texts.\n"
         "2. Say whether one named carer is available (check_nurse).\n"
         "3. Text one or more named carers to ask if they can work a shift "
         "(offer_shift). You need the carer names, the site, the date and the block. "
@@ -188,6 +189,40 @@ def offer_message(nurse: dict, facility: dict, date: str, shift_type: str) -> st
 
 # --- tools -----------------------------------------------------------------
 
+BLOCK_LABEL = {"Morning": "AM", "Afternoon": "PM", "Night": "NS"}
+
+
+def _format_availability(by_role: dict, blocks: list) -> str:
+    """AM:/PM:/NS: sections, one '- name' line per carer. First names only, with a
+    last initial added when two different carers share a first name. A role heading
+    is added only when more than one role is shown."""
+    everyone = {}
+    for people in by_role.values():
+        for p in people:
+            everyone[(p["first_name"], p["last_name"])] = p
+    first_counts = {}
+    for first, _last in everyone:
+        first_counts[first] = first_counts.get(first, 0) + 1
+
+    def display(p):
+        first = p["first_name"]
+        if first_counts.get(first, 0) > 1 and p.get("last_name"):
+            return f"{first} {p['last_name'][0]}."
+        return first
+
+    sections = []
+    for role, people in by_role.items():
+        lines = []
+        for b in blocks:
+            names = sorted(display(p) for p in people if b in p["blocks"])
+            lines.append(f"{BLOCK_LABEL[b]}:")
+            lines.extend(f"- {n}" for n in (names or ["none"]))
+            lines.append("")
+        text = "\n".join(lines).strip()
+        sections.append(f"{role}\n{text}" if len(by_role) > 1 else text)
+    return "\n\n".join(sections)
+
+
 def tool_check_availability(date, role=None, shift_type=None, **_):
     if not _valid_date(date):
         return {"error": "bad date"}
@@ -207,7 +242,7 @@ def tool_check_availability(date, role=None, shift_type=None, **_):
                 })
                 p["blocks"].append(b)
         out[r] = list(people.values())
-    return {"date": date, "available_by_role": out}
+    return {"date": date, "reply_text": _format_availability(out, blocks)}
 
 
 def _nurse_blocks(nurse_id: int, date: str) -> list[str]:
