@@ -516,21 +516,29 @@ def _melb_date(iso: str):
 
 
 def _get_pricing(name: str) -> dict | None:
-    """Look up a Residential Pricing record in Bubble by its name."""
+    """Look up a Residential Pricing record in Bubble by its name. The Data API
+    type is listed as "Residential Pricings", so that endpoint is tried first."""
     constraints = [{"key": "name", "constraint_type": "equals", "value": name}]
-    r = requests.get(
-        f"{BUBBLE_BASE}/residentialpricing", headers=_bubble_headers(), timeout=20,
-        params={"constraints": json.dumps(constraints), "limit": 5},
-    )
-    r.raise_for_status()
-    results = r.json().get("response", {}).get("results", [])
-    return results[0] if results else None
+    last = None
+    for endpoint in ("residentialpricings", "residentialpricing"):
+        r = requests.get(
+            f"{BUBBLE_BASE}/{endpoint}", headers=_bubble_headers(), timeout=20,
+            params={"constraints": json.dumps(constraints), "limit": 5},
+        )
+        if r.status_code == 404:
+            last = r
+            continue
+        r.raise_for_status()
+        results = r.json().get("response", {}).get("results", [])
+        return results[0] if results else None
+    last.raise_for_status()
+    return None
 
 
 def _find_shift_template(location_id: str, start_num: int, role: str):
     """Most recent non-cancelled Bubble shift at this site with the same start time
     and role. Used ONLY for the things the pricing table does not hold: Bubble's
-    own start/end numbers, hours, the role value, address and supervisor."""
+    own start/end numbers, the role value, address and supervisor."""
     constraints = [
         {"key": "location", "constraint_type": "equals", "value": location_id},
         {"key": "start time", "constraint_type": "equals", "value": start_num},
@@ -544,7 +552,7 @@ def _find_shift_template(location_id: str, start_num: int, role: str):
     r.raise_for_status()
     for t in r.json().get("response", {}).get("results", []):
         roles = {ROLE_ALIASES.get(str(x).strip().upper()) for x in (t.get("roles") or [])}
-        if role in roles and t.get("hours") and t.get("end time") is not None:
+        if role in roles and t.get("end time") is not None:
             return t
     return None
 
@@ -611,10 +619,9 @@ def tool_create_shift(nurse_name, facility, date, shift_type, shift_code=None, *
     template = _find_shift_template(location_id, int(start), role)
     if not template:
         return {"error": (f"no earlier {role} {shift_type} shift at {fac['name']} "
-                          f"({start}) to copy hours, role and supervisor from. "
+                          f"({start}) to copy the role, address and supervisor from. "
                           "Create the first one in Bubble.")}
 
-    hours = float(template["hours"])
     rate = float(pricing.get("rate") or 0)
     carer_pay = float(pricing.get("carer pay") or 0)
     hourly_rev = float(pricing.get("hourly revenue") or 0)
@@ -627,6 +634,9 @@ def tool_create_shift(nurse_name, facility, date, shift_type, shift_code=None, *
         e_dt = (datetime(target.year, target.month, target.day) + timedelta(days=1)).replace(
             hour=int(end[:2]), minute=int(end[2:]), tzinfo=MELB)
     midnight = datetime(target.year, target.month, target.day, tzinfo=MELB)
+
+    # Facility shifts have a 30 minute unpaid break: an 8h shift is 7.5h.
+    hours = round((e_dt - s_dt).total_seconds() / 3600 - 0.5, 2)
 
     payload = {
         "accepted": "yes", "cancelled": "no", "attended": "no",
