@@ -8,7 +8,8 @@ set of tools and decides what to call, so Paul never has to follow a script:
   check_nurse          is one named carer free
   offer_shift          text one OR MORE named carers to ask if they can work a shift
   check_replies        who has said yes / no / nothing yet
-  create_shift         create the shift in Bubble (and Supabase) for a named carer
+  create_shift         create a facility shift in Bubble (and Supabase) for a named carer
+  create_ndis_shift    create an NDIS shift (participant + NDIS Pricing item)
   not_an_admin_request hand the message back to the normal routing
 
 Conversation memory: the last few turns are kept per phone in admin_threads for
@@ -83,8 +84,19 @@ def _system() -> str:
         "book the shift. Williamstown has several codes: D6, D7, D9 are Morning, A2 "
         "and A3 are Afternoon, Night has one. If the tool says a choice is needed, "
         "ask Paul which code, one question. When create_shift succeeds, send "
-        "reply_text exactly as given. Shifts only use the standard times for each "
-        "site, not custom times.\n"
+        "reply_text exactly as given. Facility shifts only use the standard times "
+        "for each site, not custom times.\n"
+        "6. Create an NDIS shift for a named carer and a named participant "
+        "(create_ndis_shift). Needs carer, participant, date, start time and end time "
+        "(24 hour HH:MM, any times). It also needs item_prefix (01 self-care or 04 "
+        "community access) and day_kind (daytime, evening, night, saturday, sunday or "
+        "public_holiday). ALWAYS ask Paul for the item prefix and the time of day "
+        "unless he has stated them, for example 'shift is 04 daytime', 'shift is 01 "
+        "evening', 'shift is 04 sunday', 'shift is 01 night'. Ask for both in one "
+        "short question. Daytime is 0600 to 2000, evening 2000 to 2400, night 2400 to "
+        "0600. Never guess them. When it succeeds, send reply_text exactly as given. "
+        "DSW carers work NDIS shifts. A named site means a facility shift (5), a "
+        "named participant means an NDIS shift (6).\n"
         "If the message is not addressed to you as an assistant, for example a "
         "facility style request to fill a shift through the normal system such as "
         "'EN morning shift tomorrow at Port Melbourne' stated as a need rather than a "
@@ -161,6 +173,32 @@ TOOLS = [
                 },
             },
             "required": ["nurse_name", "facility", "date", "shift_type"],
+        },
+    },
+    {
+        "name": "create_ndis_shift",
+        "description": (
+            "Create an NDIS shift in Bubble for one named carer and one named "
+            "participant, priced from the NDIS Pricing table. No unpaid break is "
+            "deducted. Writes real data. Only call once item_prefix and day_kind are "
+            "known."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nurse_name": {"type": "string"},
+                "participant": {"type": "string", "description": "Participant name as Paul said it"},
+                "date": {"type": "string", "description": "YYYY-MM-DD"},
+                "start_time": {"type": "string", "description": "24 hour HH:MM"},
+                "end_time": {"type": "string", "description": "24 hour HH:MM"},
+                "item_prefix": {"type": "string", "enum": ["01", "04"]},
+                "day_kind": {
+                    "type": "string",
+                    "enum": ["daytime", "evening", "night", "saturday", "sunday", "public_holiday"],
+                },
+            },
+            "required": ["nurse_name", "participant", "date", "start_time",
+                         "end_time", "item_prefix", "day_kind"],
         },
     },
     {
@@ -604,7 +642,9 @@ def tool_create_shift(nurse_name, facility, date, shift_type, shift_code=None, *
         return {"error": f"{nurse['first_name']} already has a shift on {date}. Nothing created."}
 
     if role not in PRICING_NAMES:
-        return {"error": f"no residential pricing set up for {role}. Nothing created."}
+        return {"error": (f"{role} shifts use NDIS pricing, not residential. "
+                          "If this is an NDIS shift, ask Paul for the participant. "
+                          "Nothing created.")}
     kind, holidays_checked = _day_kind(target, shift_type)
     pricing_name = PRICING_NAMES[role][kind]
     try:
@@ -698,12 +738,238 @@ def tool_create_shift(nurse_name, facility, date, shift_type, shift_code=None, *
     return {"reply_text": text, "bubble_shift_id": new_id}
 
 
+
+# --- create_ndis_shift -----------------------------------------------------
+
+# NDIS Pricing records by item number: (prefix, day kind) -> "item no".
+NDIS_ITEM_NOS = {
+    ("01", "daytime"): "01_011_0107_1_1",
+    ("01", "evening"): "01_015_0107_1_1",
+    ("01", "night"): "01_002_0107_1_1",
+    ("01", "saturday"): "01_013_0107_1_1",
+    ("01", "sunday"): "01_014_0107_1_1",
+    ("01", "public_holiday"): "01_012_0107_1_1",
+    ("04", "daytime"): "04_104_0125_6_1",
+    ("04", "evening"): "04_103_0125_6_1",
+    ("04", "saturday"): "04_105_0125_6_1",
+    ("04", "sunday"): "04_106_0125_6_1",
+    ("04", "public_holiday"): "04_102_0125_6_1",
+    # 04 night does not exist in the NDIS Pricing table.
+}
+
+
+def _parse_hhmm(t: str) -> tuple[int, int] | None:
+    digits = "".join(c for c in str(t) if c.isdigit())
+    if len(digits) == 3:
+        digits = "0" + digits
+    if len(digits) != 4:
+        return None
+    h, m = int(digits[:2]), int(digits[2:])
+    return (h, m) if h < 24 and m < 60 else None
+
+
+def _get_ndis_pricing(item_no: str) -> dict | None:
+    constraints = [{"key": "item no", "constraint_type": "equals", "value": item_no}]
+    last = None
+    for endpoint in ("ndispricing", "ndispricings"):
+        r = requests.get(
+            f"{BUBBLE_BASE}/{endpoint}", headers=_bubble_headers(), timeout=20,
+            params={"constraints": json.dumps(constraints), "limit": 5},
+        )
+        if r.status_code == 404:
+            last = r
+            continue
+        r.raise_for_status()
+        results = r.json().get("response", {}).get("results", [])
+        return results[0] if results else None
+    last.raise_for_status()
+    return None
+
+
+def _bubble_user(bubble_id: str) -> dict:
+    r = requests.get(f"{BUBBLE_BASE}/user/{bubble_id}", headers=_bubble_headers(), timeout=20)
+    r.raise_for_status()
+    return r.json().get("response", {})
+
+
+def _resolve_participant(name: str) -> tuple[dict | None, dict | None]:
+    """Match a typed participant name against the participants table (first names).
+    Returns (participant_row, None) or (None, error_dict)."""
+    import difflib
+    parts = name.strip().split()
+    if not parts:
+        return None, {"name": name, "problem": "not_found"}
+    first, last = parts[0].lower(), (" ".join(parts[1:]).lower() or None)
+    rows = db.get_client().table("participants").select("id, name, bubble_id").execute().data or []
+    matches = [r for r in rows if (r.get("name") or "").strip().lower() == first]
+    if not matches:
+        names = {(r.get("name") or "").strip().lower(): r for r in rows}
+        close = difflib.get_close_matches(first, names.keys(), n=3, cutoff=0.75)
+        matches = [names[c] for c in close]
+    if not matches:
+        return None, {"name": name, "problem": "not_found"}
+    if len(matches) == 1:
+        return matches[0], None
+
+    labelled = []
+    for m in matches:
+        try:
+            u = _bubble_user(m["bubble_id"])
+        except Exception:
+            u = {}
+        full = f"{m['name']} {u.get('last name') or ''}".strip()
+        labelled.append((m, full))
+    if last:
+        narrowed = [m for m, full in labelled if full.lower().endswith(last)]
+        if len(narrowed) == 1:
+            return narrowed[0], None
+    return None, {"name": name, "problem": "ambiguous", "matches": [f for _, f in labelled]}
+
+
+def tool_create_ndis_shift(nurse_name, participant, date, start_time, end_time,
+                           item_prefix, day_kind, **_):
+    if db.DEV:
+        return {"error": "KLARRA_MODE is dev, so no shift was created."}
+    if not _valid_date(date):
+        return {"error": "bad date"}
+    target = datetime.strptime(date, "%Y-%m-%d").date()
+    if target < _now_melb().date():
+        return {"error": "that date is in the past, nothing created"}
+    item_no = NDIS_ITEM_NOS.get((str(item_prefix), day_kind))
+    if not item_no:
+        return {"error": f"there is no NDIS item for {item_prefix} {day_kind}. Nothing created."}
+
+    st, en = _parse_hhmm(start_time), _parse_hhmm(end_time)
+    if not st or not en:
+        return {"error": "could not read the start or end time"}
+    if st[0] < 6:
+        return {"error": "shifts starting between 00:00 and 05:59 are not supported yet. "
+                         "Create that one in Bubble."}
+
+    nurse, err = _resolve_nurse(nurse_name)
+    if err:
+        return err
+    part, err = _resolve_participant(participant)
+    if err:
+        return err
+    carer_bid = db.nurse_bubble_id(nurse["id"])
+    if not carer_bid:
+        return {"error": f"{nurse['first_name']} has no Bubble id, cannot create the shift"}
+
+    s_dt = datetime(target.year, target.month, target.day, st[0], st[1], tzinfo=MELB)
+    e_dt = datetime(target.year, target.month, target.day, en[0], en[1], tzinfo=MELB)
+    overnight = e_dt <= s_dt
+    if overnight:
+        e_dt = (datetime(target.year, target.month, target.day) + timedelta(days=1)).replace(
+            hour=en[0], minute=en[1], tzinfo=MELB)
+    hours = round((e_dt - s_dt).total_seconds() / 3600, 2)
+    if hours <= 0 or hours > 24:
+        return {"error": "those times do not make a valid shift"}
+    # Bubble stores time past midnight on an overnight shift as 24xx.
+    start_num = st[0] * 100 + st[1]
+    end_num = en[0] * 100 + en[1] + (2400 if overnight else 0)
+
+    client = db.get_client()
+    same_day = (client.table("shifts").select("start_time, end_time, participant_id")
+                .eq("nurse_id", nurse["id"]).eq("date", date)
+                .neq("status", "cancelled").execute().data or [])
+    for row in same_day:
+        try:
+            rs = datetime.fromisoformat(str(row["start_time"]).replace("Z", "+00:00"))
+            re_ = datetime.fromisoformat(str(row["end_time"]).replace("Z", "+00:00"))
+        except Exception:
+            return {"error": f"{nurse['first_name']} already has a shift on {date}. Nothing created."}
+        if rs < e_dt and s_dt < re_:
+            return {"error": f"{nurse['first_name']} already has a shift that overlaps. Nothing created."}
+    dup = (client.table("shifts").select("id").eq("participant_id", part["id"])
+           .eq("date", date).eq("start_time", s_dt.isoformat())
+           .neq("status", "cancelled").limit(1).execute().data)
+    if dup:
+        return {"error": f"{part['name']} already has a shift at that time. Nothing created."}
+
+    try:
+        pricing = _get_ndis_pricing(item_no)
+    except requests.HTTPError as e:
+        return {"error": ("could not read the NDIS Pricing table from Bubble "
+                          f"({e.response.status_code}). Nothing created.")}
+    if not pricing:
+        return {"error": f"no NDIS Pricing record with item no {item_no}. Nothing created."}
+
+    try:
+        pu = _bubble_user(part["bubble_id"])
+    except Exception:
+        return {"error": f"could not read {part['name']} from Bubble. Nothing created."}
+    addr = pu.get("address")
+    addr_text = addr.get("address") if isinstance(addr, dict) else addr
+
+    price = float(pricing.get("item price") or 0)
+    carer_pay = float(pricing.get("carer pay") or 0)
+    hourly_rev = float(pricing.get("hourly revenue") or 0)
+    midnight = datetime(target.year, target.month, target.day, tzinfo=MELB)
+
+    payload = {
+        "accepted": "yes", "cancelled": "no", "attended": "no", "invoiced": "no",
+        "carer": carer_bid,
+        "participant": part["bubble_id"],
+        "coordinator": pu.get("coordinator"),
+        "address": addr_text,
+        "date": midnight.isoformat(),
+        "start time": start_num,
+        "end time": end_num,
+        "hours": hours,
+        "rate": price,
+        "fee": round(hours * price, 2),
+        "wage": round(hours * carer_pay, 2),
+        "revenue": round(hours * hourly_rev, 2),
+        "ndis pricing": pricing["_id"],
+        "roles": ["DSW"],
+        "recurring": "no",
+    }
+    payload = {k: v for k, v in payload.items() if v is not None}
+
+    r = requests.post(f"{BUBBLE_BASE}/shift", headers=_bubble_headers(),
+                      json=payload, timeout=20)
+    if not r.ok:
+        logger.error("Bubble rejected NDIS shift create: %s %s %s", r.status_code, r.text, payload)
+        return {"error": f"Bubble rejected the shift ({r.status_code}). Nothing created."}
+    new_id = r.json().get("id")
+    if not new_id:
+        return {"error": "Bubble gave no shift id back. Check Bubble before retrying."}
+
+    shift_type = "Morning" if st[0] < 12 else "Afternoon" if st[0] < 18 else "Night"
+    problems = []
+    try:
+        db.upsert_shift_from_push(
+            bubble_shift_id=new_id, nurse_id=nurse["id"], date=date,
+            shift_type=shift_type, start_time=s_dt.isoformat(), end_time=e_dt.isoformat(),
+            status="confirmed", participant_id=part["id"],
+        )
+        db.assign_availability(nurse["id"], date, shift_type)
+        avail_bid = db.get_availability_bubble_id(nurse["id"], date, shift_type)
+        if avail_bid:
+            ar = requests.patch(f"{BUBBLE_BASE}/availability/{avail_bid}",
+                                headers=_bubble_headers(), json={"available": False},
+                                timeout=15)
+            ar.raise_for_status()
+    except Exception:
+        logger.exception("NDIS shift %s created in Bubble but follow-up sync failed", new_id)
+        problems.append("shift is in Bubble but the Supabase or availability update failed")
+
+    text = (f"Created NDIS shift: {nurse['first_name']} with {part['name']}, "
+            f"{db.short_date(date)}, {st[0]:02d}{st[1]:02d}-{en[0]:02d}{en[1]:02d} "
+            f"({hours:g}h). Pricing: {item_prefix} {day_kind.replace('_', ' ')}.")
+    if problems:
+        text += " Warning: " + "; ".join(problems) + "."
+    return {"reply_text": text, "bubble_shift_id": new_id}
+
+
 TOOL_FUNCS = {
     "check_availability": tool_check_availability,
     "check_nurse": tool_check_nurse,
     "offer_shift": tool_offer_shift,
     "check_replies": tool_check_replies,
     "create_shift": tool_create_shift,
+    "create_ndis_shift": tool_create_ndis_shift,
 }
 
 
