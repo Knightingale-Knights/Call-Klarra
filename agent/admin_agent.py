@@ -8,6 +8,7 @@ set of tools and decides what to call, so Paul never has to follow a script:
   check_nurse          is one named carer free
   offer_shift          text one OR MORE named carers to ask if they can work a shift
   check_replies        who has said yes / no / nothing yet
+  create_shift         create the shift in Bubble (and Supabase) for a named carer
   not_an_admin_request hand the message back to the normal routing
 
 Conversation memory: the last few turns are kept per phone in admin_threads for
@@ -29,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import anthropic
+import requests
 
 import db
 
@@ -76,7 +78,13 @@ def _system() -> str:
         "tell Paul plainly what went wrong.\n"
         "After offer_shift succeeds, confirm briefly who was texted and that you will "
         "tell him as replies come in.\n"
-        "You cannot create shifts in Bubble yet. If asked, say that is not built yet.\n"
+        "5. Create a shift in Bubble for a named carer (create_shift). Needs carer, "
+        "site, date and block. Only call it when Paul clearly asks you to create or "
+        "book the shift. Williamstown has several codes: D6, D7, D9 are Morning, A2 "
+        "and A3 are Afternoon, Night has one. If the tool says a choice is needed, "
+        "ask Paul which code, one question. When create_shift succeeds, send "
+        "reply_text exactly as given. Shifts only use the standard times for each "
+        "site, not custom times.\n"
         "If the message is not addressed to you as an assistant, for example a "
         "facility style request to fill a shift through the normal system such as "
         "'EN morning shift tomorrow at Port Melbourne' stated as a need rather than a "
@@ -131,6 +139,28 @@ TOOLS = [
                 "shift_type": {"type": "string", "enum": BLOCKS},
             },
             "required": ["nurse_names", "facility", "date", "shift_type"],
+        },
+    },
+    {
+        "name": "create_shift",
+        "description": (
+            "Create a shift in Bubble (visible to carers in the app) for one named "
+            "carer at a site, using that site's standard times. Writes real data. "
+            "Refuses if the carer already has a shift that day."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nurse_name": {"type": "string"},
+                "facility": {"type": "string", "description": "Site name as Paul said it"},
+                "date": {"type": "string", "description": "YYYY-MM-DD"},
+                "shift_type": {"type": "string", "enum": BLOCKS},
+                "shift_code": {
+                    "type": "string",
+                    "description": "Williamstown only: D6, D7, D9, A2 or A3",
+                },
+            },
+            "required": ["nurse_name", "facility", "date", "shift_type"],
         },
     },
     {
@@ -362,11 +392,308 @@ def tool_check_replies(date=None, **_):
     } for r in rows]}
 
 
+
+# --- create_shift ----------------------------------------------------------
+
+BUBBLE_BASE = "https://knightingale.com.au/api/1.1/obj"
+
+# Standard shift times per site: slug -> block -> [(code, start, end)].
+SHIFT_TIMES = {
+    "port_melbourne": {
+        "Morning": [(None, "0700", "1500")],
+        "Afternoon": [(None, "1430", "2215")],
+        "Night": [(None, "2200", "0715")],
+    },
+    "mclean_lodge": {
+        "Morning": [(None, "0730", "1530")],
+        "Afternoon": [(None, "1515", "2230")],
+        "Night": [(None, "2215", "0745")],
+    },
+    "williamstown": {
+        "Morning": [("D6", "0600", "1400"), ("D7", "0700", "1500"), ("D9", "0900", "1700")],
+        "Afternoon": [("A2", "1400", "2200"), ("A3", "1445", "2215")],
+        "Night": [(None, "2200", "0700")],
+    },
+    "ron_con": {
+        "Morning": [(None, "0700", "1500")],
+        "Afternoon": [(None, "1400", "2200")],
+        "Night": [(None, "2200", "0700")],
+    },
+    "angus_martin": {
+        "Morning": [(None, "0700", "1500")],
+        "Afternoon": [(None, "1500", "2200")],
+        "Night": [(None, "2200", "0700")],
+    },
+    "eunice_seddon": {
+        "Morning": [(None, "0700", "1500")],
+        "Afternoon": [(None, "1430", "2215")],
+        "Night": [(None, "2200", "0715")],
+    },
+    "gilgunya": {
+        "Morning": [(None, "0700", "1500")],
+        "Afternoon": [(None, "1430", "2100")],
+        "Night": [(None, "2230", "0715")],
+    },
+    "brotherhood_st_laurence": {
+        "Morning": [(None, "0700", "1500")],
+        "Afternoon": [(None, "1445", "2215")],
+        "Night": [(None, "2200", "0700")],
+    },
+}
+
+EXTRA_LOCATION_IDS = {
+    "gilgunya": "1782888571512x876198886010605600",
+    "brotherhood_st_laurence": "1778383751696x989992016292812000",
+}
+
+ROLE_ALIASES = {
+    "RN": "RN", "REGISTERED NURSE": "RN",
+    "EN": "EN", "ENROLLED NURSE": "EN",
+    "PCA": "PCA", "PERSONAL CARE ASSISTANT": "PCA", "PERSONAL CARE WORKER": "PCA",
+    "PCW": "PCA", "AIN": "PCA",
+    "DSW": "DSW", "DISABILITY SUPPORT WORKER": "DSW", "SUPPORT WORKER": "DSW",
+}
+
+MELB = ZoneInfo("Australia/Melbourne")
+
+
+def _location_id(slug: str) -> str | None:
+    if slug in EXTRA_LOCATION_IDS:
+        return EXTRA_LOCATION_IDS[slug]
+    for bubble_id, s in getattr(db, "LOCATION_ID_TO_SLUG", {}).items():
+        if s == slug:
+            return bubble_id
+    return None
+
+
+def _bubble_headers() -> dict:
+    return {"Authorization": f"Bearer {os.environ['BUBBLE_API_TOKEN']}"}
+
+
+# Victorian public holidays (from the `holidays` package data). Extend each year.
+# Years not listed here are not checked and the reply says so.
+VIC_PUBLIC_HOLIDAYS = {
+    "2026-01-01", "2026-01-26", "2026-03-09", "2026-04-03", "2026-04-04",
+    "2026-04-05", "2026-04-06", "2026-04-25", "2026-06-08", "2026-09-25",
+    "2026-11-03", "2026-12-25", "2026-12-26", "2026-12-28",
+    "2027-01-01", "2027-01-26", "2027-03-08", "2027-03-26", "2027-03-27",
+    "2027-03-28", "2027-03-29", "2027-04-25", "2027-06-14", "2027-09-24",
+    "2027-11-02", "2027-12-25", "2027-12-26", "2027-12-27", "2027-12-28",
+}
+HOLIDAY_YEARS = {2026, 2027}
+
+# Residential Pricing record names in Bubble, by role then day kind.
+PRICING_NAMES = {
+    "EN": {"AM": "EN AM", "PM": "EN PM", "NS": "EN NT",
+           "SAT": "EN SAT", "SUN": "EN SUN", "PH": "EN PH"},
+    "PCA": {"AM": "PCA AM", "PM": "PCA PM", "NS": "PCA NT",
+            "SAT": "PCA SAT", "SUN": "PCA SUN", "PH": "PCA P/H"},
+    "RN": {"AM": "RN JNR AM", "PM": "RN JNR PM", "NS": "JNR RN NS",
+           "SAT": "RN JNR SAT", "SUN": "RN JNR SUN", "PH": "RN JNR PH"},
+}
+
+
+def _day_kind(target, shift_type: str) -> tuple[str, bool]:
+    """Pricing kind for a shift, by its START date: public holiday beats Sunday
+    beats Saturday beats the weekday block. Returns (kind, holidays_checked)."""
+    if target.year in HOLIDAY_YEARS:
+        if target.isoformat() in VIC_PUBLIC_HOLIDAYS:
+            return "PH", True
+        checked = True
+    else:
+        checked = False
+    wd = target.weekday()
+    if wd == 6:
+        return "SUN", checked
+    if wd == 5:
+        return "SAT", checked
+    return {"Morning": "AM", "Afternoon": "PM", "Night": "NS"}[shift_type], checked
+
+
+def _melb_date(iso: str):
+    dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    return dt.astimezone(MELB).date()
+
+
+def _get_pricing(name: str) -> dict | None:
+    """Look up a Residential Pricing record in Bubble by its name."""
+    constraints = [{"key": "name", "constraint_type": "equals", "value": name}]
+    r = requests.get(
+        f"{BUBBLE_BASE}/residentialpricing", headers=_bubble_headers(), timeout=20,
+        params={"constraints": json.dumps(constraints), "limit": 5},
+    )
+    r.raise_for_status()
+    results = r.json().get("response", {}).get("results", [])
+    return results[0] if results else None
+
+
+def _find_shift_template(location_id: str, start_num: int, role: str):
+    """Most recent non-cancelled Bubble shift at this site with the same start time
+    and role. Used ONLY for the things the pricing table does not hold: Bubble's
+    own start/end numbers, hours, the role value, address and supervisor."""
+    constraints = [
+        {"key": "location", "constraint_type": "equals", "value": location_id},
+        {"key": "start time", "constraint_type": "equals", "value": start_num},
+        {"key": "cancelled", "constraint_type": "equals", "value": "no"},
+    ]
+    r = requests.get(
+        f"{BUBBLE_BASE}/shift", headers=_bubble_headers(), timeout=20,
+        params={"constraints": json.dumps(constraints), "limit": 50,
+                "sort_field": "Created Date", "descending": "true"},
+    )
+    r.raise_for_status()
+    for t in r.json().get("response", {}).get("results", []):
+        roles = {ROLE_ALIASES.get(str(x).strip().upper()) for x in (t.get("roles") or [])}
+        if role in roles and t.get("hours") and t.get("end time") is not None:
+            return t
+    return None
+
+
+def tool_create_shift(nurse_name, facility, date, shift_type, shift_code=None, **_):
+    if db.DEV:
+        return {"error": "KLARRA_MODE is dev, so no shift was created."}
+    if not _valid_date(date) or shift_type not in BLOCKS:
+        return {"error": "bad date or shift_type"}
+    target = datetime.strptime(date, "%Y-%m-%d").date()
+    if target < _now_melb().date():
+        return {"error": "that date is in the past, nothing created"}
+
+    nurse, err = _resolve_nurse(nurse_name)
+    if err:
+        return err
+    fac = db.find_facility_by_name(facility)
+    if not fac:
+        return {"error": f"could not match a site called '{facility}'"}
+    slug = fac["slug"]
+    options = (SHIFT_TIMES.get(slug) or {}).get(shift_type)
+    if not options:
+        return {"error": f"no standard {shift_type} times saved for {fac['name']}"}
+
+    if len(options) > 1:
+        wanted = (shift_code or "").strip().upper()
+        pick = next((o for o in options if o[0] == wanted), None)
+        if not pick:
+            return {"needs_choice": [f"{c} {a}-{b}" for c, a, b in options],
+                    "site": fac["name"], "shift_type": shift_type}
+    else:
+        pick = options[0]
+    _code, start, end = pick
+
+    role = str(nurse.get("role") or "").upper()
+    if role not in ROLES:
+        return {"error": f"{nurse['first_name']} has no staffed role on file"}
+    location_id = _location_id(slug)
+    carer_bid = db.nurse_bubble_id(nurse["id"])
+    if not location_id:
+        return {"error": f"no Bubble location id saved for {fac['name']}"}
+    if not carer_bid:
+        return {"error": f"{nurse['first_name']} has no Bubble id, cannot create the shift"}
+
+    clash = (db.get_client().table("shifts").select("id")
+             .eq("nurse_id", nurse["id"]).eq("date", date)
+             .neq("status", "cancelled").limit(1).execute().data)
+    if clash:
+        return {"error": f"{nurse['first_name']} already has a shift on {date}. Nothing created."}
+
+    if role not in PRICING_NAMES:
+        return {"error": f"no residential pricing set up for {role}. Nothing created."}
+    kind, holidays_checked = _day_kind(target, shift_type)
+    pricing_name = PRICING_NAMES[role][kind]
+    try:
+        pricing = _get_pricing(pricing_name)
+    except requests.HTTPError as e:
+        return {"error": ("could not read the Residential Pricing table from Bubble "
+                          f"({e.response.status_code}). Check it is ticked in Bubble "
+                          "Settings, API, Data API. Nothing created.")}
+    if not pricing:
+        return {"error": f"no Residential Pricing record named '{pricing_name}'. Nothing created."}
+
+    template = _find_shift_template(location_id, int(start), role)
+    if not template:
+        return {"error": (f"no earlier {role} {shift_type} shift at {fac['name']} "
+                          f"({start}) to copy hours, role and supervisor from. "
+                          "Create the first one in Bubble.")}
+
+    hours = float(template["hours"])
+    rate = float(pricing.get("rate") or 0)
+    carer_pay = float(pricing.get("carer pay") or 0)
+    hourly_rev = float(pricing.get("hourly revenue") or 0)
+
+    s_dt = datetime(target.year, target.month, target.day,
+                    int(start[:2]), int(start[2:]), tzinfo=MELB)
+    e_dt = datetime(target.year, target.month, target.day,
+                    int(end[:2]), int(end[2:]), tzinfo=MELB)
+    if e_dt <= s_dt:
+        e_dt = (datetime(target.year, target.month, target.day) + timedelta(days=1)).replace(
+            hour=int(end[:2]), minute=int(end[2:]), tzinfo=MELB)
+    midnight = datetime(target.year, target.month, target.day, tzinfo=MELB)
+
+    payload = {
+        "accepted": "yes", "cancelled": "no", "attended": "no",
+        "invoiced": "no", "csv": "no",
+        "carer": carer_bid,
+        "location": location_id,
+        "date": midnight.isoformat(),
+        "start time": template["start time"],
+        "end time": template["end time"],
+        "hours": hours,
+        "rate": rate,
+        "fee": round(hours * rate, 2),
+        "wage": round(hours * carer_pay, 2),
+        "revenue": round(hours * hourly_rev, 2),
+        "roles": template.get("roles"),
+        "address": template.get("address"),
+        "res pricing": pricing["_id"],
+        "supervisor": template.get("supervisor"),
+        "check in time": s_dt.isoformat(),
+        "check out time": e_dt.isoformat(),
+    }
+    payload = {k: v for k, v in payload.items() if v is not None}
+
+    r = requests.post(f"{BUBBLE_BASE}/shift", headers=_bubble_headers(),
+                      json=payload, timeout=20)
+    if not r.ok:
+        logger.error("Bubble rejected shift create: %s %s %s", r.status_code, r.text, payload)
+        return {"error": f"Bubble rejected the shift ({r.status_code}). Nothing created."}
+    new_id = r.json().get("id")
+    if not new_id:
+        return {"error": "Bubble gave no shift id back. Check Bubble before retrying."}
+
+    problems = []
+    try:
+        db.upsert_shift_from_push(
+            bubble_shift_id=new_id, nurse_id=nurse["id"], date=date,
+            shift_type=shift_type, start_time=s_dt.isoformat(), end_time=e_dt.isoformat(),
+            status="confirmed", facility_id=fac["id"],
+        )
+        db.assign_availability(nurse["id"], date, shift_type)
+        avail_bid = db.get_availability_bubble_id(nurse["id"], date, shift_type)
+        if avail_bid:
+            ar = requests.patch(f"{BUBBLE_BASE}/availability/{avail_bid}",
+                                headers=_bubble_headers(), json={"available": False},
+                                timeout=15)
+            ar.raise_for_status()
+    except Exception:
+        logger.exception("Shift %s created in Bubble but follow-up sync failed", new_id)
+        problems.append("shift is in Bubble but the Supabase or availability update failed")
+
+    code_txt = f"{_code} " if _code else ""
+    label = BLOCK_LABEL[shift_type]
+    text = (f"Created: {nurse['first_name']}, {fac['name']}, {db.short_date(date)}, "
+            f"{label} {code_txt}{start}-{end} ({hours:g}h). Pricing: {pricing_name}.")
+    if not holidays_checked:
+        text += " Public holidays are not checked for that year, so check the rate."
+    if problems:
+        text += " Warning: " + "; ".join(problems) + "."
+    return {"reply_text": text, "bubble_shift_id": new_id}
+
+
 TOOL_FUNCS = {
     "check_availability": tool_check_availability,
     "check_nurse": tool_check_nurse,
     "offer_shift": tool_offer_shift,
     "check_replies": tool_check_replies,
+    "create_shift": tool_create_shift,
 }
 
 
