@@ -23,6 +23,9 @@ Routing order matters, and is deliberately this order:
       or more carers, replies; old fixed parser kept as fallback) — checked next on
       his number, ahead of a pending approval, so it isn't swallowed by that gate.
   1. Admin approval reply (narrow: only fires if there's a real pending approval).
+  1b. A carer (not admin, not a facility) asking to check out early -> reply with a
+      check-out link from the CarerTexts app. Only fires when Claude reads the text as
+      that request, so everything else carries on below.
   2. An ACTIVE offer (cascade or ad hoc) on this number — wins over facility
      identity, because it means we are actively expecting a YES/NO from this exact
      number right now. This matters because in dev/test setups one phone number can
@@ -560,6 +563,70 @@ def handle_adhoc_offer_reply(offer: dict, body: str) -> Response:
     return twiml_reply("No worries, thanks for letting us know.")
 
 
+# --- Carer early check-out ---
+# A carer on shift texts that they need to check out early. Klarra asks the CarerTexts
+# app (Vercel) for a check-out link for that carer's current shift and replies with it.
+# Needs CARERTEXTS_SECRET (same value as KLARRA_SHARED_SECRET on the Vercel project).
+
+CARERTEXTS_URL = os.environ.get("CARERTEXTS_URL", "https://carertexts.vercel.app").rstrip("/")
+CARERTEXTS_SECRET = os.environ.get("CARERTEXTS_SECRET", "").strip()
+
+
+def _wants_early_checkout(text: str) -> bool:
+    """True if this SMS is a carer saying they need to check out early / are finishing
+    their shift early / asking for a check-out link. Any failure counts as no."""
+    if not text or len(text) > 300:
+        return False
+    try:
+        client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+        msg = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=5,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "A care worker texted their employer's scheduling number while on shift. "
+                    "Is this message asking to check out early, saying they need to leave or "
+                    "finish their shift early, or asking for a check-out link? "
+                    "Answer ONLY yes or no.\n\n"
+                    f"Message: \"{text}\""
+                ),
+            }],
+        )
+        return msg.content[0].text.strip().lower().startswith("yes")
+    except Exception:
+        logger.exception("Early check-out intent check failed")
+        return False
+
+
+def handle_early_checkout(phone: str, body: str) -> Response | None:
+    """Reply with a check-out link when a carer asks to check out early. Returns None when
+    the text is not that request (caller carries on with normal routing)."""
+    if not CARERTEXTS_SECRET or not phone:
+        return None
+    if _parse_yes_no(body):
+        return None  # a bare yes/no is an offer reply, never a check-out request
+    if not _wants_early_checkout(body):
+        return None
+    try:
+        r = requests.post(
+            f"{CARERTEXTS_URL}/api/early-checkout",
+            json={"phone": phone},
+            headers={"Authorization": f"Bearer {CARERTEXTS_SECRET}"},
+            timeout=25,
+        )
+        r.raise_for_status()
+        message = (r.json() or {}).get("message")
+        if message:
+            return twiml_reply(message)
+    except Exception:
+        logger.exception("Early check-out link request failed")
+    return twiml_reply(
+        "Sorry, I couldn't get your check out link just now. Please try again in a minute, "
+        "or call Paul or Vidhu."
+    )
+
+
 @app.route("/sms", methods=["POST"])
 def sms():
     from_number = request.form.get("From")
@@ -608,6 +675,13 @@ def sms():
         admin_response = handle_admin_reply(body)
         if admin_response is not None:
             return admin_response
+
+    # A carer asking to check out early gets a check-out link. Admin and facility numbers
+    # are skipped so their own flows are never touched.
+    if not _is_admin_number(from_number) and not db.facility_by_phone(from_number):
+        early_response = handle_early_checkout(from_number, body)
+        if early_response is not None:
+            return early_response
 
     # An ACTIVE cascade offer on this number wins over facility identity — see the
     # module docstring for why this ordering matters.
