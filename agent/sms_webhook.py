@@ -570,6 +570,9 @@ def handle_adhoc_offer_reply(offer: dict, body: str) -> Response:
 
 CARERTEXTS_URL = os.environ.get("CARERTEXTS_URL", "https://carertexts.vercel.app").rstrip("/")
 CARERTEXTS_SECRET = os.environ.get("CARERTEXTS_SECRET", "").strip()
+# TEMPORARY test switch: set EARLY_CHECKOUT_TEST=1 so the admin number can also test early check-out.
+# Remove the variable when testing is done.
+EARLY_CHECKOUT_TEST = os.environ.get("EARLY_CHECKOUT_TEST", "").strip() == "1"
 
 
 def _wants_early_checkout(text: str) -> bool:
@@ -638,6 +641,11 @@ def sms():
         return twiml_reply(random.choice(
             ["No problem.", "My pleasure.", "Easy.", "No worries.", "Anytime.", "All good."]
         ))
+
+    if EARLY_CHECKOUT_TEST and _is_admin_number(from_number):
+        test_response = handle_early_checkout(from_number, body)
+        if test_response is not None:
+            return test_response
 
     if _is_admin_number(from_number):
         # A pending duplicate-shift review takes absolute priority on his number —
