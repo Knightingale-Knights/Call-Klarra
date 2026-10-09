@@ -171,7 +171,7 @@ def create_bubble_shift(template: dict, target_date: str) -> str | None:
         "start time": template_start_num(template),
         "end time": template_end_num(template),
         "hours": hours,
-        "ndis": template.get("ndis_code_bubble_id"),
+        "ndis pricing": template.get("ndis_code_bubble_id"),
         "rate": rate,
         "fee": hours * rate,
         "wage": hours * wage_rate,
