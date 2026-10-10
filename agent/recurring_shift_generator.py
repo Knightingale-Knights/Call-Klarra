@@ -260,10 +260,10 @@ def send_roster_reminder(nurse_id: int, lines: list[str]) -> None:
         return
     name = nurse.get("first_name") or "there"
     bullets = "\n".join(f"* {line}" for line in lines)
-    body = (f"Hi {name}, it's Klarra from Knightingale. Next week's roster is up:\n\n"
+    body = (f"Hi {name}, it's Klarra. Next week's roster is up:\n\n"
             f"{bullets}\n\n"
-            f"Please check your shifts and let Paul know if anything looks off. "
-            f"Have fun =)")
+            f"Please check your shifts and let Paul know if anything looks off.\n\n"
+            f"Have a fun day =)")
     try:
         db.send_sms(nurse["phone"], body)
         logger.info("Sent roster reminder to nurse %s", nurse_id)
