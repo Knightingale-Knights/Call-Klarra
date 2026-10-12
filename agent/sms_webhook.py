@@ -563,9 +563,9 @@ def handle_adhoc_offer_reply(offer: dict, body: str) -> Response:
     return twiml_reply("No worries, thanks for letting us know.")
 
 
-# --- Carer early check-out ---
-# A carer on shift texts that they need to check out early. Klarra asks the CarerTexts
-# app (Vercel) for a check-out link for that carer's current shift and replies with it.
+# --- Carer check-in / early check-out by text ---
+# A carer texts for their check-in link, or that they need to check out early. Klarra asks the
+# CarerTexts app (Vercel) for the link for that carer's shift and replies with it.
 # Needs CARERTEXTS_SECRET (same value as KLARRA_SHARED_SECRET on the Vercel project).
 
 CARERTEXTS_URL = os.environ.get("CARERTEXTS_URL", "https://carertexts.vercel.app").rstrip("/")
@@ -575,45 +575,57 @@ CARERTEXTS_SECRET = os.environ.get("CARERTEXTS_SECRET", "").strip()
 EARLY_CHECKOUT_TEST = os.environ.get("EARLY_CHECKOUT_TEST", "").strip() == "1"
 
 
-def _wants_early_checkout(text: str) -> bool:
-    """True if this SMS is a carer saying they need to check out early / are finishing
-    their shift early / asking for a check-out link. Any failure counts as no."""
+def _carer_link_request(text: str) -> str | None:
+    """'checkin' if this SMS is a carer asking for their check-in link (or saying they have
+    arrived / are starting and want to check in), 'checkout' if they are asking to check out
+    early / saying they need to leave or finish early / asking for a check-out link, otherwise
+    None. Any failure counts as None."""
     if not text or len(text) > 300:
-        return False
+        return None
     try:
         client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
         msg = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=5,
+            max_tokens=8,
             messages=[{
                 "role": "user",
                 "content": (
-                    "A care worker texted their employer's scheduling number while on shift. "
-                    "Is this message asking to check out early, saying they need to leave or "
-                    "finish their shift early, or asking for a check-out link? "
-                    "Answer ONLY yes or no.\n\n"
+                    "A care worker texted their employer's scheduling number around a shift. "
+                    "Classify the message. Answer ONLY one word:\n"
+                    "checkin = they are asking for a check-in link, or saying they have arrived "
+                    "or are starting and want to check in\n"
+                    "checkout = they are asking to check out early, saying they need to leave or "
+                    "finish their shift early, or asking for a check-out link\n"
+                    "none = anything else\n\n"
                     f"Message: \"{text}\""
                 ),
             }],
         )
-        return msg.content[0].text.strip().lower().startswith("yes")
+        answer = msg.content[0].text.strip().lower()
+        if answer.startswith("checkin"):
+            return "checkin"
+        if answer.startswith("checkout"):
+            return "checkout"
+        return None
     except Exception:
-        logger.exception("Early check-out intent check failed")
-        return False
+        logger.exception("Carer link intent check failed")
+        return None
 
 
-def handle_early_checkout(phone: str, body: str) -> Response | None:
-    """Reply with a check-out link when a carer asks to check out early. Returns None when
+def handle_carer_link_request(phone: str, body: str) -> Response | None:
+    """Reply with a check-in or check-out link when a carer asks for one. Returns None when
     the text is not that request (caller carries on with normal routing)."""
     if not CARERTEXTS_SECRET or not phone:
         return None
     if _parse_yes_no(body):
-        return None  # a bare yes/no is an offer reply, never a check-out request
-    if not _wants_early_checkout(body):
+        return None  # a bare yes/no is an offer reply, never a link request
+    kind = _carer_link_request(body)
+    if not kind:
         return None
+    endpoint = "checkin-link" if kind == "checkin" else "early-checkout"
     try:
         r = requests.post(
-            f"{CARERTEXTS_URL}/api/early-checkout",
+            f"{CARERTEXTS_URL}/api/{endpoint}",
             json={"phone": phone},
             headers={"Authorization": f"Bearer {CARERTEXTS_SECRET}"},
             timeout=25,
@@ -623,9 +635,10 @@ def handle_early_checkout(phone: str, body: str) -> Response | None:
         if message:
             return twiml_reply(message)
     except Exception:
-        logger.exception("Early check-out link request failed")
+        logger.exception("Carer link request failed (%s)", kind)
+    word = "check in" if kind == "checkin" else "check out"
     return twiml_reply(
-        "Sorry, I couldn't get your check out link just now. Please try again in a minute, "
+        f"Sorry, I couldn't get your {word} link just now. Please try again in a minute, "
         "or call Paul or Vidhu."
     )
 
@@ -643,7 +656,7 @@ def sms():
         ))
 
     if EARLY_CHECKOUT_TEST and _is_admin_number(from_number):
-        test_response = handle_early_checkout(from_number, body)
+        test_response = handle_carer_link_request(from_number, body)
         if test_response is not None:
             return test_response
 
@@ -687,7 +700,7 @@ def sms():
     # A carer asking to check out early gets a check-out link. Admin and facility numbers
     # are skipped so their own flows are never touched.
     if not _is_admin_number(from_number) and not db.facility_by_phone(from_number):
-        early_response = handle_early_checkout(from_number, body)
+        early_response = handle_carer_link_request(from_number, body)
         if early_response is not None:
             return early_response
 
