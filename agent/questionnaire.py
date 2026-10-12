@@ -29,7 +29,7 @@ import db
 logger = logging.getLogger("knightingale-agent.questionnaire")
 
 MELB = ZoneInfo("Australia/Melbourne")
-BUBBLE_BASE = "https://knightingale.com.au/api/1.1/obj"
+BUBBLE_BASE = os.environ.get("QUESTIONNAIRE_BUBBLE_BASE", "https://knightingale.com.au/api/1.1/obj").rstrip("/")
 
 ANSWER = ["Yes", "No", "Unknown"]
 SAFETY = ["Safe", "Unsafe", "N/A"]

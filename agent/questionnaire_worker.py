@@ -16,6 +16,7 @@ Env:
   QUESTIONNAIRE_TEST_NOW=1        on start, schedule ONLY's next shift with a call in 2 minutes
   QUESTIONNAIRE_SKIP_CHECKIN=1    don't wait for the carer's check in (testing)
   OUTBOUND_AGENT_NAME             which outbound agent to dispatch (default knightingale-outbound)
+  QUESTIONNAIRE_BUBBLE_BASE       Bubble Data API base (dev: https://knightingale.com.au/version-test/api/1.1/obj)
   plus the usual BUBBLE_API_TOKEN, SUPABASE_*, TWILIO_*, LIVEKIT_*, KLARRA_MODE.
 
 Run:  python agent/questionnaire_worker.py
