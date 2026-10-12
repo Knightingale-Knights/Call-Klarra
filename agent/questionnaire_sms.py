@@ -75,35 +75,40 @@ def _template_question(section: str, key: str, p: str) -> str:
     """Fallback wording if Claude is unavailable."""
     f = q.field_def(section, key)
     text = f"About {p}: {f['question']}"
-    if f["kind"] == "list":
-        text += f" Options include: {', '.join(q.OPTIONS[f['options']])}."
-    elif f["kind"] == "answer":
+    if f["kind"] == "answer":
         text += " (yes / no)"
     elif f["kind"] == "safety":
         text += " (safe / unsafe / not applicable)"
     return text
 
 
+def _bullets(items: list[str]) -> str:
+    return "\n".join(f"• {i}" for i in items)
+
+
 def compose_question(section: str, key: str, state: dict) -> str:
-    """Natural SMS wording for one question, using the participant's name and pronouns."""
+    """Natural SMS wording for one question, using the participant's name and pronouns.
+    List questions get their options as dot points underneath."""
     p, pr = state["participant_name"], state["pronouns"]
-    fallback = _template_question(section, key, p)
+    f = q.field_def(section, key)
+    question = _template_question(section, key, p)
     try:
         msg = _claude().messages.create(
-            model=MODEL, max_tokens=400,
+            model=MODEL, max_tokens=300,
             messages=[{"role": "user", "content": (
-                f"Rewrite this as one short, friendly, plain-English text message to a care "
-                f"worker who is with {p} right now. Refer to {p} by name or as "
-                f"{pr['subj']}/{pr['obj']}/{pr['poss']}, never 'they'. Keep the full option list "
-                f"if there is one. Don't greet, don't sign off, no emojis, never use an em dash. "
-                f"Output only the message.\n\n{fallback}"
+                f"Rewrite this as one short, friendly, plain-English question in a text message "
+                f"to a care worker who is with {p} right now. Refer to {p} by name or as "
+                f"{pr['subj']}/{pr['obj']}/{pr['poss']}, never 'they'. Don't list any options, "
+                f"don't greet, don't sign off, no emojis, never use an em dash. Output only the "
+                f"question.\n\n{question}"
             )}],
         )
-        text = msg.content[0].text.strip().replace("—", ", ")
-        return text or fallback
+        question = msg.content[0].text.strip().replace("—", ", ") or question
     except Exception:
         logger.exception("Compose failed, using template")
-        return fallback
+    if f["kind"] == "list":
+        question += "\nThe options are:\n" + _bullets(q.OPTIONS[f["options"]])
+    return question
 
 
 def parse_reply(section: str, key: str, body: str, state: dict) -> dict:
