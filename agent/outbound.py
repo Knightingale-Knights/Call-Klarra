@@ -45,7 +45,7 @@ logger.setLevel(logging.INFO)
 for noisy in ("hpack", "httpx", "httpcore", "h2"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
-AGENT_NAME = "knightingale-outbound"
+AGENT_NAME = os.environ.get("OUTBOUND_AGENT_NAME", "knightingale-outbound")
 
 
 def text_outcome(meta: dict, outcome: str) -> None:

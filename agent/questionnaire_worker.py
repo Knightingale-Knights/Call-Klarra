@@ -13,6 +13,9 @@ Every minute:
 
 Env:
   QUESTIONNAIRE_ONLY_PARTICIPANT  optional Bubble user id: restrict to one participant (testing)
+  QUESTIONNAIRE_TEST_NOW=1        on start, schedule ONLY's next shift with a call in 2 minutes
+  QUESTIONNAIRE_SKIP_CHECKIN=1    don't wait for the carer's check in (testing)
+  OUTBOUND_AGENT_NAME             which outbound agent to dispatch (default knightingale-outbound)
   plus the usual BUBBLE_API_TOKEN, SUPABASE_*, TWILIO_*, LIVEKIT_*, KLARRA_MODE.
 
 Run:  python agent/questionnaire_worker.py
@@ -41,7 +44,9 @@ logger = logging.getLogger("questionnaire-worker")
 for noisy in ("hpack", "httpx", "httpcore", "h2"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
-AGENT_NAME = "knightingale-outbound"
+AGENT_NAME = os.environ.get("OUTBOUND_AGENT_NAME", "knightingale-outbound")
+TEST_NOW = os.environ.get("QUESTIONNAIRE_TEST_NOW") == "1"
+SKIP_CHECKIN = os.environ.get("QUESTIONNAIRE_SKIP_CHECKIN") == "1"
 ONLY = os.environ.get("QUESTIONNAIRE_ONLY_PARTICIPANT", "").strip() or None
 
 HEADS_UP_START, HEADS_UP_END = 17, 21      # Melbourne hours
@@ -87,8 +92,10 @@ def session_exists_for_shift(shift_bid: str) -> bool:
     return bool(r.data)
 
 
-def schedule_one(participant_bid: str, shift: dict) -> None:
+def schedule_one(participant_bid: str, shift: dict, call_at: datetime | None = None,
+                 when: str = "tomorrow") -> None:
     if session_exists_for_shift(shift["_id"]):
+        logger.info("Session already exists for shift %s", shift["_id"])
         return
     nxt = q.next_section(participant_bid)
     if not nxt:
@@ -100,7 +107,7 @@ def schedule_one(participant_bid: str, shift: dict) -> None:
     if not phone:
         logger.warning("Carer %s has no phone, skipping", shift["carer"])
         return
-    call_at = q.shift_start(shift) + CALL_OFFSET
+    call_at = call_at or (q.shift_start(shift) + CALL_OFFSET)
     p_name = q.first_name(participant)
     now = datetime.now(timezone.utc).isoformat()
 
@@ -118,7 +125,7 @@ def schedule_one(participant_bid: str, shift: dict) -> None:
 
     body = (f"Hi {q.first_name(carer)}, it's Klarra from Knightingale. I noticed we don't have "
             f"any information for {p_name} on {q.topics_phrase(section, askable)}. I'll give you "
-            f"a call tomorrow at {q.pretty_time(call_at)} when you're with {p_name}. This way I "
+            f"a call {when} at {q.pretty_time(call_at)} when you're with {p_name}. This way I "
             f"can ask you to ask {p_name}. Speak then.")
     db.send_sms(phone, body)
     logger.info("Heads-up sent: %s / %s / %s at %s", p_name, section, phone, call_at)
@@ -160,7 +167,7 @@ async def start_call(lk: api.LiveKitAPI, session: dict) -> None:
         q.update_session(session, status="Failed", skipped_fields="shift cancelled")
         return
     start = q.shift_start(shift)
-    if not shift.get("check in time"):
+    if not shift.get("check in time") and not SKIP_CHECKIN:
         if q.melb_now() > start + CHECKIN_GRACE:
             q.update_session(session, status="Failed", skipped_fields="carer never checked in")
         else:
@@ -201,10 +208,35 @@ async def start_call(lk: api.LiveKitAPI, session: dict) -> None:
     logger.info("Dispatched questionnaire call %s (%s, %d fields)", room, section, len(fields))
 
 
+def schedule_test_now() -> None:
+    """Testing: schedule ONLY's next shift (today onwards) with a call in 2 minutes."""
+    if not ONLY:
+        logger.warning("QUESTIONNAIRE_TEST_NOW needs QUESTIONNAIRE_ONLY_PARTICIPANT")
+        return
+    today = q.melb_now().date()
+    lo = datetime(today.year, today.month, today.day, tzinfo=q.MELB) - timedelta(minutes=1)
+    shifts = [s for s in q.bubble_get("shift", [
+        {"key": "participant", "constraint_type": "equals", "value": ONLY},
+        {"key": "date", "constraint_type": "greater than", "value": lo.isoformat()},
+    ]) if not _cancelled(s) and s.get("carer") and q.shift_start(s)]
+    if not shifts:
+        logger.warning("Test: no upcoming shift for participant %s", ONLY)
+        return
+    shift = min(shifts, key=q.shift_start)
+    call_at = q.melb_now() + timedelta(minutes=2)
+    schedule_one(ONLY, shift, call_at=call_at, when="today")
+
+
 async def main():
     lk = api.LiveKitAPI()
     last_heads_up = 0.0
-    logger.info("Questionnaire worker started (KLARRA_MODE=%s, only=%s)", db.KLARRA_MODE, ONLY)
+    logger.info("Questionnaire worker started (KLARRA_MODE=%s, only=%s, agent=%s)",
+                db.KLARRA_MODE, ONLY, AGENT_NAME)
+    if TEST_NOW:
+        try:
+            schedule_test_now()
+        except Exception:
+            logger.exception("Test scheduling failed")
     while True:
         try:
             h = q.melb_now().hour
