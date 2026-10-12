@@ -570,16 +570,12 @@ def handle_adhoc_offer_reply(offer: dict, body: str) -> Response:
 
 CARERTEXTS_URL = os.environ.get("CARERTEXTS_URL", "https://carertexts.vercel.app").rstrip("/")
 CARERTEXTS_SECRET = os.environ.get("CARERTEXTS_SECRET", "").strip()
-# TEMPORARY test switch: set EARLY_CHECKOUT_TEST=1 so the admin number can also test early check-out.
-# Remove the variable when testing is done.
-EARLY_CHECKOUT_TEST = os.environ.get("EARLY_CHECKOUT_TEST", "").strip() == "1"
 
 
 def _carer_link_request(text: str) -> str | None:
-    """'checkin' if this SMS is a carer asking for their check-in link (or saying they have
-    arrived / are starting and want to check in), 'checkout' if they are asking to check out
-    early / saying they need to leave or finish early / asking for a check-out link, otherwise
-    None. Any failure counts as None."""
+    """Classify a carer's SMS: 'checkin', 'checkout', 'auto' (a greeting or vague message about
+    their shift, e.g. "hi", "i'm here", "finished", "link please"), or None for anything else.
+    Any failure counts as None."""
     if not text or len(text) > 300:
         return None
     try:
@@ -591,52 +587,61 @@ def _carer_link_request(text: str) -> str | None:
                 "role": "user",
                 "content": (
                     "A care worker texted their employer's scheduling number around a shift. "
-                    "Classify the message. Answer ONLY one word:\n"
-                    "checkin = they are asking for a check-in link, or saying they have arrived "
-                    "or are starting and want to check in\n"
-                    "checkout = they are asking to check out early, saying they need to leave or "
-                    "finish their shift early, or asking for a check-out link\n"
-                    "none = anything else\n\n"
+                    "Be liberal: if the message could plausibly be about checking in or out, say so. "
+                    "Answer ONLY one word:\n"
+                    "checkin = asking for a check-in link, or saying they have arrived, are "
+                    "starting, or want to check in\n"
+                    "checkout = asking for a check-out link, or saying they are finished, leaving, "
+                    "need to leave or finish early, or want to check out\n"
+                    "auto = a greeting or vague message with no other topic (hi, hello, link "
+                    "please, help, are you there), where the best reply is whichever link fits "
+                    "their shift\n"
+                    "none = clearly about something else (running late, sick, pay, a question "
+                    "about another matter)\n\n"
                     f"Message: \"{text}\""
                 ),
             }],
         )
         answer = msg.content[0].text.strip().lower()
-        if answer.startswith("checkin"):
-            return "checkin"
-        if answer.startswith("checkout"):
-            return "checkout"
+        for kind in ("checkin", "checkout", "auto"):
+            if answer.startswith(kind):
+                return kind
         return None
     except Exception:
         logger.exception("Carer link intent check failed")
         return None
 
 
-def handle_carer_link_request(phone: str, body: str) -> Response | None:
+def handle_carer_link_request(phone: str, body: str, allow_auto: bool = False) -> Response | None:
     """Reply with a check-in or check-out link when a carer asks for one. Returns None when
-    the text is not that request (caller carries on with normal routing)."""
+    the text is not that request (caller carries on with normal routing). A vague 'auto'
+    message is only answered when allow_auto is set and the number matches a shift."""
     if not CARERTEXTS_SECRET or not phone:
         return None
     if _parse_yes_no(body):
         return None  # a bare yes/no is an offer reply, never a link request
     kind = _carer_link_request(body)
-    if not kind:
+    if not kind or (kind == "auto" and not allow_auto):
         return None
-    endpoint = "checkin-link" if kind == "checkin" else "early-checkout"
     try:
         r = requests.post(
-            f"{CARERTEXTS_URL}/api/{endpoint}",
-            json={"phone": phone},
+            f"{CARERTEXTS_URL}/api/carer-link",
+            json={"phone": phone, "intent": kind},
             headers={"Authorization": f"Bearer {CARERTEXTS_SECRET}"},
             timeout=25,
         )
         r.raise_for_status()
-        message = (r.json() or {}).get("message")
+        data = r.json() or {}
+        if kind == "auto" and not data.get("found"):
+            return None  # not a carer on a shift: normal routing
+        message = data.get("message")
         if message:
             return twiml_reply(message)
     except Exception:
         logger.exception("Carer link request failed (%s)", kind)
-    word = "check in" if kind == "checkin" else "check out"
+        if kind == "auto":
+            return None
+    word = "check out" if kind == "checkout" else "check in"
     return twiml_reply(
         f"Sorry, I couldn't get your {word} link just now. Please try again in a minute, "
         "or call Paul."
@@ -654,11 +659,6 @@ def sms():
         return twiml_reply(random.choice(
             ["No problem.", "My pleasure.", "Easy.", "No worries.", "Anytime.", "All good."]
         ))
-
-    if EARLY_CHECKOUT_TEST and _is_admin_number(from_number):
-        test_response = handle_carer_link_request(from_number, body)
-        if test_response is not None:
-            return test_response
 
     if _is_admin_number(from_number):
         # A pending duplicate-shift review takes absolute priority on his number —
@@ -733,6 +733,10 @@ def sms():
                     facility["slug"] if facility else None)
 
     if not facility:
+        # A carer texting anything vague (e.g. "hi") gets whichever link fits their shift.
+        auto_response = handle_carer_link_request(from_number, body, allow_auto=True)
+        if auto_response is not None:
+            return auto_response
         # Unknown number. Afterhours -> have a conversation; daytime -> brief reply.
         if _afterhours_now():
             return handle_afterhours_chat(from_number, body)
