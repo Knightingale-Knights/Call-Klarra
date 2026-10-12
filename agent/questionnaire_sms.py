@@ -196,9 +196,10 @@ def start(session: dict, carer: dict, participant: dict, phone: str) -> None:
             f"about {p}. Please ask {pr['obj']} and reply here. Reply 'skip' if you don't know "
             f"one, or 'stop' to finish for today.\n\n(1/{total}) {first}")
     state["transcript"].append(f"Klarra: {body}")
-    db.send_sms(phone, body)
+    # Save first, then text: if saving fails nothing is sent (no repeat texts on retry).
     _save_state(session, state, carer_phone=phone, started=_now().isoformat())
     q.update_session(session, status="In Progress")
+    db.send_sms(phone, body)
     logger.info("Questionnaire SMS started: %s / %s (%d questions)", p, section, total)
 
 
