@@ -11,6 +11,8 @@ Every minute:
      question (questionnaire_sms.start). Not checked in: retry every 5 min until 90 min
      after shift start, then mark Failed.
   3. Timeouts: remind once after 45 min of silence, close after 90 min.
+  4. Risk plans: after a Risk Assessment or Home Safety session ends, create a Risk
+     Management Plan in Bubble for each newly identified risk (risk_plans.py).
 
 The carer's replies come in through sms_webhook.py, which hands them to
 questionnaire_sms.handle_inbound.
@@ -20,6 +22,7 @@ Env:
   QUESTIONNAIRE_TEST_NOW=1        on start, schedule a test in 2 minutes (and skip the 5pm heads-up run)
   QUESTIONNAIRE_TEST_SHIFT        Bubble shift id to test with (else ONLY's next shift)
   QUESTIONNAIRE_SKIP_CHECKIN=1    don't wait for the carer's check in (testing)
+  QUESTIONNAIRE_TEST_SECTION      force a section in test mode (e.g. Home Safety)
   QUESTIONNAIRE_BUBBLE_BASE       Bubble Data API base (dev: https://knightingale.com.au/version-test/api/1.1/obj)
   plus the usual BUBBLE_API_TOKEN, SUPABASE_*, TWILIO_*, ANTHROPIC_API_KEY, KLARRA_MODE.
 
@@ -41,6 +44,7 @@ load_dotenv()
 import db
 import questionnaire as q
 import questionnaire_sms as qs
+import risk_plans
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("questionnaire-worker")
@@ -51,6 +55,7 @@ TEST_NOW = os.environ.get("QUESTIONNAIRE_TEST_NOW") == "1"
 SKIP_CHECKIN = os.environ.get("QUESTIONNAIRE_SKIP_CHECKIN") == "1"
 ONLY = os.environ.get("QUESTIONNAIRE_ONLY_PARTICIPANT", "").strip() or None
 TEST_SHIFT = os.environ.get("QUESTIONNAIRE_TEST_SHIFT", "").strip() or None
+TEST_SECTION = os.environ.get("QUESTIONNAIRE_TEST_SECTION", "").strip() or None
 
 HEADS_UP_START, HEADS_UP_END = 17, 21      # Melbourne hours
 EARLIEST_START, LATEST_START = 7, 19        # only shifts starting in this window
@@ -100,8 +105,13 @@ def schedule_one(participant_bid: str, shift: dict, start_at: datetime | None = 
     if not force and session_exists_for_shift(shift["_id"]):
         logger.info("Session already exists for shift %s", shift["_id"])
         return
-    nxt = q.next_section(participant_bid)
-    if not nxt:
+    if force and TEST_SECTION in q.SECTIONS:
+        rec = q.get_record(TEST_SECTION, participant_bid)
+        nxt = (TEST_SECTION, q.missing_fields(TEST_SECTION, rec))
+    else:
+        nxt = q.next_section(participant_bid)
+    if not nxt or not nxt[1]:
+        logger.info("Nothing left to ask for participant %s", participant_bid)
         return
     section, askable = nxt
     participant = q.bubble_user(participant_bid)
@@ -240,6 +250,7 @@ def main():
                 except Exception:
                     logger.exception("Start failed for session %s", s["id"])
             qs.check_timeouts()
+            risk_plans.process_pending()
         except Exception:
             logger.exception("Worker loop error")
         time.sleep(60)
