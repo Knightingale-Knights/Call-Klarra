@@ -98,7 +98,9 @@ def compose_question(section: str, key: str, state: dict) -> str:
             messages=[{"role": "user", "content": (
                 f"Rewrite this as one short, friendly, plain-English question in a text message "
                 f"to a care worker who is with {p} right now. Refer to {p} by name or as "
-                f"{pr['subj']}/{pr['obj']}/{pr['poss']}, never 'they'. Don't list any options, "
+                f"{pr['subj']}/{pr['obj']}/{pr['poss']}, never 'they'. Keep exactly what is being "
+                f"asked: if it asks to list or describe something, the rewrite must ask them to "
+                f"list or describe it, never turn it into a yes/no question. Don't list any options, "
                 f"don't greet, don't sign off, no emojis, never use an em dash. Output only the "
                 f"question.\n\n{question}"
             )}],
