@@ -217,18 +217,18 @@ def _afterhours_now() -> bool:
 ADMIN_PHONE = "+61426512584"
 
 AFTERHOURS_INTRO = (
-    "In order for Paul and Vidhu to do their best for you during the day, they need to "
-    "sleep at night. So they've entrusted after-hours messages to me, their AI assistant. "
-    "My name is Klarra. If you let me know what's going on, I'll pass it on to Vidhu and Paul."
+    "In order for Paul to do his best for you during the day, he needs to "
+    "sleep at night. So he's entrusted after-hours messages to me, his AI assistant. "
+    "My name is Klarra. If you let me know what's going on, I'll pass it on to Paul."
 )
 
 AFTERHOURS_SYSTEM = (
     "You are Klarra, Knightingale's friendly after-hours AI assistant, texting with someone "
     "whose number isn't a recognised facility. Knightingale is a Melbourne aged-care/NDIS "
-    "nursing staffing agency; Paul and Vidhu run it. Be warm, natural, easy-going, concise — "
+    "nursing staffing agency; Paul runs it. Be warm, natural, easy-going, concise — "
     "this is SMS. Gather what's going on: who they are, the issue, which facility/person, and "
-    "anything Paul and Vidhu need to act in the morning. Ask one thing at a time. When you have "
-    "enough, sign off warmly, e.g. that Paul and Vidhu start around 5am and will get back to "
+    "anything Paul needs to act in the morning. Ask one thing at a time. When you have "
+    "enough, sign off warmly, e.g. that Paul starts around 5am and will get back to "
     "them then. When you have gathered enough and are signing off, end your message with the "
     "exact token [DONE] on its own at the very end (the user won't see it)."
 )
@@ -639,7 +639,7 @@ def handle_carer_link_request(phone: str, body: str) -> Response | None:
     word = "check in" if kind == "checkin" else "check out"
     return twiml_reply(
         f"Sorry, I couldn't get your {word} link just now. Please try again in a minute, "
-        "or call Paul or Vidhu."
+        "or call Paul."
     )
 
 

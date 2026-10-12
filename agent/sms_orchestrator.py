@@ -27,7 +27,7 @@ at a higher rate, so escalation only happens after every candidate at the curren
 has declined or not replied.
 
 KLARRA_MODE=mid changes the whole shape of this: the nurse cascade is skipped
-entirely. The dev phones get the full request immediately so Paul/Vidhu can fill it
+entirely. The dev phones get the full request immediately so Paul can fill it
 by hand, and 30 seconds later the facility is texted the name of the top-ranked
 candidate — so the facility experiences a fast automatic fill while a human is
 actually doing the work behind it. See handle_request_mid().
@@ -266,7 +266,7 @@ def handle_request_mid(req: dict):
 
       1. Rank the real candidate pool (read-only — nobody is contacted).
       2. Text every dev phone the full request immediately, with the ranked
-         shortlist, so Paul/Vidhu can go and fill it by hand.
+         shortlist, so Paul can go and fill it by hand.
       3. Wait 30s, then text the facility naming the TOP-RANKED candidate —
          regardless of whether that nurse has agreed to anything.
       4. Park the row as 'mid_handoff' so it isn't re-claimed. The actual booking
