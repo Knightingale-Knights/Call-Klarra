@@ -351,8 +351,8 @@ def first_name(user: dict) -> str:
 
 
 def pronouns(user: dict) -> dict:
-    """From the User 'gender' field. Unknown or other -> they/them."""
-    g = str(user.get("gender") or "").strip().lower()
+    """From the User 'sex' option set (fallback 'gender'). Unknown or other -> they/them."""
+    g = str(user.get("sex") or user.get("gender") or "").strip().lower()
     if g in ("male", "m", "man", "boy"):
         return {"subj": "he", "obj": "him", "poss": "his"}
     if g in ("female", "f", "woman", "girl"):
