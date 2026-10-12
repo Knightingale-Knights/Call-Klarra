@@ -13,7 +13,8 @@ Every minute:
 
 Env:
   QUESTIONNAIRE_ONLY_PARTICIPANT  optional Bubble user id: restrict to one participant (testing)
-  QUESTIONNAIRE_TEST_NOW=1        on start, schedule ONLY's next shift with a call in 2 minutes
+  QUESTIONNAIRE_TEST_NOW=1        on start, schedule a test call in 2 minutes (and skip the 5pm heads-up run)
+  QUESTIONNAIRE_TEST_SHIFT        Bubble shift id to test with (else ONLY's next shift)
   QUESTIONNAIRE_SKIP_CHECKIN=1    don't wait for the carer's check in (testing)
   OUTBOUND_AGENT_NAME             which outbound agent to dispatch (default knightingale-outbound)
   QUESTIONNAIRE_BUBBLE_BASE       Bubble Data API base (dev: https://knightingale.com.au/version-test/api/1.1/obj)
@@ -49,6 +50,7 @@ AGENT_NAME = os.environ.get("OUTBOUND_AGENT_NAME", "knightingale-outbound")
 TEST_NOW = os.environ.get("QUESTIONNAIRE_TEST_NOW") == "1"
 SKIP_CHECKIN = os.environ.get("QUESTIONNAIRE_SKIP_CHECKIN") == "1"
 ONLY = os.environ.get("QUESTIONNAIRE_ONLY_PARTICIPANT", "").strip() or None
+TEST_SHIFT = os.environ.get("QUESTIONNAIRE_TEST_SHIFT", "").strip() or None
 
 HEADS_UP_START, HEADS_UP_END = 17, 21      # Melbourne hours
 EARLIEST_START, LATEST_START = 7, 19        # only shifts starting in this window
@@ -210,7 +212,17 @@ async def start_call(lk: api.LiveKitAPI, session: dict) -> None:
 
 
 def schedule_test_now() -> None:
-    """Testing: schedule ONLY's next shift (today onwards) with a call in 2 minutes."""
+    """Testing: schedule TEST_SHIFT (or ONLY's next shift) with a call in 2 minutes."""
+    global ONLY
+    if TEST_SHIFT:
+        shift = q.bubble_get_by_id("shift", TEST_SHIFT)
+        if not shift or not shift.get("participant") or not shift.get("carer"):
+            logger.warning("Test shift %s not found, or has no participant/carer", TEST_SHIFT)
+            return
+        ONLY = shift["participant"]
+        logger.info("Test shift %s, participant %s", TEST_SHIFT, ONLY)
+        schedule_one(ONLY, shift, call_at=q.melb_now() + timedelta(minutes=2), when="today")
+        return
     if not ONLY:
         logger.warning("QUESTIONNAIRE_TEST_NOW needs QUESTIONNAIRE_ONLY_PARTICIPANT")
         return
@@ -241,7 +253,8 @@ async def main():
     while True:
         try:
             h = q.melb_now().hour
-            if HEADS_UP_START <= h < HEADS_UP_END and time.time() - last_heads_up > 900:
+            if (not TEST_NOW and HEADS_UP_START <= h < HEADS_UP_END
+                    and time.time() - last_heads_up > 900):
                 run_heads_up()
                 last_heads_up = time.time()
             for s in due_sessions():
