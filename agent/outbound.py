@@ -143,8 +143,30 @@ def finalise_questionnaire(meta: dict, state: dict) -> None:
             skipped_fields=",".join(sorted(set(state["skipped"]))),
             transcript="\n".join(state["transcript"])[:50000],
         )
+        if still:
+            text_questionnaire_gaps(meta, still, set(state["skipped"]))
     except Exception:
         logger.exception("Failed to finalise questionnaire session %s", meta.get("session_id"))
+
+
+def text_questionnaire_gaps(meta: dict, still: list[str], skipped: set) -> None:
+    """Text Paul the questions still unanswered after a questionnaire call."""
+    admin = os.environ.get("KLARRA_DEV_PHONE")
+    if not admin:
+        return
+    answered = len(meta["fields"]) - len(still)
+    unknown = [k for k in still if k in skipped]
+    not_reached = [k for k in still if k not in skipped]
+    lines = [f"Questionnaire gaps: {meta['participant_name']} ({meta['section']}), "
+             f"carer {meta['carer_name']}. {answered} of {len(meta['fields'])} answered."]
+    if unknown:
+        lines.append("Carer didn't know: " + ", ".join(unknown))
+    if not_reached:
+        lines.append("Not reached: " + ", ".join(not_reached))
+    try:
+        db.send_sms(admin, "\n".join(lines))
+    except Exception:
+        logger.exception("Failed to text questionnaire gaps")
 
 
 def build_questionnaire_tools(meta: dict):
@@ -198,6 +220,7 @@ def questionnaire_instructions(d: dict) -> str:
     import questionnaire as q
     section = d["section"]
     p = d["participant_name"]
+    pr = d.get("pronouns") or {"subj": "they", "obj": "them", "poss": "their"}
     lines = []
     for key in d["fields"]:
         f = q.field_def(section, key)
@@ -220,7 +243,10 @@ def questionnaire_instructions(d: dict) -> str:
            f"The carer is with {p} right now. Ask the carer to ask {p} each question, or answer "
            f"from what they already know, then tell you. ")
     return f"""
-You are Klarra from Knightingale, calling {d['carer_name']}, a carer who is on shift with {p}. Speak with an English (British) accent. Warm, clear and efficient. You texted {d['carer_name']} yesterday to say you'd call now.
+You are Klarra from Knightingale, calling {d['carer_name']}, a carer who is on shift with {p}.
+Voice: you are English, from London. Always speak with a natural British (Southern English, RP) accent and British vocabulary and phrasing ("lovely", "brilliant", "cheers", "no worries at all"). Never use an American accent. Warm, clear and efficient.
+Refer to {p} as {pr['subj']}/{pr['obj']}/{pr['poss']}.
+Never go quiet: after every answer and every tool call, immediately carry on speaking (acknowledge briefly, then ask the next question). You texted {d['carer_name']} yesterday to say you'd call now.
 Purpose: fill in missing {section} information for {p}. {who}
 
 Flow:
@@ -329,10 +355,14 @@ async def entrypoint(ctx: JobContext):
         instructions = facility_instructions(meta)
         greet = "Greet the facility and give them the update."
 
+    voice, speed = "shimmer", 1.25
+    if kind == "questionnaire":
+        voice = os.environ.get("QUESTIONNAIRE_VOICE", "marin")
+        speed = float(os.environ.get("QUESTIONNAIRE_SPEED", "1.1"))
     if TurnDetection is not None:
         rt = openai.realtime.RealtimeModel(
-            voice="shimmer",
-            speed=1.25,
+            voice=voice,
+            speed=speed,
             turn_detection=TurnDetection(
                 type="semantic_vad",
                 eagerness="medium",
@@ -341,8 +371,12 @@ async def entrypoint(ctx: JobContext):
             ),
         )
     else:
-        rt = openai.realtime.RealtimeModel(voice="shimmer", speed=1.25)
-    session = AgentSession(llm=rt)
+        rt = openai.realtime.RealtimeModel(voice=voice, speed=speed)
+    if kind == "questionnaire":
+        # "away" fires after 3s with nobody (carer or Klarra) speaking.
+        session = AgentSession(llm=rt, user_away_timeout=3.0)
+    else:
+        session = AgentSession(llm=rt)
 
     if q_state is not None:
         @session.on("conversation_item_added")
@@ -355,6 +389,19 @@ async def entrypoint(ctx: JobContext):
                     q_state["transcript"].append(f"{who}: {text}")
             except Exception:
                 pass
+
+        @session.on("user_state_changed")
+        def _on_user_state(ev):
+            if ev.new_state == "speaking":
+                q_state["nudged"] = False
+            elif (ev.new_state == "away" and not q_state["finished"]
+                  and not q_state.get("nudged")):
+                q_state["nudged"] = True  # once per silence, until the carer speaks again
+                asyncio.create_task(session.generate_reply(instructions=(
+                    "Nobody has spoken for 3 seconds. Carry on now: if you were waiting on an "
+                    "answer they may still be finding out, say a short 'no rush, take your time'; "
+                    "otherwise acknowledge their last answer and ask the next question, or repeat "
+                    "the last question if it wasn't answered.")))
 
         def _q_disconnect(participant):
             if participant.identity == "callee":
@@ -374,7 +421,7 @@ async def entrypoint(ctx: JobContext):
         asyncio.create_task(_timer())
 
         import questionnaire as q
-        sess = q.get_session(meta["session_id"])
+        sess = await asyncio.to_thread(q.get_session, meta["session_id"])
         if sess:
             await asyncio.to_thread(q.update_session, sess, status="In Progress")
 

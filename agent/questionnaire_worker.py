@@ -96,8 +96,8 @@ def session_exists_for_shift(shift_bid: str) -> bool:
 
 
 def schedule_one(participant_bid: str, shift: dict, call_at: datetime | None = None,
-                 when: str = "tomorrow") -> None:
-    if session_exists_for_shift(shift["_id"]):
+                 when: str = "tomorrow", force: bool = False) -> None:
+    if not force and session_exists_for_shift(shift["_id"]):
         logger.info("Session already exists for shift %s", shift["_id"])
         return
     nxt = q.next_section(participant_bid)
@@ -112,6 +112,7 @@ def schedule_one(participant_bid: str, shift: dict, call_at: datetime | None = N
         return
     call_at = call_at or (q.shift_start(shift) + CALL_OFFSET)
     p_name = q.first_name(participant)
+    pr = q.pronouns(participant)
     now = datetime.now(timezone.utc).isoformat()
 
     bubble_id = q.bubble_create("questionnairesession", {
@@ -128,8 +129,8 @@ def schedule_one(participant_bid: str, shift: dict, call_at: datetime | None = N
 
     body = (f"Hi {q.first_name(carer)}, it's Klarra from Knightingale. I noticed we don't have "
             f"any information for {p_name} on {q.topics_phrase(section, askable)}. I'll give you "
-            f"a call {when} at {q.pretty_time(call_at)} when you're with {p_name}. This way I "
-            f"can ask you to ask {p_name}. Speak then.")
+            f"a call {when} at {q.pretty_time(call_at)} when you're with {pr['obj']}. This way I "
+            f"can ask you to ask {pr['obj']}. Speak then.")
     db.send_sms(phone, body)
     logger.info("Heads-up sent: %s / %s / %s at %s", p_name, section, phone, call_at)
 
@@ -202,6 +203,7 @@ async def start_call(lk: api.LiveKitAPI, session: dict) -> None:
         "section": section, "fields": fields, "record_id": record["_id"],
         "participant_bubble_id": session["participant_bubble_id"],
         "participant_name": q.first_name(participant), "carer_name": q.first_name(carer),
+        "pronouns": q.pronouns(participant),
     }
     room = f"questionnaire-{session['id'][:8]}-{int(time.time())}"
     q.update_session(session, status="Calling", carer_bubble_id=carer_bid,
@@ -221,7 +223,9 @@ def schedule_test_now() -> None:
             return
         ONLY = shift["participant"]
         logger.info("Test shift %s, participant %s", TEST_SHIFT, ONLY)
-        schedule_one(ONLY, shift, call_at=q.melb_now() + timedelta(minutes=2), when="today")
+        # force: every restart in test mode runs a fresh test call
+        schedule_one(ONLY, shift, call_at=q.melb_now() + timedelta(minutes=2), when="today",
+                     force=True)
         return
     if not ONLY:
         logger.warning("QUESTIONNAIRE_TEST_NOW needs QUESTIONNAIRE_ONLY_PARTICIPANT")

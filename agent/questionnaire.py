@@ -345,7 +345,19 @@ def bubble_create(datatype: str, fields: dict) -> str:
 
 
 def first_name(user: dict) -> str:
-    return (user.get("first name") or "").strip() or "there"
+    """First word only: 'Johanna Houston' -> 'Johanna'."""
+    parts = (user.get("first name") or "").split()
+    return parts[0] if parts else "there"
+
+
+def pronouns(user: dict) -> dict:
+    """From the User 'gender' field. Unknown or other -> they/them."""
+    g = str(user.get("gender") or "").strip().lower()
+    if g in ("male", "m", "man", "boy"):
+        return {"subj": "he", "obj": "him", "poss": "his"}
+    if g in ("female", "f", "woman", "girl"):
+        return {"subj": "she", "obj": "her", "poss": "her"}
+    return {"subj": "they", "obj": "them", "poss": "their"}
 
 
 # ---------- section records ----------
