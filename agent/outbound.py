@@ -157,12 +157,12 @@ def text_questionnaire_gaps(meta: dict, still: list[str], skipped: set) -> None:
     answered = len(meta["fields"]) - len(still)
     unknown = [k for k in still if k in skipped]
     not_reached = [k for k in still if k not in skipped]
-    lines = [f"Questionnaire gaps: {meta['participant_name']} ({meta['section']}), "
-             f"carer {meta['carer_name']}. {answered} of {len(meta['fields'])} answered."]
+    lines = [f"Q'naire gaps: {meta['participant_name']} ({meta['section']}) w/ "
+             f"{meta['carer_name']}. {answered}/{len(meta['fields'])} done."]
     if unknown:
-        lines.append("Carer didn't know: " + ", ".join(unknown))
+        lines.append("Didn't know: " + ", ".join(unknown))
     if not_reached:
-        lines.append("Not reached: " + ", ".join(not_reached))
+        lines.append("Didn't get to: " + ", ".join(not_reached))
     try:
         db.send_sms(admin, "\n".join(lines))
     except Exception:

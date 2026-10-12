@@ -428,7 +428,7 @@ def topics_phrase(section: str, keys: list[str], limit: int = 3) -> str:
             topics.append(t)
     shown = topics[:limit]
     if len(topics) > limit:
-        shown.append("a few other things")
+        shown.append("a few other bits")
     if len(shown) == 1:
         return shown[0]
     return ", ".join(shown[:-1]) + " and " + shown[-1]

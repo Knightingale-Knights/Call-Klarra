@@ -96,7 +96,7 @@ def session_exists_for_shift(shift_bid: str) -> bool:
 
 
 def schedule_one(participant_bid: str, shift: dict, call_at: datetime | None = None,
-                 when: str = "tomorrow", force: bool = False) -> None:
+                 when: str = "tmrw", force: bool = False) -> None:
     if not force and session_exists_for_shift(shift["_id"]):
         logger.info("Session already exists for shift %s", shift["_id"])
         return
@@ -127,10 +127,11 @@ def schedule_one(participant_bid: str, shift: dict, call_at: datetime | None = N
         "scheduled_call": call_at.isoformat(), "heads_up_sent": now,
     }).execute()
 
-    body = (f"Hi {q.first_name(carer)}, it's Klarra from Knightingale. I noticed we don't have "
-            f"any information for {p_name} on {q.topics_phrase(section, askable)}. I'll give you "
-            f"a call {when} at {q.pretty_time(call_at)} when you're with {pr['obj']}. This way I "
-            f"can ask you to ask {pr['obj']}. Speak then.")
+    topics = q.topics_phrase(section, askable).replace("their ", "")
+    body = (f"Hey {q.first_name(carer)}, Klarra from Knightingale here. Noticed we've got no "
+            f"info on {p_name}'s {topics}. I'll give you a buzz {when} at "
+            f"{q.pretty_time(call_at)} when you're with {pr['obj']} so you can ask {pr['obj']} "
+            f"for me. Chat then!")
     db.send_sms(phone, body)
     logger.info("Heads-up sent: %s / %s / %s at %s", p_name, section, phone, call_at)
 
@@ -224,7 +225,7 @@ def schedule_test_now() -> None:
         ONLY = shift["participant"]
         logger.info("Test shift %s, participant %s", TEST_SHIFT, ONLY)
         # force: every restart in test mode runs a fresh test call
-        schedule_one(ONLY, shift, call_at=q.melb_now() + timedelta(minutes=2), when="today",
+        schedule_one(ONLY, shift, call_at=q.melb_now() + timedelta(minutes=2), when="2day",
                      force=True)
         return
     if not ONLY:
@@ -241,7 +242,7 @@ def schedule_test_now() -> None:
         return
     shift = min(shifts, key=q.shift_start)
     call_at = q.melb_now() + timedelta(minutes=2)
-    schedule_one(ONLY, shift, call_at=call_at, when="today")
+    schedule_one(ONLY, shift, call_at=call_at, when="2day")
 
 
 async def main():
