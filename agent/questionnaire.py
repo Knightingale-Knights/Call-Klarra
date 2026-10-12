@@ -73,9 +73,10 @@ OPTIONS = {
 }
 
 
-def F(key, kind, topic, question, options=None, sensitive=False):
+def F(key, kind, topic, question, options=None, sensitive=False, gate=None):
+    """gate: a yes/no question asked first. 'No' saves "None"; 'yes' asks `question`."""
     return {"key": key, "kind": kind, "topic": topic, "question": question,
-            "options": options, "sensitive": sensitive}
+            "options": options, "sensitive": sensitive, "gate": gate}
 
 
 SECTIONS = {
@@ -107,12 +108,15 @@ SECTIONS = {
             F("mental health", "list", "mental health",
               "What mental health conditions do they have?", "Mental Health", sensitive=True),
             F("medications", "text", "medications",
-              "Please list all the medications they take, for physical and mental health (name and dose if known)."),
-            F("allergies", "text", "allergies", "Please list any allergies they have ('None' if none)."),
+              "Please list the medications they take.",
+              gate="Do they take any medication?"),
+            F("allergies", "text", "allergies", "Please list their allergies.",
+              gate="Do they have any allergies?"),
             F("behaviour support plan", "answer", "their behaviour support plan",
               "Do they have a behaviour support plan?"),
             F("hospital admissions", "text", "hospital admissions",
-              "Please list any hospital admissions they have had, with roughly when and why ('None' if none)."),
+              "Please list their hospital admissions, with roughly when and why.",
+              gate="Have they had any hospital admissions?"),
             F("last hospital stay length", "text", "hospital admissions",
               "How long was their last hospital stay? ('N/A' if never admitted)"),
         ],
@@ -126,9 +130,11 @@ SECTIONS = {
             F("foods liked", "text", "food likes and dislikes", "What foods do they like?"),
             F("foods disliked", "text", "food likes and dislikes", "What foods don't they like?"),
             F("dietary requirements", "text", "dietary requirements",
-              "Please list any dietary requirements they have ('None' if none)."),
+              "Please list their dietary requirements.",
+              gate="Do they have any dietary requirements?"),
             F("mobility aids", "text", "mobility aids",
-              "Please list any mobility aids they use ('None' if none)."),
+              "Please list the mobility aids they use.",
+              gate="Do they use any mobility aids?"),
             F("daily tasks assistance", "text", "daily tasks",
               "What daily tasks do they need assistance with?"),
             F("personal care", "list", "personal care",

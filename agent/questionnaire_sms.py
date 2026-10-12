@@ -71,11 +71,19 @@ def _save_state(session: dict, state: dict, **fields) -> None:
     session.update(fields)
 
 
-def _template_question(section: str, key: str, p: str) -> str:
+# Fields that are skipped (saved as the given value) when the field they depend on is "None".
+DEPENDS = {
+    "last hospital stay length": ("hospital admissions", "N/A"),
+    "emergency contact phone two": ("emergency contact name two", "None"),
+    "emergency contact relationship two": ("emergency contact name two", "None"),
+}
+
+
+def _template_question(section: str, key: str, p: str, gate: bool = False) -> str:
     """Fallback wording if Claude is unavailable."""
     f = q.field_def(section, key)
-    text = f"About {p}: {f['question']}"
-    if f["kind"] == "answer":
+    text = f"About {p}: {f['gate'] if gate else f['question']}"
+    if gate or f["kind"] == "answer":
         text += " (yes / no)"
     elif f["kind"] == "safety":
         text += " (safe / unsafe / not applicable)"
@@ -83,34 +91,57 @@ def _template_question(section: str, key: str, p: str) -> str:
 
 
 def _bullets(items: list[str]) -> str:
-    return "\n".join(f"• {i}" for i in items)
+    return "\n".join(f"\u2022 {i}" for i in items)
 
 
-def compose_question(section: str, key: str, state: dict) -> str:
+def compose_question(section: str, key: str, state: dict, gate: bool = False) -> str:
     """Natural SMS wording for one question, using the participant's name and pronouns.
     List questions get their options as dot points underneath."""
     p, pr = state["participant_name"], state["pronouns"]
     f = q.field_def(section, key)
-    question = _template_question(section, key, p)
+    question = _template_question(section, key, p, gate)
     try:
         msg = _claude().messages.create(
             model=MODEL, max_tokens=300,
             messages=[{"role": "user", "content": (
                 f"Rewrite this as one short, friendly, plain-English question in a text message "
                 f"to a care worker who is with {p} right now. Refer to {p} by name or as "
-                f"{pr['subj']}/{pr['obj']}/{pr['poss']}, never 'they'. Keep exactly what is being "
-                f"asked: if it asks to list or describe something, the rewrite must ask them to "
-                f"list or describe it, never turn it into a yes/no question. Don't list any options, "
-                f"don't greet, don't sign off, no emojis, never use an em dash. Output only the "
-                f"question.\n\n{question}"
+                f"{pr['subj']}/{pr['obj']}/{pr['poss']}, never 'they'. Ask exactly what is asked "
+                f"and nothing more: don't add details, examples or extra requests, and don't turn "
+                f"a 'list' question into a yes/no one. Don't list any options, don't greet, don't "
+                f"sign off, no emojis, never use an em dash. Output only the question.\n\n{question}"
             )}],
         )
-        question = msg.content[0].text.strip().replace("—", ", ") or question
+        question = msg.content[0].text.strip().replace("\u2014", ", ") or question
     except Exception:
         logger.exception("Compose failed, using template")
-    if f["kind"] == "list":
+    if not gate and f["kind"] == "list":
         question += "\nThe options are:\n" + _bullets(q.OPTIONS[f["options"]])
     return question
+
+
+def ask(section: str, state: dict) -> str:
+    """Wording for the current field: its yes/no gate first if it has one."""
+    key = state["fields"][state["pos"]]
+    gate = bool(q.field_def(section, key).get("gate")) and state.get("phase") != "main"
+    state["phase"] = "gate" if gate else "main"
+    if key not in state["asked"]:
+        state["asked"].append(key)
+    return compose_question(section, key, state, gate=gate)
+
+
+def parse_gate(body: str, gate_q: str, p: str) -> dict:
+    """Yes / no / unknown for a gate question, plus any details given with a yes."""
+    prompt = f"""A care worker was texted this yes/no question about {p}: "{gate_q}"
+Their reply: "{body}"
+Return ONLY JSON: {{"answer": "yes", "detail": "", "stop": false}}
+- answer: "yes", "no", or "unknown" (unknown if they don't know or the reply doesn't answer it).
+- detail: if they said yes AND already gave the details (e.g. named the items), a short clear summary of them; else "".
+- stop = true only if they say they can't continue now."""
+    msg = _claude().messages.create(model=MODEL, max_tokens=300,
+                                    messages=[{"role": "user", "content": prompt}])
+    m = re.search(r"\{.*\}", msg.content[0].text, re.S)
+    return json.loads(m.group(0)) if m else {"answer": "unknown"}
 
 
 def parse_reply(section: str, key: str, body: str, state: dict) -> dict:
@@ -161,13 +192,13 @@ def start(session: dict, carer: dict, participant: dict, phone: str) -> None:
         "participant_name": q.first_name(participant), "carer_name": q.first_name(carer),
         "pronouns": q.pronouns(participant), "bubble_base": q.BUBBLE_BASE,
         "reminded": False, "started_at": _now().isoformat(),
+        "phase": None, "none_fields": [],
     }
     p, c, pr = state["participant_name"], state["carer_name"], state["pronouns"]
-    first = compose_question(section, fields[0], state)
+    first = ask(section, state)
     body = (f"Hi {c}, as promised here are a few quick questions about {p}. Please ask "
             f"{pr['obj']} and reply here. If you don't know an answer, just reply with anything "
             f"and I'll move on.\n\n{first}")
-    state["asked"].append(fields[0])
     state["transcript"].append(f"Klarra: {body}")
     # Save first, then text: if saving fails nothing is sent (no repeat texts on retry).
     _save_state(session, state, carer_phone=phone, started=_now().isoformat())
@@ -242,50 +273,94 @@ def handle_inbound(phone: str, body: str) -> str | None:
         q.BUBBLE_BASE = default_base
 
 
+def _save(session: dict, state: dict, key: str, value: str, note: str = "") -> bool:
+    """Normalise and save one answer. Returns False if the value isn't valid for the field."""
+    section = session["section"]
+    try:
+        fields, _ = q.normalise_answer(section, key, value)
+    except ValueError:
+        return False
+    q.save_fields(section, state["record_id"], session["participant_bubble_id"], fields)
+    if str(fields.get(key)).strip().lower() in ("none", "['none']"):
+        state.setdefault("none_fields", []).append(key)
+    if note and section == "Home Safety":
+        q.save_fields(section, state["record_id"], session["participant_bubble_id"],
+                      {"home safety notes": note}, append_notes=True)
+    return True
+
+
+def _advance(session: dict, state: dict) -> None:
+    """Move to the next field, auto-filling ones whose parent answer was None."""
+    state["pos"] += 1
+    state["phase"] = None
+    while state["pos"] < len(state["fields"]):
+        key = state["fields"][state["pos"]]
+        dep = DEPENDS.get(key)
+        if dep and dep[0] in state.get("none_fields", []):
+            _save(session, state, key, dep[1])
+            state["pos"] += 1
+            continue
+        break
+
+
 def _handle(session: dict, state: dict, body: str) -> str:
     section = session["section"]
     key = state["fields"][state["pos"]]
-    c = state["carer_name"]
+    f = q.field_def(section, key)
+    c, p = state["carer_name"], state["participant_name"]
     state["transcript"].append(f"Carer: {body}")
     state["reminded"] = False
+    stop_reply = f"No worries, thanks {c}. I'll pick up the rest on another shift."
 
     if body.strip().lower().strip("!.? ") in STOP_WORDS:
         state["unanswered"].append(key)
-        reply = f"No worries, thanks {c}. I'll pick up the rest on another shift."
-        state["transcript"].append(f"Klarra: {reply}")
-        return finish(session, state, reply)
+        state["transcript"].append(f"Klarra: {stop_reply}")
+        return finish(session, state, stop_reply)
 
-    try:
-        parsed = parse_reply(section, key, body, state)
-    except Exception:
-        logger.exception("Parse failed")
-        parsed = {"answered": False}
-
-    saved = False
-    value = str(parsed.get("value") or "").strip()
-    if parsed.get("answered") and value:
+    stop = False
+    if state.get("phase") == "gate":
         try:
-            fields, _ = q.normalise_answer(section, key, value)
-            q.save_fields(section, state["record_id"], session["participant_bubble_id"], fields)
-            saved = True
-        except ValueError:
-            pass
-        note = (parsed.get("note") or "").strip()
-        if saved and note and section == "Home Safety":
-            q.save_fields(section, state["record_id"], session["participant_bubble_id"],
-                          {"home safety notes": note}, append_notes=True)
-    if not saved:
-        state["unanswered"].append(key)  # flagged: reported to Paul, re-asked after 14 days
+            g = parse_gate(body, f["gate"], p)
+        except Exception:
+            logger.exception("Gate parse failed")
+            g = {"answer": "unknown"}
+        stop = bool(g.get("stop"))
+        answer = str(g.get("answer") or "").lower()
+        detail = str(g.get("detail") or "").strip()
+        if answer == "no":
+            _save(session, state, key, "None")
+        elif answer == "yes" and detail:
+            if not _save(session, state, key, detail):
+                state["unanswered"].append(key)
+        elif answer == "yes" and not stop:
+            # Yes, but no details yet: ask the follow-up for the same field.
+            state["phase"] = "main"
+            reply = f"Thanks! {ask(section, state)}"
+            state["transcript"].append(f"Klarra: {reply}")
+            _save_state(session, state)
+            return reply
+        else:
+            state["unanswered"].append(key)
+    else:
+        try:
+            parsed = parse_reply(section, key, body, state)
+        except Exception:
+            logger.exception("Parse failed")
+            parsed = {"answered": False}
+        stop = bool(parsed.get("stop"))
+        value = str(parsed.get("value") or "").strip()
+        ok = bool(parsed.get("answered") and value) and _save(
+            session, state, key, value, (parsed.get("note") or "").strip())
+        if not ok:
+            state["unanswered"].append(key)  # flagged: reported to Paul, re-asked after 14 days
 
-    if parsed.get("stop"):
-        reply = f"No worries, thanks {c}. I'll pick up the rest on another shift."
-        state["transcript"].append(f"Klarra: {reply}")
-        return finish(session, state, reply)
+    if stop:
+        state["transcript"].append(f"Klarra: {stop_reply}")
+        return finish(session, state, stop_reply)
 
-    state["pos"] += 1
+    _advance(session, state)
     if state["pos"] >= len(state["fields"]):
-        reply = (f"That's everything, thanks so much {c}! Have a good rest of your shift "
-                 f"with {state['participant_name']}.")
+        reply = f"That's everything, thanks so much {c}! Have a good rest of your shift with {p}."
         state["transcript"].append(f"Klarra: {reply}")
         return finish(session, state, reply)
 
@@ -294,9 +369,7 @@ def _handle(session: dict, state: dict, body: str) -> str:
         state["transcript"].append(f"Klarra: {reply}")
         return finish(session, state, reply)
 
-    nxt_key = state["fields"][state["pos"]]
-    reply = f"Thanks! {compose_question(section, nxt_key, state)}"
-    state["asked"].append(nxt_key)
+    reply = f"Thanks! {ask(section, state)}"
     state["transcript"].append(f"Klarra: {reply}")
     _save_state(session, state)
     return reply
