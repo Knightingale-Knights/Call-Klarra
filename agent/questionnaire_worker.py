@@ -5,7 +5,7 @@ Every minute:
   1. Heads-up (5pm-9pm Melbourne, every 15 min, idempotent):
      for each NDIS participant with a shift tomorrow (first one starting 7am-7pm) and
      empty questionnaire fields, create a Questionnaire Session for that shift and text
-     the carer a heads-up naming what's missing and when Klarra will text.
+     the carer a heads-up naming what's missing and when they'll be texted.
   2. Start: for each Scheduled session whose time has passed, check the shift is still on
      and the carer has checked in (Bubble "check in time" set), then text the first
      question (questionnaire_sms.start). Not checked in: retry every 5 min until 90 min
@@ -128,7 +128,7 @@ def schedule_one(participant_bid: str, shift: dict, start_at: datetime | None = 
     }).execute()
 
     topics = q.topics_phrase(section, askable).replace("their ", f"{pr['poss']} ")
-    body = (f"Hi {q.first_name(carer)}, it's Klarra from Knightingale. I noticed we don't have "
+    body = (f"Hi {q.first_name(carer)}, I noticed we don't have "
             f"any information for {p_name} on {topics}. I'll text you {when} at "
             f"{q.pretty_time(start_at)} when you're with {pr['obj']}, so you can ask "
             f"{pr['obj']} a few quick questions for me. Thanks!")
