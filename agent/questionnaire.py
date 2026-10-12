@@ -17,6 +17,7 @@ the list contains "Other".
 """
 
 import os
+import re
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -310,20 +311,37 @@ def bubble_user(bubble_id: str) -> dict:
     return r.json()["response"]
 
 
-def bubble_patch(datatype: str, bubble_id: str, fields: dict) -> None:
-    r = requests.patch(f"{BUBBLE_BASE}/{datatype}/{bubble_id}", headers=_headers(),
-                       json=fields, timeout=20)
-    if not r.ok:
-        logger.error("Bubble PATCH %s/%s failed: %s %s", datatype, bubble_id, r.status_code, r.text)
+_FIELD_ERR = re.compile(r"Invalid data for field ([^:]+): could not parse")
+
+
+def _send(method: str, url: str, fields: dict) -> requests.Response:
+    """Send to Bubble. If an option set field is rejected (option sets may be named in
+    lowercase, e.g. 'health profile'), retry that field lowercased."""
+    fields = dict(fields)
+    for _ in range(len(fields) + 1):
+        r = requests.request(method, url, headers=_headers(), json=fields, timeout=20)
+        if r.ok:
+            return r
+        m = _FIELD_ERR.search(r.text)
+        key = m.group(1).strip() if m else None
+        if not key or key not in fields:
+            break
+        v = fields[key]
+        low = [x.lower() for x in v] if isinstance(v, list) else str(v).lower()
+        if low == v:
+            break
+        fields[key] = low
+    logger.error("Bubble %s %s failed: %s %s", method, url, r.status_code, r.text)
     r.raise_for_status()
+    return r
+
+
+def bubble_patch(datatype: str, bubble_id: str, fields: dict) -> None:
+    _send("PATCH", f"{BUBBLE_BASE}/{datatype}/{bubble_id}", fields)
 
 
 def bubble_create(datatype: str, fields: dict) -> str:
-    r = requests.post(f"{BUBBLE_BASE}/{datatype}", headers=_headers(), json=fields, timeout=20)
-    if not r.ok:
-        logger.error("Bubble POST %s failed: %s %s", datatype, r.status_code, r.text)
-    r.raise_for_status()
-    return r.json()["id"]
+    return _send("POST", f"{BUBBLE_BASE}/{datatype}", fields).json()["id"]
 
 
 def first_name(user: dict) -> str:
