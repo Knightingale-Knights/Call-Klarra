@@ -45,7 +45,7 @@ logger.setLevel(logging.INFO)
 for noisy in ("hpack", "httpx", "httpcore", "h2"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
-AGENT_NAME = os.environ.get("OUTBOUND_AGENT_NAME", "knightingale-outbound")
+AGENT_NAME = "knightingale-outbound"
 
 
 def text_outcome(meta: dict, outcome: str) -> None:
@@ -122,153 +122,6 @@ Keep it short and human.
 """.strip()
 
 
-def finalise_questionnaire(meta: dict, state: dict) -> None:
-    """Close the session once: Completed if nothing asked is still empty, else Partial."""
-    import questionnaire as q
-    from datetime import datetime, timezone
-    if state.get("closed"):
-        return
-    state["closed"] = True
-    state["finished"] = True
-    try:
-        sess = q.get_session(meta["session_id"])
-        if not sess:
-            return
-        rec = q.get_record(meta["section"], meta["participant_bubble_id"]) or {}
-        still = [k for k in meta["fields"] if k in q.missing_fields(meta["section"], rec)]
-        q.update_session(
-            sess,
-            status="Completed" if not still else "Partial",
-            completed=datetime.now(timezone.utc).isoformat(),
-            skipped_fields=",".join(sorted(set(state["skipped"]))),
-            transcript="\n".join(state["transcript"])[:50000],
-        )
-        if still:
-            text_questionnaire_gaps(meta, still, set(state["skipped"]))
-    except Exception:
-        logger.exception("Failed to finalise questionnaire session %s", meta.get("session_id"))
-
-
-def text_questionnaire_gaps(meta: dict, still: list[str], skipped: set) -> None:
-    """Text Paul the questions still unanswered after a questionnaire call."""
-    admin = os.environ.get("KLARRA_DEV_PHONE")
-    if not admin:
-        return
-    answered = len(meta["fields"]) - len(still)
-    unknown = [k for k in still if k in skipped]
-    not_reached = [k for k in still if k not in skipped]
-    lines = [f"Q'naire gaps: {meta['participant_name']} ({meta['section']}) w/ "
-             f"{meta['carer_name']}. {answered}/{len(meta['fields'])} done."]
-    if unknown:
-        lines.append("Didn't know: " + ", ".join(unknown))
-    if not_reached:
-        lines.append("Didn't get to: " + ", ".join(not_reached))
-    try:
-        db.send_sms(admin, "\n".join(lines))
-    except Exception:
-        logger.exception("Failed to text questionnaire gaps")
-
-
-def build_questionnaire_tools(meta: dict):
-    import questionnaire as q
-    section = meta["section"]
-    allowed = set(meta["fields"]) | {"home safety notes"}
-    state = {"transcript": [], "skipped": [], "finished": False, "closed": False}
-
-    @function_tool
-    async def save_answer(field: str, value: str) -> str:
-        """Save one answer. Args: field: the field name exactly as listed. value: the answer."""
-        field = field.strip().lower()
-        if field not in allowed:
-            return f"Unknown field '{field}'. Use one of: {sorted(allowed)}"
-        try:
-            fields, msg = q.normalise_answer(section, field, value)
-        except ValueError as e:
-            return f"Not saved: {e}"
-        try:
-            await asyncio.to_thread(q.save_fields, section, meta["record_id"],
-                                    meta["participant_bubble_id"], fields,
-                                    field == "home safety notes")
-        except Exception:
-            logger.exception("save_answer failed for %s", field)
-            return "Could not save that one. Carry on, it will be asked again another time."
-        if field in state["skipped"]:
-            state["skipped"].remove(field)
-        return msg
-
-    @function_tool
-    async def skip_question(field: str, reason: str) -> str:
-        """Skip a question the carer can't answer. Args: field: field name. reason: short reason."""
-        state["skipped"].append(field.strip().lower())
-        return "Skipped."
-
-    @function_tool
-    async def finish_call() -> str:
-        """Call after you have said your full goodbye. Saves the session and ends the call."""
-        await asyncio.to_thread(finalise_questionnaire, meta, state)
-        await _hang_up()
-        return "Ended."
-
-    return [save_answer, skip_question, finish_call], state
-
-
-QUESTIONNAIRE_MAX_SECONDS = 15 * 60
-QUESTIONNAIRE_WRAP_SECONDS = 13 * 60
-
-
-def questionnaire_instructions(d: dict) -> str:
-    import questionnaire as q
-    section = d["section"]
-    p = d["participant_name"]
-    pr = d.get("pronouns") or {"subj": "they", "obj": "them", "poss": "their"}
-    lines = []
-    for key in d["fields"]:
-        f = q.field_def(section, key)
-        if not f:
-            continue
-        if f["kind"] == "list":
-            extra = f" [list; options: {', '.join(q.OPTIONS[f['options']])}]"
-        elif f["kind"] == "answer":
-            extra = " [Yes / No / Unknown]"
-        elif f["kind"] == "safety":
-            extra = " [Safe / Unsafe / N/A]"
-        else:
-            extra = " [free text]"
-        sens = " (sensitive)" if f["sensitive"] else ""
-        lines.append(f"- field \"{key}\": {f['question']}{extra}{sens}")
-    questions = "\n".join(lines)
-    home = section == "Home Safety"
-    who = ("These are about the home itself, so the carer can answer from what they can see. "
-           if home else
-           f"The carer is with {p} right now. Ask the carer to ask {p} each question, or answer "
-           f"from what they already know, then tell you. ")
-    return f"""
-You are Klarra from Knightingale, calling {d['carer_name']}, a carer who is on shift with {p}.
-Voice: you are English, from London. Always speak with a natural British (Southern English, RP) accent and British vocabulary and phrasing ("lovely", "brilliant", "cheers", "no worries at all"). Never use an American accent. Warm, clear and efficient.
-Refer to {p} as {pr['subj']}/{pr['obj']}/{pr['poss']}.
-Never go quiet: after every answer and every tool call, immediately carry on speaking (acknowledge briefly, then ask the next question). You texted {d['carer_name']} yesterday to say you'd call now.
-Purpose: fill in missing {section} information for {p}. {who}
-
-Flow:
-1. Open: "Hi {d['carer_name']}, it's Klarra from Knightingale, as promised. Is now still OK for a few quick questions about {p}? It'll take no more than about 15 minutes."
-   If now is not OK, say a friendly goodbye and call finish_call.
-2. Ask the questions below, one at a time, in order. Keep each question short and natural.
-3. After each answer, call save_answer with the field name exactly as written below and the answer.
-   - Free text: a short clear summary of what they said. Use "None" if there is nothing (e.g. no allergies).
-   - Yes / No / Unknown and Safe / Unsafe / N/A: pass exactly one of those words.
-   - List fields: ask openly first; if they're unsure, mention 3 or 4 common options. Pass a comma separated list using the option names where they fit, and their own words for anything else. Pass "None" if none apply.
-   - If something is Unsafe, ask briefly what the problem is, then also call save_answer for "home safety notes" with a one line note (e.g. "Stairs: loose railing on back steps").
-   - If they don't know, call skip_question with the field and a short reason, and move on. Never guess or invent an answer.
-4. Sensitive topics (marked sensitive): tell the carer they can answer from their own knowledge, or step away first, rather than asking out loud if that would be uncomfortable.
-5. Never give medical advice. If they raise a safety concern or incident, thank them, note it in the closest free text answer, and suggest they also record it in a progress note.
-6. When all questions are done, or you're told time is up: thank them, say anything left will be picked up on another shift, give a full warm goodbye out loud, THEN call finish_call.
-Always say your full line before any tool call. Never cut yourself off.
-
-Questions:
-{questions}
-""".strip()
-
-
 async def entrypoint(ctx: JobContext):
     await ctx.connect()
     meta = json.loads(ctx.job.metadata or "{}")
@@ -290,12 +143,6 @@ async def entrypoint(ctx: JobContext):
         )
     except api.TwirpError:
         logger.warning("Call to %s not answered/failed", phone)
-        if kind == "questionnaire":
-            import questionnaire as q
-            sess = q.get_session(meta["session_id"])
-            if sess:
-                q.update_session(sess, status="No Answer")
-            return
         if kind == "nurse":
             db.record_call_event(meta["nurse_id"], "no_answer",
                                  facility_id=meta.get("facility_id"),
@@ -339,12 +186,7 @@ async def entrypoint(ctx: JobContext):
         return "Ended."
 
     tools = []  # facility + intro: Klarra never hangs up, the caller does
-    q_state = None
-    if kind == "questionnaire":
-        tools, q_state = build_questionnaire_tools(meta)
-        instructions = questionnaire_instructions(meta)
-        greet = f"Greet {meta['carer_name']} and check now is still OK."
-    elif kind == "nurse":
+    if kind == "nurse":
         tools = [record_result, hang_up]
         instructions = nurse_instructions(meta)
         greet = f"Greet {meta['nurse_name']} and offer the shift."
@@ -355,14 +197,10 @@ async def entrypoint(ctx: JobContext):
         instructions = facility_instructions(meta)
         greet = "Greet the facility and give them the update."
 
-    voice, speed = "shimmer", 1.25
-    if kind == "questionnaire":
-        voice = os.environ.get("QUESTIONNAIRE_VOICE", "marin")
-        speed = float(os.environ.get("QUESTIONNAIRE_SPEED", "1.1"))
     if TurnDetection is not None:
         rt = openai.realtime.RealtimeModel(
-            voice=voice,
-            speed=speed,
+            voice="shimmer",
+            speed=1.25,
             turn_detection=TurnDetection(
                 type="semantic_vad",
                 eagerness="medium",
@@ -371,60 +209,8 @@ async def entrypoint(ctx: JobContext):
             ),
         )
     else:
-        rt = openai.realtime.RealtimeModel(voice=voice, speed=speed)
-    if kind == "questionnaire":
-        # "away" fires after 3s with nobody (carer or Klarra) speaking.
-        session = AgentSession(llm=rt, user_away_timeout=3.0)
-    else:
-        session = AgentSession(llm=rt)
-
-    if q_state is not None:
-        @session.on("conversation_item_added")
-        def _on_item(ev):
-            try:
-                item = ev.item
-                text = getattr(item, "text_content", None)
-                if text:
-                    who = "Klarra" if item.role == "assistant" else "Carer"
-                    q_state["transcript"].append(f"{who}: {text}")
-            except Exception:
-                pass
-
-        @session.on("user_state_changed")
-        def _on_user_state(ev):
-            if ev.new_state == "speaking":
-                q_state["nudged"] = False
-            elif (ev.new_state == "away" and not q_state["finished"]
-                  and not q_state.get("nudged")):
-                q_state["nudged"] = True  # once per silence, until the carer speaks again
-                asyncio.create_task(session.generate_reply(instructions=(
-                    "Nobody has spoken for 3 seconds. Carry on now: if you were waiting on an "
-                    "answer they may still be finding out, say a short 'no rush, take your time'; "
-                    "otherwise acknowledge their last answer and ask the next question, or repeat "
-                    "the last question if it wasn't answered.")))
-
-        def _q_disconnect(participant):
-            if participant.identity == "callee":
-                asyncio.create_task(asyncio.to_thread(finalise_questionnaire, meta, q_state))
-        ctx.room.on("participant_disconnected", _q_disconnect)
-
-        async def _timer():
-            await asyncio.sleep(QUESTIONNAIRE_WRAP_SECONDS)
-            if not q_state["finished"]:
-                await session.generate_reply(instructions=(
-                    "Time is nearly up. Finish the current question, then thank them, say the "
-                    "rest will be picked up on another shift, give a full goodbye, then call finish_call."))
-            await asyncio.sleep(QUESTIONNAIRE_MAX_SECONDS - QUESTIONNAIRE_WRAP_SECONDS)
-            if not q_state["finished"]:
-                await asyncio.to_thread(finalise_questionnaire, meta, q_state)
-                await _hang_up()
-        asyncio.create_task(_timer())
-
-        import questionnaire as q
-        sess = await asyncio.to_thread(q.get_session, meta["session_id"])
-        if sess:
-            await asyncio.to_thread(q.update_session, sess, status="In Progress")
-
+        rt = openai.realtime.RealtimeModel(voice="shimmer", speed=1.25)
+    session = AgentSession(llm=rt)
     await session.start(agent=Agent(instructions=instructions, tools=tools), room=ctx.room)
     await session.generate_reply(instructions=greet)
 

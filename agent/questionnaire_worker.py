@@ -1,32 +1,33 @@
 """
-Questionnaire worker (Railway service, always on).
+Questionnaire worker (Railway service, always on). Everything happens by SMS.
 
 Every minute:
   1. Heads-up (5pm-9pm Melbourne, every 15 min, idempotent):
      for each NDIS participant with a shift tomorrow (first one starting 7am-7pm) and
      empty questionnaire fields, create a Questionnaire Session for that shift and text
-     the carer a heads-up naming what's missing and when Klarra will call.
-  2. Calls: for each Scheduled session whose call time has passed, check the shift is
-     still on and the carer has checked in (Bubble "check in time" set), then dispatch
-     the outbound agent (kind="questionnaire"). Not checked in: retry every 5 min until
-     90 min after shift start, then mark Failed.
+     the carer a heads-up naming what's missing and when Klarra will text.
+  2. Start: for each Scheduled session whose time has passed, check the shift is still on
+     and the carer has checked in (Bubble "check in time" set), then text the first
+     question (questionnaire_sms.start). Not checked in: retry every 5 min until 90 min
+     after shift start, then mark Failed.
+  3. Timeouts: remind once after 45 min of silence, close after 90 min.
+
+The carer's replies come in through sms_webhook.py, which hands them to
+questionnaire_sms.handle_inbound.
 
 Env:
   QUESTIONNAIRE_ONLY_PARTICIPANT  optional Bubble user id: restrict to one participant (testing)
-  QUESTIONNAIRE_TEST_NOW=1        on start, schedule a test call in 2 minutes (and skip the 5pm heads-up run)
+  QUESTIONNAIRE_TEST_NOW=1        on start, schedule a test in 2 minutes (and skip the 5pm heads-up run)
   QUESTIONNAIRE_TEST_SHIFT        Bubble shift id to test with (else ONLY's next shift)
   QUESTIONNAIRE_SKIP_CHECKIN=1    don't wait for the carer's check in (testing)
-  OUTBOUND_AGENT_NAME             which outbound agent to dispatch (default knightingale-outbound)
   QUESTIONNAIRE_BUBBLE_BASE       Bubble Data API base (dev: https://knightingale.com.au/version-test/api/1.1/obj)
-  plus the usual BUBBLE_API_TOKEN, SUPABASE_*, TWILIO_*, LIVEKIT_*, KLARRA_MODE.
+  plus the usual BUBBLE_API_TOKEN, SUPABASE_*, TWILIO_*, ANTHROPIC_API_KEY, KLARRA_MODE.
 
 Run:  python agent/questionnaire_worker.py
 """
 
 import os
-import json
 import time
-import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -34,19 +35,18 @@ import certifi
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 
 from dotenv import load_dotenv
-from livekit import api
 
 load_dotenv()
 
 import db
 import questionnaire as q
+import questionnaire_sms as qs
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("questionnaire-worker")
 for noisy in ("hpack", "httpx", "httpcore", "h2"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
-AGENT_NAME = os.environ.get("OUTBOUND_AGENT_NAME", "knightingale-outbound")
 TEST_NOW = os.environ.get("QUESTIONNAIRE_TEST_NOW") == "1"
 SKIP_CHECKIN = os.environ.get("QUESTIONNAIRE_SKIP_CHECKIN") == "1"
 ONLY = os.environ.get("QUESTIONNAIRE_ONLY_PARTICIPANT", "").strip() or None
@@ -54,7 +54,7 @@ TEST_SHIFT = os.environ.get("QUESTIONNAIRE_TEST_SHIFT", "").strip() or None
 
 HEADS_UP_START, HEADS_UP_END = 17, 21      # Melbourne hours
 EARLIEST_START, LATEST_START = 7, 19        # only shifts starting in this window
-CALL_OFFSET = timedelta(minutes=30)
+START_OFFSET = timedelta(minutes=30)
 CHECKIN_GRACE = timedelta(minutes=90)
 
 
@@ -95,8 +95,8 @@ def session_exists_for_shift(shift_bid: str) -> bool:
     return bool(r.data)
 
 
-def schedule_one(participant_bid: str, shift: dict, call_at: datetime | None = None,
-                 when: str = "tmrw", force: bool = False) -> None:
+def schedule_one(participant_bid: str, shift: dict, start_at: datetime | None = None,
+                 when: str = "tomorrow", force: bool = False) -> None:
     if not force and session_exists_for_shift(shift["_id"]):
         logger.info("Session already exists for shift %s", shift["_id"])
         return
@@ -110,7 +110,7 @@ def schedule_one(participant_bid: str, shift: dict, call_at: datetime | None = N
     if not phone:
         logger.warning("Carer %s has no phone, skipping", shift["carer"])
         return
-    call_at = call_at or (q.shift_start(shift) + CALL_OFFSET)
+    start_at = start_at or (q.shift_start(shift) + START_OFFSET)
     p_name = q.first_name(participant)
     pr = q.pronouns(participant)
     now = datetime.now(timezone.utc).isoformat()
@@ -118,22 +118,22 @@ def schedule_one(participant_bid: str, shift: dict, call_at: datetime | None = N
     bubble_id = q.bubble_create("questionnairesession", {
         "participant": participant_bid, "carer": shift["carer"], "shift": shift["_id"],
         "section": section, "status": "Scheduled",
-        "scheduled call": call_at.isoformat(), "heads up sent": now,
+        "scheduled call": start_at.isoformat(), "heads up sent": now,
     })
     db.get_client().table("questionnaire_sessions").insert({
         "bubble_id": bubble_id, "participant_bubble_id": participant_bid,
         "carer_bubble_id": shift["carer"], "carer_phone": phone, "section": section,
         "status": "Scheduled", "shift_bubble_id": shift["_id"],
-        "scheduled_call": call_at.isoformat(), "heads_up_sent": now,
+        "scheduled_call": start_at.isoformat(), "heads_up_sent": now,
     }).execute()
 
-    topics = q.topics_phrase(section, askable).replace("their ", "")
-    body = (f"Hey {q.first_name(carer)}, Klarra from Knightingale here. Noticed we've got no "
-            f"info on {p_name}'s {topics}. I'll give you a buzz {when} at "
-            f"{q.pretty_time(call_at)} when you're with {pr['obj']} so you can ask {pr['obj']} "
-            f"for me. Chat then!")
+    topics = q.topics_phrase(section, askable).replace("their ", f"{pr['poss']} ")
+    body = (f"Hi {q.first_name(carer)}, it's Klarra from Knightingale. I noticed we don't have "
+            f"any information for {p_name} on {topics}. I'll text you {when} at "
+            f"{q.pretty_time(start_at)} when you're with {pr['obj']}, so you can ask "
+            f"{pr['obj']} a few quick questions for me. Thanks!")
     db.send_sms(phone, body)
-    logger.info("Heads-up sent: %s / %s / %s at %s", p_name, section, phone, call_at)
+    logger.info("Heads-up sent: %s / %s / %s at %s", p_name, section, phone, start_at)
 
 
 def run_heads_up() -> None:
@@ -146,7 +146,7 @@ def run_heads_up() -> None:
             logger.exception("Heads-up failed for participant %s", pbid)
 
 
-# ---------- 2. calls ----------
+# ---------- 2. start ----------
 
 def due_sessions() -> list[dict]:
     now = datetime.now(timezone.utc).isoformat()
@@ -155,18 +155,7 @@ def due_sessions() -> list[dict]:
     return r.data or []
 
 
-def call_number(phone: str) -> str | None:
-    """Same contact rules as SMS: dev redirects to the dev phone, mid only reaches testers."""
-    phone = db.normalise_phone(phone)
-    if db.DEV and phone not in db.dev_testers():
-        return os.environ.get("KLARRA_DEV_PHONE")
-    if db.MID and phone not in db.dev_testers():
-        logger.warning("[MID] blocked questionnaire call to %s", phone)
-        return None
-    return phone
-
-
-async def start_call(lk: api.LiveKitAPI, session: dict) -> None:
+def start_session(session: dict) -> None:
     shift = q.bubble_get_by_id("shift", session["shift_bubble_id"])
     if not shift or _cancelled(shift):
         q.update_session(session, status="Failed", skipped_fields="shift cancelled")
@@ -181,41 +170,21 @@ async def start_call(lk: api.LiveKitAPI, session: dict) -> None:
                 {"scheduled_call": nxt.isoformat()}).eq("id", session["id"]).execute()
         return
 
-    # Carer may have changed since the heads-up: call whoever is on the shift now.
+    # Carer may have changed since the heads-up: text whoever is on the shift now.
     carer_bid = shift.get("carer") or session["carer_bubble_id"]
     carer = q.bubble_user(carer_bid)
     participant = q.bubble_user(session["participant_bubble_id"])
-    phone = call_number(carer.get("phone number") or session.get("carer_phone"))
+    phone = qs.effective_number(carer.get("phone number") or session.get("carer_phone"))
     if not phone:
-        q.update_session(session, status="Failed", skipped_fields="call blocked by KLARRA_MODE")
+        q.update_session(session, status="Failed", skipped_fields="blocked by KLARRA_MODE")
         return
-
-    section = session["section"]
-    record = q.get_or_create_record(section, session["participant_bubble_id"])
-    skipped = q.recently_skipped(session["participant_bubble_id"], section)
-    fields = [k for k in q.missing_fields(section, record) if k not in skipped]
-    if not fields:
-        q.update_session(session, status="Completed",
-                         completed=datetime.now(timezone.utc).isoformat())
-        return
-
-    meta = {
-        "kind": "questionnaire", "phone": phone, "session_id": session["id"],
-        "section": section, "fields": fields, "record_id": record["_id"],
-        "participant_bubble_id": session["participant_bubble_id"],
-        "participant_name": q.first_name(participant), "carer_name": q.first_name(carer),
-        "pronouns": q.pronouns(participant),
-    }
-    room = f"questionnaire-{session['id'][:8]}-{int(time.time())}"
-    q.update_session(session, status="Calling", carer_bubble_id=carer_bid,
-                     started=datetime.now(timezone.utc).isoformat())
-    await lk.agent_dispatch.create_dispatch(api.CreateAgentDispatchRequest(
-        agent_name=AGENT_NAME, room=room, metadata=json.dumps(meta)))
-    logger.info("Dispatched questionnaire call %s (%s, %d fields)", room, section, len(fields))
+    if carer_bid != session["carer_bubble_id"]:
+        q.update_session(session, carer_bubble_id=carer_bid)
+    qs.start(session, carer, participant, phone)
 
 
 def schedule_test_now() -> None:
-    """Testing: schedule TEST_SHIFT (or ONLY's next shift) with a call in 2 minutes."""
+    """Testing: schedule TEST_SHIFT (or ONLY's next shift) to start in 2 minutes."""
     global ONLY
     if TEST_SHIFT:
         shift = q.bubble_get_by_id("shift", TEST_SHIFT)
@@ -223,33 +192,36 @@ def schedule_test_now() -> None:
             logger.warning("Test shift %s not found, or has no participant/carer", TEST_SHIFT)
             return
         ONLY = shift["participant"]
-        logger.info("Test shift %s, participant %s", TEST_SHIFT, ONLY)
-        # force: every restart in test mode runs a fresh test call
-        schedule_one(ONLY, shift, call_at=q.melb_now() + timedelta(minutes=2), when="2day",
-                     force=True)
-        return
-    if not ONLY:
-        logger.warning("QUESTIONNAIRE_TEST_NOW needs QUESTIONNAIRE_ONLY_PARTICIPANT")
-        return
-    today = q.melb_now().date()
-    lo = datetime(today.year, today.month, today.day, tzinfo=q.MELB) - timedelta(minutes=1)
-    shifts = [s for s in q.bubble_get("shift", [
-        {"key": "participant", "constraint_type": "equals", "value": ONLY},
-        {"key": "date", "constraint_type": "greater than", "value": lo.isoformat()},
-    ]) if not _cancelled(s) and s.get("carer") and q.shift_start(s)]
-    if not shifts:
-        logger.warning("Test: no upcoming shift for participant %s", ONLY)
-        return
-    shift = min(shifts, key=q.shift_start)
-    call_at = q.melb_now() + timedelta(minutes=2)
-    schedule_one(ONLY, shift, call_at=call_at, when="2day")
+    else:
+        if not ONLY:
+            logger.warning("QUESTIONNAIRE_TEST_NOW needs QUESTIONNAIRE_TEST_SHIFT or ONLY_PARTICIPANT")
+            return
+        today = q.melb_now().date()
+        lo = datetime(today.year, today.month, today.day, tzinfo=q.MELB) - timedelta(minutes=1)
+        shifts = [s for s in q.bubble_get("shift", [
+            {"key": "participant", "constraint_type": "equals", "value": ONLY},
+            {"key": "date", "constraint_type": "greater than", "value": lo.isoformat()},
+        ]) if not _cancelled(s) and s.get("carer") and q.shift_start(s)]
+        if not shifts:
+            logger.warning("Test: no upcoming shift for participant %s", ONLY)
+            return
+        shift = min(shifts, key=q.shift_start)
+    # Close any earlier test session still open, then start fresh every restart.
+    old = (db.get_client().table("questionnaire_sessions").select("id")
+           .eq("shift_bubble_id", shift["_id"]).in_("status", ["Scheduled", "In Progress"])
+           .execute())
+    for row in old.data or []:
+        db.get_client().table("questionnaire_sessions").update(
+            {"status": "Failed", "skipped_fields": "replaced by new test"}).eq("id", row["id"]).execute()
+    logger.info("Test shift %s, participant %s", shift["_id"], ONLY)
+    schedule_one(ONLY, shift, start_at=q.melb_now() + timedelta(minutes=2), when="today",
+                 force=True)
 
 
-async def main():
-    lk = api.LiveKitAPI()
+def main():
     last_heads_up = 0.0
-    logger.info("Questionnaire worker started (KLARRA_MODE=%s, only=%s, agent=%s)",
-                db.KLARRA_MODE, ONLY, AGENT_NAME)
+    logger.info("Questionnaire worker started (KLARRA_MODE=%s, only=%s, bubble=%s)",
+                db.KLARRA_MODE, ONLY, q.BUBBLE_BASE)
     if TEST_NOW:
         try:
             schedule_test_now()
@@ -264,13 +236,14 @@ async def main():
                 last_heads_up = time.time()
             for s in due_sessions():
                 try:
-                    await start_call(lk, s)
+                    start_session(s)
                 except Exception:
-                    logger.exception("Call start failed for session %s", s["id"])
+                    logger.exception("Start failed for session %s", s["id"])
+            qs.check_timeouts()
         except Exception:
             logger.exception("Worker loop error")
-        await asyncio.sleep(60)
+        time.sleep(60)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

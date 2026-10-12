@@ -58,6 +58,7 @@ import requests
 
 import db
 import admin_agent
+import questionnaire_sms
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -653,6 +654,15 @@ def sms():
     from_number = request.form.get("From")
     body = request.form.get("Body", "")
     logger.info("SMS from %s: %s", from_number, body)
+
+    # A carer mid-way through a participant questionnaire: their reply is an answer.
+    # Inert unless this number has a questionnaire In Progress.
+    try:
+        q_reply = questionnaire_sms.handle_inbound(from_number, body)
+        if q_reply:
+            return twiml_reply(q_reply)
+    except Exception:
+        logger.exception("Questionnaire SMS handling failed, continuing normal routing")
 
     # Courtesy: a bare thank-you gets a friendly reply, no shift parsing.
     if body.strip().lower().strip("!.") in ("thanks", "thank you", "ta", "cheers", "thankyou"):
