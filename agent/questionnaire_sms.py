@@ -91,7 +91,30 @@ def _template_question(section: str, key: str, p: str, gate: bool = False) -> st
 
 
 def _bullets(items: list[str]) -> str:
-    return "\n".join(f"\u2022 {i}" for i in items)
+    return "\n".join(f"\u2022 {'No, none' if i == 'None' else i}" for i in items)
+
+
+# Fixed wording for list questions. {p} name, {subj_is} "she's"/"he's"/"they're".
+LIST_TEMPLATES = {
+    "physical health": "Does {p} have any of the physical health conditions listed below? Please reply with the names of the conditions:",
+    "mental health": "Does {p} have any of the mental health conditions listed below? Please reply with the names of the conditions:",
+    "personal care": "Does {p} need help with any of the personal care tasks listed below? Please reply with the names of the tasks:",
+    "nutrition": "Do you believe any of the eating or drinking concerns listed below apply to {p}? Please reply with the names of the concerns:",
+    "accidental movement": "Does {p} have any of the accidental movements listed below? Please reply with the names of the movements:",
+    "manual handling": "Does {p} need any of the manual handling assistance listed below? Please reply with the names of the types of assistance:",
+    "environmental": "Do you believe any of the hazards listed below pose a threat to {p}'s safety when {subj_is} at home? Please reply with the names of the hazards:",
+    "financial risks": "Do you believe any of the financial risks listed below apply to {p}? Please reply with the names of the risks:",
+    "social risks": "Do you believe any of the social risks listed below pose a threat to {p}'s safety? Please reply with the names of the risks:",
+    "substance use": "Does {p} use any of the substances listed below? Please reply with the names of the substances:",
+}
+
+
+def _list_question(key: str, f: dict, state: dict) -> str:
+    pr = state["pronouns"]
+    subj_is = {"he": "he's", "she": "she's"}.get(pr["subj"], "they're")
+    tpl = LIST_TEMPLATES.get(key) or f"{f['question']} Please reply with the names:"
+    return (tpl.format(p=state["participant_name"], subj_is=subj_is) + "\n"
+            + _bullets(q.OPTIONS[f["options"]]))
 
 
 def compose_question(section: str, key: str, state: dict, gate: bool = False) -> str:
@@ -99,6 +122,8 @@ def compose_question(section: str, key: str, state: dict, gate: bool = False) ->
     List questions get their options as dot points underneath."""
     p, pr = state["participant_name"], state["pronouns"]
     f = q.field_def(section, key)
+    if not gate and f["kind"] == "list":
+        return _list_question(key, f, state)
     question = _template_question(section, key, p, gate)
     try:
         msg = _claude().messages.create(
@@ -115,19 +140,22 @@ def compose_question(section: str, key: str, state: dict, gate: bool = False) ->
         question = msg.content[0].text.strip().replace("\u2014", ", ") or question
     except Exception:
         logger.exception("Compose failed, using template")
-    if not gate and f["kind"] == "list":
-        question += "\nThe options are:\n" + _bullets(q.OPTIONS[f["options"]])
     return question
 
 
 def ask(section: str, state: dict) -> str:
-    """Wording for the current field: its yes/no gate first if it has one."""
+    """Wording for the current field: its yes/no gate first if it has one.
+    New questions get a "Question N:" header; a gate's follow-up doesn't."""
     key = state["fields"][state["pos"]]
+    follow_up = state.get("phase") == "main" and key in state["asked"]
     gate = bool(q.field_def(section, key).get("gate")) and state.get("phase") != "main"
     state["phase"] = "gate" if gate else "main"
     if key not in state["asked"]:
         state["asked"].append(key)
-    return compose_question(section, key, state, gate=gate)
+    text = compose_question(section, key, state, gate=gate)
+    if follow_up:
+        return text
+    return f"Question {state['asked'].index(key) + 1}:\n{text}"
 
 
 def parse_gate(body: str, gate_q: str, p: str) -> dict:
@@ -196,9 +224,9 @@ def start(session: dict, carer: dict, participant: dict, phone: str) -> None:
     }
     p, c, pr = state["participant_name"], state["carer_name"], state["pronouns"]
     first = ask(section, state)
-    body = (f"Hi {c}, as promised here are a few quick questions about {p}. Please ask "
-            f"{pr['obj']} and reply here. If you don't know an answer, just reply with anything "
-            f"and I'll move on.\n\n{first}")
+    body = (f"Hi {c}, as promised here are a few quick questions about {p}. Please complete "
+            f"the questionnaire together. If you don't know an answer, just say \"I don't "
+            f"know\" and I'll move on.\n\n{first}")
     state["transcript"].append(f"Klarra: {body}")
     # Save first, then text: if saving fails nothing is sent (no repeat texts on retry).
     _save_state(session, state, carer_phone=phone, started=_now().isoformat())
@@ -335,7 +363,7 @@ def _handle(session: dict, state: dict, body: str) -> str:
         elif answer == "yes" and not stop:
             # Yes, but no details yet: ask the follow-up for the same field.
             state["phase"] = "main"
-            reply = f"Thanks! {ask(section, state)}"
+            reply = f"Thanks! {ask(section, state)}"  # gate follow-up, same question
             state["transcript"].append(f"Klarra: {reply}")
             _save_state(session, state)
             return reply
@@ -369,7 +397,7 @@ def _handle(session: dict, state: dict, body: str) -> str:
         state["transcript"].append(f"Klarra: {reply}")
         return finish(session, state, reply)
 
-    reply = f"Thanks! {ask(section, state)}"
+    reply = f"Thanks!\n\n{ask(section, state)}"
     state["transcript"].append(f"Klarra: {reply}")
     _save_state(session, state)
     return reply
