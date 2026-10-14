@@ -152,7 +152,7 @@ def create_plans(section: str, participant_bid: str, participant_name: str) -> i
         return 0
     ratings = rate(section, new, participant_name, record.get("home safety notes") or "")
     review = (datetime.now(timezone.utc) + timedelta(days=365)).isoformat()
-    made = 0
+    made, ids = 0, []
     for base, rt in zip(new, ratings):
         risk = f"{base}: {rt['detail']}" if rt["detail"] else base
         try:
@@ -161,7 +161,7 @@ def create_plans(section: str, participant_bid: str, participant_name: str) -> i
             logger.exception("Treatment API failed for %s", risk)
             text = ""
         try:
-            q.bubble_create(PLAN_TYPE, {
+            plan_id = q.bubble_create(PLAN_TYPE, {
                 "participant": participant_bid,
                 "risk": risk,
                 "treatment": text,
@@ -170,11 +170,25 @@ def create_plans(section: str, participant_bid: str, participant_name: str) -> i
                 "review date": review,
                 "person responsible": "Paul",
             })
+            ids.append(plan_id)
             made += 1
         except Exception:
             logger.exception("Could not create Risk Management Plan for %s", risk)
+    if ids:
+        link_to_assessment(participant_bid, ids)
     logger.info("Created %d risk plans for %s (%s)", made, participant_name, section)
     return made
+
+
+def link_to_assessment(participant_bid: str, plan_ids: list[str]) -> None:
+    """Add the new plans to the participant's Risk Assessment "risk management plan" list."""
+    try:
+        ra = q.get_or_create_record("Risk Assessment", participant_bid)
+        current = ra.get("risk management plan") or []
+        q.bubble_patch("riskassessment", ra["_id"],
+                       {"risk management plan": list(dict.fromkeys(current + plan_ids))})
+    except Exception:
+        logger.exception("Could not link risk plans to Risk Assessment for %s", participant_bid)
 
 
 def process_pending() -> None:
