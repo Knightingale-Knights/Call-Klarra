@@ -477,6 +477,8 @@ def normalise_answer(section: str, key: str, value: str) -> tuple[dict, str]:
     opts = OPTIONS[f["options"]]
     matched, extra = [], []
     for part in [p for p in value.replace(";", ",").split(",") if p.strip()]:
+        if part.strip().lower() in ("no", "nil", "nothing", "no none", "none of them"):
+            part = "None"
         m = _match_option(part, opts)
         if m and m not in matched:
             matched.append(m)
