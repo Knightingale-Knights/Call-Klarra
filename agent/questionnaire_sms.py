@@ -308,7 +308,12 @@ def _save(session: dict, state: dict, key: str, value: str, note: str = "") -> b
         fields, _ = q.normalise_answer(section, key, value)
     except ValueError:
         return False
-    q.save_fields(section, state["record_id"], session["participant_bubble_id"], fields)
+    try:
+        q.save_fields(section, state["record_id"], session["participant_bubble_id"], fields)
+    except Exception:
+        # Never drop the carer out of the questionnaire over a save error: flag and move on.
+        logger.exception("Save failed for %s / %s", section, key)
+        return False
     if str(fields.get(key)).strip().lower() in ("none", "['none']"):
         state.setdefault("none_fields", []).append(key)
     if note and section == "Home Safety":
