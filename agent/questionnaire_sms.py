@@ -102,7 +102,7 @@ LIST_TEMPLATES = {
     "nutrition": "Do you believe any of the eating or drinking concerns listed below apply to {p}? Please reply with the names of the concerns:",
     "accidental movement": "Does {p} have any of the accidental movements listed below? Please reply with the names of the movements:",
     "manual handling": "Does {p} need any of the manual handling assistance listed below? Please reply with the names of the types of assistance:",
-    "environmental": "Do you believe any of the hazards listed below pose a threat to {p}'s safety when {subj_is} at home? Please reply with the names of the hazards:",
+    "environmental risks": "Do you believe any of the hazards listed below pose a threat to {p}'s safety when {subj_is} at home? Please reply with the names of the hazards:",
     "financial risks": "Do you believe any of the financial risks listed below apply to {p}? Please reply with the names of the risks:",
     "social risks": "Do you believe any of the social risks listed below pose a threat to {p}'s safety? Please reply with the names of the risks:",
     "substance use": "Does {p} use any of the substances listed below? Please reply with the names of the substances:",

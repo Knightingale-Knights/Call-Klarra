@@ -173,7 +173,7 @@ SECTIONS = {
               "Accidental Movement"),
             F("manual handling", "list", "manual handling",
               "What manual handling assistance do they need?", "Manual Handling"),
-            F("environmental", "list", "environmental risks",
+            F("environmental risks", "list", "environmental risks",
               "Are there any environmental hazards or risks, like wandering off, fire, traffic or sharps?",
               "Environmental"),
             F("financial risks", "list", "financial risks",
@@ -273,9 +273,16 @@ def _headers():
     return {"Authorization": f"Bearer {os.environ['BUBBLE_API_TOKEN']}"}
 
 
+# Bubble field names that differ from the Supabase column names.
+COLUMN_OVERRIDES = {
+    "environmental risks": "environmental",
+    "environmental risks other": "environmental_other",
+}
+
+
 def col(key: str) -> str:
     """Bubble field name -> Supabase column name."""
-    return key.replace(" ", "_")
+    return COLUMN_OVERRIDES.get(key, key.replace(" ", "_"))
 
 
 def field_def(section: str, key: str) -> dict | None:
