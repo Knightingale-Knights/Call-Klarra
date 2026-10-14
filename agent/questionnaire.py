@@ -388,9 +388,14 @@ def get_or_create_record(section: str, participant_bid: str) -> dict:
         return rec
     s = SECTIONS[section]
     new_id = bubble_create(s["type"], {"participant": participant_bid})
-    try:  # link it from the participant's User record (best effort)
-        bubble_patch("user", participant_bid, {s["user_field"]: new_id})
-    except Exception:
+    # Link it from the participant's User record (best effort; field may use _ or spaces).
+    for name in (s["user_field"], s["user_field"].replace("_", " ")):
+        try:
+            bubble_patch("user", participant_bid, {name: new_id})
+            break
+        except Exception:
+            continue
+    else:
         logger.warning("Could not set User.%s for %s", s["user_field"], participant_bid)
     return {"_id": new_id, "participant": participant_bid}
 
