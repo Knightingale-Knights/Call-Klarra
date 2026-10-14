@@ -109,12 +109,25 @@ LIST_TEMPLATES = {
 }
 
 
+MAX_OPTIONS_PER_TEXT = 12
+
+
+def list_parts(f: dict) -> list[list[str]]:
+    """Long option lists are split into texts of up to 12 options (plus "No, none")."""
+    opts = [o for o in q.OPTIONS[f["options"]] if o != "None"]
+    n = max(1, -(-len(opts) // MAX_OPTIONS_PER_TEXT))
+    size = -(-len(opts) // n)
+    return [opts[i:i + size] for i in range(0, len(opts), size)]
+
+
 def _list_question(key: str, f: dict, state: dict) -> str:
     pr = state["pronouns"]
     subj_is = {"he": "he's", "she": "she's"}.get(pr["subj"], "they're")
     tpl = LIST_TEMPLATES.get(key) or f"{f['question']} Please reply with the names:"
+    parts = list_parts(f)
+    part = min(state.get("part", 0), len(parts) - 1)
     return (tpl.format(p=state["participant_name"], subj_is=subj_is) + "\n"
-            + _bullets(q.OPTIONS[f["options"]]))
+            + _bullets(["None"] + parts[part]))
 
 
 def compose_question(section: str, key: str, state: dict, gate: bool = False) -> str:
@@ -153,9 +166,14 @@ def ask(section: str, state: dict) -> str:
     if key not in state["asked"]:
         state["asked"].append(key)
     text = compose_question(section, key, state, gate=gate)
+    f = q.field_def(section, key)
+    n = state["asked"].index(key) + 1
+    if f["kind"] == "list" and len(list_parts(f)) > 1:
+        total = len(list_parts(f))
+        return f"Question {n} (part {state.get('part', 0) + 1} of {total}):\n{text}"
     if follow_up:
         return text
-    return f"Question {state['asked'].index(key) + 1}:\n{text}"
+    return f"Question {n}:\n{text}"
 
 
 def parse_gate(body: str, gate_q: str, p: str) -> dict:
@@ -172,11 +190,12 @@ Return ONLY JSON: {{"answer": "yes", "detail": "", "stop": false}}
     return json.loads(m.group(0)) if m else {"answer": "unknown"}
 
 
-def parse_reply(section: str, key: str, body: str, state: dict) -> dict:
+def parse_reply(section: str, key: str, body: str, state: dict,
+                options: list[str] | None = None) -> dict:
     """Ask Claude whether the reply answers the question, and if so, the value to save."""
     f = q.field_def(section, key)
     if f["kind"] == "list":
-        allowed = f"list; options: {', '.join(q.OPTIONS[f['options']])}"
+        allowed = f"list; options: {', '.join(options or q.OPTIONS[f['options']])}"
     elif f["kind"] == "answer":
         allowed = "Yes / No / Unknown"
     elif f["kind"] == "safety":
@@ -247,28 +266,75 @@ def finish(session: dict, state: dict, closing: str | None = None) -> str | None
         skipped_fields=",".join(sorted(set(state["unanswered"]))),
         transcript="\n".join(state["transcript"])[:50000],
     )
-    if still:
-        text_gaps(session, state, still)
+    # The worker emails Paul the gaps (one email per session), see email_pending_gaps().
+    state["gaps"] = still
+    state["gaps_emailed"] = False if still else True
+    db.get_client().table("questionnaire_sessions").update(
+        {"state": state}).eq("id", session["id"]).execute()
     return closing
 
 
-def text_gaps(session: dict, state: dict, still: list[str]) -> None:
-    admin = os.environ.get("KLARRA_DEV_PHONE")
-    if not admin:
-        return
-    flagged = [k for k in still if k in set(state["unanswered"])]
-    not_asked = [k for k in still if k not in set(state["asked"])]
+def gaps_email(session: dict, state: dict) -> tuple[str, str]:
+    """(subject, text body) listing every question left unanswered in this session."""
+    section = session["section"]
+    still = state.get("gaps") or []
+    flagged = set(state.get("unanswered") or [])
+    asked = set(state.get("asked") or [])
+    p, c = state["participant_name"], state["carer_name"]
     total = len(state["fields"])
-    lines = [f"Questionnaire gaps for {state['participant_name']} ({session['section']}) "
-             f"with {state['carer_name']}: {total - len(still)} of {total} answered."]
-    if flagged:
-        lines.append("Unanswered: " + ", ".join(flagged))
+
+    def line(k):
+        f = q.field_def(section, k)
+        return f"- {f['question'] if f else k}  [{k}]"
+
+    dont_know = [k for k in still if k in flagged]
+    no_reply = [k for k in still if k not in flagged and k in asked]
+    not_asked = [k for k in still if k not in asked]
+    out = [f"Participant: {p}", f"Section: {section}", f"Carer: {c}",
+           f"Answered: {total - len(still)} of {total}", ""]
+    if dont_know:
+        out += ["Carer didn't know / didn't answer:"] + [line(k) for k in dont_know] + [""]
+    if no_reply:
+        out += ["Carer didn't reply:"] + [line(k) for k in no_reply] + [""]
     if not_asked:
-        lines.append("Not asked yet: " + ", ".join(not_asked))
-    try:
-        db.send_sms(admin, "\n".join(lines))
-    except Exception:
-        logger.exception("Failed to text questionnaire gaps")
+        out += ["Not asked yet (session ended):"] + [line(k) for k in not_asked] + [""]
+    out.append("These will be asked again on a later shift unless you fill them in Bubble first.")
+    return f"Questionnaire follow-up: {p} ({section})", "\n".join(out)
+
+
+def send_email(subject: str, body: str) -> None:
+    """Postmark. Needs POSTMARK_SERVER_TOKEN and QUESTIONNAIRE_EMAIL_FROM (a verified sender)."""
+    import requests
+    r = requests.post(
+        "https://api.postmarkapp.com/email",
+        headers={"X-Postmark-Server-Token": os.environ["POSTMARK_SERVER_TOKEN"],
+                 "Accept": "application/json", "Content-Type": "application/json"},
+        json={"From": os.environ["QUESTIONNAIRE_EMAIL_FROM"],
+              "To": os.environ.get("QUESTIONNAIRE_EMAIL_TO", "paul@knightingale.com.au"),
+              "Subject": subject, "TextBody": body, "MessageStream": "outbound"},
+        timeout=20,
+    )
+    r.raise_for_status()
+
+
+def email_pending_gaps() -> None:
+    """Worker: one email per finished session that ended with unanswered questions."""
+    since = (_now() - timedelta(days=2)).isoformat()
+    r = (db.get_client().table("questionnaire_sessions").select("*")
+         .in_("status", ["Completed", "Partial"]).gte("completed", since).execute())
+    for session in r.data or []:
+        state = session.get("state") or {}
+        if not state or state.get("gaps_emailed") is not False:
+            continue
+        try:
+            subject, body = gaps_email(session, state)
+            send_email(subject, body)
+            state["gaps_emailed"] = True
+            db.get_client().table("questionnaire_sessions").update(
+                {"state": state}).eq("id", session["id"]).execute()
+            logger.info("Emailed gaps for session %s", session["id"])
+        except Exception:
+            logger.exception("Gaps email failed for session %s", session["id"])
 
 
 def wrap_up_text(state: dict) -> str:
@@ -374,6 +440,36 @@ def _handle(session: dict, state: dict, body: str) -> str:
             return reply
         else:
             state["unanswered"].append(key)
+    elif f["kind"] == "list" and len(list_parts(f)) > 1:
+        parts = list_parts(f)
+        part = state.get("part", 0)
+        try:
+            parsed = parse_reply(section, key, body, state, ["None"] + parts[part])
+        except Exception:
+            logger.exception("Parse failed")
+            parsed = {"answered": False}
+        stop = bool(parsed.get("stop"))
+        value = str(parsed.get("value") or "").strip()
+        if parsed.get("answered") and value:
+            picked = [v.strip() for v in value.split(",")
+                      if v.strip() and v.strip().lower() not in ("none", "no", "no, none")]
+            state.setdefault("part_values", []).extend(picked)
+        else:
+            state["part_unknown"] = True
+        if part + 1 < len(parts) and not stop:
+            # Same question, next part of the list.
+            state["part"] = part + 1
+            reply = f"Thanks!\n\n{ask(section, state)}"
+            state["transcript"].append(f"Klarra: {reply}")
+            _save_state(session, state)
+            return reply
+        values = state.pop("part_values", [])
+        unknown = state.pop("part_unknown", False)
+        state["part"] = 0
+        saved = _save(session, state, key, ", ".join(values) if values else "None") \
+            if (values or not unknown) else False
+        if unknown or not saved:
+            state["unanswered"].append(key)  # partly or not answered: flagged to Paul
     else:
         try:
             parsed = parse_reply(section, key, body, state)

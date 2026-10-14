@@ -250,6 +250,7 @@ def main():
                 except Exception:
                     logger.exception("Start failed for session %s", s["id"])
             qs.check_timeouts()
+            qs.email_pending_gaps()
             risk_plans.process_pending()
         except Exception:
             logger.exception("Worker loop error")
