@@ -52,6 +52,9 @@ def _ts(s: str) -> datetime:
 
 def effective_number(phone: str) -> str | None:
     """The number texts will actually reach, under KLARRA_MODE (same rules as db.send_sms)."""
+    redirect = os.environ.get("QUESTIONNAIRE_REDIRECT_TO", "").strip()
+    if redirect:  # testing: every questionnaire text goes to this number
+        return db.normalise_phone(redirect)
     phone = db.normalise_phone(phone)
     if db.DEV and phone not in db.dev_testers():
         return db.normalise_phone(os.environ.get("KLARRA_DEV_PHONE"))
@@ -224,34 +227,101 @@ Rules:
 
 # ---------- session flow ----------
 
-def start(session: dict, carer: dict, participant: dict, phone: str) -> None:
-    """Send the first question. Marks the session In Progress."""
+def start(session: dict, carer: dict, participant: dict, phone: str,
+          admin: bool = False, send: bool = True) -> str | None:
+    """Send the first question (or return it, send=False). Marks the session In Progress.
+    admin=True: Paul answering himself. Ignores the 14-day skip list, and anything he
+    doesn't know is left for carers (not flagged, no email)."""
     section = session["section"]
     record = q.get_or_create_record(section, session["participant_bubble_id"])
-    skipped = q.recently_skipped(session["participant_bubble_id"], section)
+    skipped = set() if admin else q.recently_skipped(session["participant_bubble_id"], section)
     fields = [k for k in q.missing_fields(section, record) if k not in skipped]
     if not fields:
         q.update_session(session, status="Completed", completed=_now().isoformat())
-        return
+        return None
     state = {
         "fields": fields, "pos": 0, "asked": [], "unanswered": [], "transcript": [],
         "record_id": record["_id"],
         "participant_name": q.first_name(participant), "carer_name": q.first_name(carer),
         "pronouns": q.pronouns(participant), "bubble_base": q.BUBBLE_BASE,
         "reminded": False, "started_at": _now().isoformat(),
-        "phase": None, "none_fields": [],
+        "phase": None, "none_fields": [], "admin": admin,
     }
     p, c, pr = state["participant_name"], state["carer_name"], state["pronouns"]
     first = ask(section, state)
-    body = (f"Hi {c}, as promised here are a few quick questions about {p}. Please complete "
-            f"the questionnaire together. If you don't know an answer, just say \"I don't "
-            f"know\" and I'll move on.\n\n{first}")
+    if admin:
+        body = (f"Here are {p}'s {section} questions. If you don't know an answer, just say "
+                f"\"I don't know\" and I'll leave it for a carer to ask on shift. Reply "
+                f"\"stop\" to finish early.\n\n{first}")
+    else:
+        body = (f"Hi {c}, as promised here are a few quick questions about {p}. Please "
+                f"complete the questionnaire together. If you don't know an answer, just say "
+                f"\"I don't know\" and I'll move on.\n\n{first}")
     state["transcript"].append(f"Klarra: {body}")
     # Save first, then text: if saving fails nothing is sent (no repeat texts on retry).
     _save_state(session, state, carer_phone=phone, started=_now().isoformat())
     q.update_session(session, status="In Progress")
-    db.send_sms(phone, body)
-    logger.info("Questionnaire SMS started: %s / %s (%d questions)", p, section, len(fields))
+    if send:
+        db.send_sms(phone, body)
+    logger.info("Questionnaire SMS started: %s / %s (%d questions, admin=%s)",
+                p, section, len(fields), admin)
+    return body
+
+
+def create_session(participant_bid: str, section: str, carer_bid: str | None,
+                   phone: str, shift_bid: str | None, start_at: datetime,
+                   status: str = "Scheduled") -> dict:
+    """Create the session in Bubble and Supabase. Returns the Supabase row."""
+    now = _now().isoformat()
+    fields = {"participant": participant_bid, "section": section, "status": status,
+              "scheduled call": start_at.isoformat()}
+    if carer_bid:
+        fields["carer"] = carer_bid
+    if shift_bid:
+        fields["shift"] = shift_bid
+    if status == "Scheduled":
+        fields["heads up sent"] = now
+    bubble_id = q.bubble_create("questionnairesession", fields)
+    row = {"bubble_id": bubble_id, "participant_bubble_id": participant_bid,
+           "carer_bubble_id": carer_bid or "admin", "carer_phone": phone,
+           "section": section, "status": status, "shift_bubble_id": shift_bid,
+           "scheduled_call": start_at.isoformat()}
+    if status == "Scheduled":
+        row["heads_up_sent"] = now
+    r = db.get_client().table("questionnaire_sessions").insert(row).execute()
+    return r.data[0]
+
+
+def schedule_for_shift(participant_bid: str, shift: dict, start_at: datetime,
+                       when: str, section: str | None = None,
+                       heads_up: bool = True) -> dict:
+    """Schedule a carer session for this shift; text the carer a heads-up if asked.
+    Returns {"section", "carer_name", "participant_name", "start_at"} or {"error"}."""
+    if section:
+        nxt = (section, q.missing_fields(section, q.get_record(section, participant_bid)))
+    else:
+        nxt = q.next_section(participant_bid)
+    if not nxt or not nxt[1]:
+        return {"error": "nothing left to ask"}
+    section, askable = nxt
+    participant = q.bubble_user(participant_bid)
+    carer = q.bubble_user(shift["carer"])
+    phone = effective_number(carer.get("phone number"))
+    if not phone:
+        return {"error": f"{q.first_name(carer)} has no phone number (or texting is blocked)"}
+    create_session(participant_bid, section, shift["carer"], phone, shift["_id"], start_at)
+    p_name, pr = q.first_name(participant), q.pronouns(participant)
+    if heads_up:
+        topics = q.topics_phrase(section, askable).replace("their ", f"{pr['poss']} ")
+        body = (f"Hi {q.first_name(carer)}, I noticed we don't have any information for "
+                f"{p_name} on {topics}. I'll text you {when} at {q.pretty_time(start_at)} "
+                f"when you're with {pr['obj']}, so you can ask {pr['obj']} a few quick "
+                f"questions for me. Thanks!")
+        db.send_sms(phone, body)
+    logger.info("Scheduled %s / %s with %s at %s (heads-up=%s)",
+                p_name, section, q.first_name(carer), start_at, heads_up)
+    return {"section": section, "carer_name": q.first_name(carer),
+            "participant_name": p_name, "start_at": start_at}
 
 
 def finish(session: dict, state: dict, closing: str | None = None) -> str | None:
@@ -259,16 +329,18 @@ def finish(session: dict, state: dict, closing: str | None = None) -> str | None
     rec = q.get_record(session["section"], session["participant_bubble_id"]) or {}
     missing = set(q.missing_fields(session["section"], rec))
     still = [k for k in state["fields"] if k in missing]
+    admin = bool(state.get("admin"))
     q.update_session(
         session,
         status="Completed" if not still else "Partial",
         completed=_now().isoformat(),
-        skipped_fields=",".join(sorted(set(state["unanswered"]))),
+        # Paul's "don't know"s stay askable for carers straight away.
+        skipped_fields="" if admin else ",".join(sorted(set(state["unanswered"]))),
         transcript="\n".join(state["transcript"])[:50000],
     )
-    # The worker emails Paul the gaps (one email per session), see email_pending_gaps().
+    # The worker emails Paul the gaps (one email per carer session), see email_pending_gaps().
     state["gaps"] = still
-    state["gaps_emailed"] = False if still else True
+    state["gaps_emailed"] = bool(admin or not still)
     db.get_client().table("questionnaire_sessions").update(
         {"state": state}).eq("id", session["id"]).execute()
     return closing
@@ -338,6 +410,9 @@ def email_pending_gaps() -> None:
 
 
 def wrap_up_text(state: dict) -> str:
+    if state.get("admin"):
+        return (f"That's 15 minutes on {state['participant_name']}, thanks Paul. Text me "
+                f"again whenever you want to keep going.")
     return (f"Thanks for all those answers. I don't want to take up a ton of your time. I'll "
             f"leave you to support {state['participant_name']} now. Will touch base on your next "
             f"few shifts to get answers to the remaining Q's. Have a good one.")
@@ -489,7 +564,9 @@ def _handle(session: dict, state: dict, body: str) -> str:
 
     _advance(session, state)
     if state["pos"] >= len(state["fields"]):
-        reply = f"That's everything, thanks so much {c}! Have a good rest of your shift with {p}."
+        reply = (f"That's all the {section} questions for {p}, thanks Paul!"
+                 if state.get("admin") else
+                 f"That's everything, thanks so much {c}! Have a good rest of your shift with {p}.")
         state["transcript"].append(f"Klarra: {reply}")
         return finish(session, state, reply)
 

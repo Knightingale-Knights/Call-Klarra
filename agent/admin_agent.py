@@ -10,6 +10,8 @@ set of tools and decides what to call, so Paul never has to follow a script:
   check_replies        who has said yes / no / nothing yet
   create_shift         create a facility shift in Bubble (and Supabase) for a named carer
   create_ndis_shift    create an NDIS shift (participant + NDIS Pricing item)
+  start_my_questionnaire     Paul answers a participant's questionnaire himself by text
+  text_carer_questionnaire   text the carer on today's shift a participant's questionnaire
   not_an_admin_request hand the message back to the normal routing
 
 Conversation memory: the last few turns are kept per phone in admin_threads for
@@ -34,6 +36,7 @@ import anthropic
 import requests
 
 import db
+import questionnaire_admin
 
 logger = logging.getLogger("knightingale-admin-agent")
 
@@ -97,6 +100,13 @@ def _system() -> str:
         "0600. Never guess them. When it succeeds, send reply_text exactly as given. "
         "DSW carers work NDIS shifts. A named site means a facility shift (5), a "
         "named participant means an NDIS shift (6).\n"
+        "7. Participant questionnaires. If Paul says he is ready to do or work on a "
+        "participant's questionnaire himself (e.g. 'I'm ready to work on John's "
+        "questionnaire, start asking me questions'), call start_my_questionnaire with "
+        "the participant's name. If he asks you to text a carer who is on shift with a "
+        "participant to do the questionnaire, call text_carer_questionnaire with the "
+        "participant's name and the carer's name if given. For both, send reply_text "
+        "exactly as given. If a tool returns an error, tell Paul plainly.\n"
         "If the message is not addressed to you as an assistant, for example a "
         "facility style request to fill a shift through the normal system such as "
         "'EN morning shift tomorrow at Port Melbourne' stated as a need rather than a "
@@ -210,6 +220,37 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {"date": {"type": "string", "description": "YYYY-MM-DD"}},
+        },
+    },
+    {
+        "name": "start_my_questionnaire",
+        "description": (
+            "Start a participant questionnaire with Paul himself: Klarra texts him the "
+            "participant's next unanswered section, one question at a time. Anything he "
+            "doesn't know is left for a carer to ask on shift."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"participant": {"type": "string",
+                                           "description": "participant's name as Paul wrote it"}},
+            "required": ["participant"],
+        },
+    },
+    {
+        "name": "text_carer_questionnaire",
+        "description": (
+            "Text the carer who is on shift with a participant TODAY to do that "
+            "participant's questionnaire: heads-up now, questions 30 minutes after the "
+            "shift starts (straight away if already past). Paul gets an email of any "
+            "questions left unanswered."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "participant": {"type": "string"},
+                "carer": {"type": "string", "description": "carer's name if Paul gave one"},
+            },
+            "required": ["participant"],
         },
     },
     {
@@ -970,7 +1011,11 @@ TOOL_FUNCS = {
     "check_replies": tool_check_replies,
     "create_shift": tool_create_shift,
     "create_ndis_shift": tool_create_ndis_shift,
+    "start_my_questionnaire": lambda **a: questionnaire_admin.start_my_questionnaire(
+        phone=_CURRENT_PHONE, **a),
+    "text_carer_questionnaire": questionnaire_admin.text_carer_questionnaire,
 }
+_CURRENT_PHONE = None  # set by run(): the admin number texting right now
 
 
 def _call(name: str, args: dict):
@@ -1025,6 +1070,8 @@ def _save_history(phone: str, messages: list) -> None:
 def run(phone: str, body: str) -> str | None:
     """Handle one text from Paul. Returns the reply text, or None if the message
     isn't for the admin agent (caller should continue normal routing)."""
+    global _CURRENT_PHONE
+    _CURRENT_PHONE = phone
     history = _load_history(phone)
     user_msg = {"role": "user", "content": body}
     messages = history + [user_msg]
@@ -1051,6 +1098,12 @@ def run(phone: str, body: str) -> str | None:
                 return None
             logger.info("Admin agent tool %s %s", block.name, block.input)
             result = _call(block.name, block.input)
+            if block.name in ("start_my_questionnaire", "text_carer_questionnaire") \
+                    and isinstance(result, dict) and result.get("reply_text"):
+                # Reply straight away (saves a model round trip inside Twilio's timeout).
+                text = result["reply_text"]
+                _save_history(phone, history + [user_msg, {"role": "assistant", "content": text}])
+                return text
             results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,

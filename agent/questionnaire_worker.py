@@ -23,6 +23,8 @@ Env:
   QUESTIONNAIRE_TEST_SHIFT        Bubble shift id to test with (else ONLY's next shift)
   QUESTIONNAIRE_SKIP_CHECKIN=1    don't wait for the carer's check in (testing)
   QUESTIONNAIRE_TEST_SECTION      force a section in test mode (e.g. Home Safety)
+  QUESTIONNAIRE_AUTO=1            run the automatic 5pm heads-up (off by default)
+  QUESTIONNAIRE_REDIRECT_TO       testing: send every questionnaire text to this number
   QUESTIONNAIRE_BUBBLE_BASE       Bubble Data API base (dev: https://knightingale.com.au/version-test/api/1.1/obj)
   plus the usual BUBBLE_API_TOKEN, SUPABASE_*, TWILIO_*, ANTHROPIC_API_KEY, KLARRA_MODE.
 
@@ -53,6 +55,9 @@ for noisy in ("hpack", "httpx", "httpcore", "h2"):
 
 TEST_NOW = os.environ.get("QUESTIONNAIRE_TEST_NOW") == "1"
 SKIP_CHECKIN = os.environ.get("QUESTIONNAIRE_SKIP_CHECKIN") == "1"
+# Automatic 5pm heads-up for tomorrow's shifts. Off unless QUESTIONNAIRE_AUTO=1:
+# by default sessions only start when Paul asks Klarra by text (questionnaire_admin.py).
+AUTO = os.environ.get("QUESTIONNAIRE_AUTO") == "1"
 ONLY = os.environ.get("QUESTIONNAIRE_ONLY_PARTICIPANT", "").strip() or None
 TEST_SHIFT = os.environ.get("QUESTIONNAIRE_TEST_SHIFT", "").strip() or None
 TEST_SECTION = os.environ.get("QUESTIONNAIRE_TEST_SECTION", "").strip() or None
@@ -105,45 +110,12 @@ def schedule_one(participant_bid: str, shift: dict, start_at: datetime | None = 
     if not force and session_exists_for_shift(shift["_id"]):
         logger.info("Session already exists for shift %s", shift["_id"])
         return
-    if force and TEST_SECTION in q.SECTIONS:
-        rec = q.get_record(TEST_SECTION, participant_bid)
-        nxt = (TEST_SECTION, q.missing_fields(TEST_SECTION, rec))
-    else:
-        nxt = q.next_section(participant_bid)
-    if not nxt or not nxt[1]:
-        logger.info("Nothing left to ask for participant %s", participant_bid)
-        return
-    section, askable = nxt
-    participant = q.bubble_user(participant_bid)
-    carer = q.bubble_user(shift["carer"])
-    phone = db.normalise_phone(carer.get("phone number"))
-    if not phone:
-        logger.warning("Carer %s has no phone, skipping", shift["carer"])
-        return
-    start_at = start_at or (q.shift_start(shift) + START_OFFSET)
-    p_name = q.first_name(participant)
-    pr = q.pronouns(participant)
-    now = datetime.now(timezone.utc).isoformat()
-
-    bubble_id = q.bubble_create("questionnairesession", {
-        "participant": participant_bid, "carer": shift["carer"], "shift": shift["_id"],
-        "section": section, "status": "Scheduled",
-        "scheduled call": start_at.isoformat(), "heads up sent": now,
-    })
-    db.get_client().table("questionnaire_sessions").insert({
-        "bubble_id": bubble_id, "participant_bubble_id": participant_bid,
-        "carer_bubble_id": shift["carer"], "carer_phone": phone, "section": section,
-        "status": "Scheduled", "shift_bubble_id": shift["_id"],
-        "scheduled_call": start_at.isoformat(), "heads_up_sent": now,
-    }).execute()
-
-    topics = q.topics_phrase(section, askable).replace("their ", f"{pr['poss']} ")
-    body = (f"Hi {q.first_name(carer)}, I noticed we don't have "
-            f"any information for {p_name} on {topics}. I'll text you {when} at "
-            f"{q.pretty_time(start_at)} when you're with {pr['obj']}, so you can ask "
-            f"{pr['obj']} a few quick questions for me. Thanks!")
-    db.send_sms(phone, body)
-    logger.info("Heads-up sent: %s / %s / %s at %s", p_name, section, phone, start_at)
+    section = TEST_SECTION if (force and TEST_SECTION in q.SECTIONS) else None
+    res = qs.schedule_for_shift(participant_bid, shift,
+                                start_at or (q.shift_start(shift) + START_OFFSET), when,
+                                section=section)
+    if res.get("error"):
+        logger.info("Not scheduled for %s: %s", participant_bid, res["error"])
 
 
 def run_heads_up() -> None:
@@ -240,7 +212,7 @@ def main():
     while True:
         try:
             h = q.melb_now().hour
-            if (not TEST_NOW and HEADS_UP_START <= h < HEADS_UP_END
+            if (AUTO and not TEST_NOW and HEADS_UP_START <= h < HEADS_UP_END
                     and time.time() - last_heads_up > 900):
                 run_heads_up()
                 last_heads_up = time.time()
