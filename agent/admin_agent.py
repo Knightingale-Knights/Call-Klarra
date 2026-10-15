@@ -564,7 +564,7 @@ HOLIDAY_YEARS = {2026, 2027}
 
 # Residential Pricing record names in Bubble, by role then day kind.
 PRICING_NAMES = {
-    "EN": {"AM": "EN AM", "PM": "EN PM", "NS": "EN NT",
+    "EN": {"AM": "EN AM", "PM": "EN PM", "NS": "EN NS",
            "SAT": "EN SAT", "SUN": "EN SUN", "PH": "EN PH"},
     "PCA": {"AM": "PCA AM", "PM": "PCA PM", "NS": "PCA NT",
             "SAT": "PCA SAT", "SUN": "PCA SUN", "PH": "PCA P/H"},
@@ -637,6 +637,19 @@ def _find_shift_template(location_id: str, start_num: int, role: str):
     return None
 
 
+def _res_pricing_key(template: dict) -> str | None:
+    """The Data API name of the Shift field linking to Residential Pricing, read
+    off a real shift. Bubble keeps a field's original API name after a rename, so
+    the editor label ("res pricing") can differ from what the API accepts."""
+    keys = list(template.keys())
+    logger.info("Template shift keys: %s", keys)
+    for k in keys:
+        kl = k.lower()
+        if "pricing" in kl and "ndis" not in kl:
+            return k
+    return None
+
+
 def tool_create_shift(nurse_name, facility, date, shift_type, shift_code=None, **_):
     if db.DEV:
         return {"error": "KLARRA_MODE is dev, so no shift was created."}
@@ -703,6 +716,11 @@ def tool_create_shift(nurse_name, facility, date, shift_type, shift_code=None, *
         return {"error": (f"no earlier {role} {shift_type} shift at {fac['name']} "
                           f"({start}) to copy the role, address and supervisor from. "
                           "Create the first one in Bubble.")}
+    pricing_key = _res_pricing_key(template)
+    if not pricing_key:
+        return {"error": (f"the earlier {fac['name']} shift has no residential pricing "
+                          "set, so the pricing field name could not be read. "
+                          "Nothing created.")}
 
     rate = float(pricing.get("rate") or 0)
     carer_pay = float(pricing.get("carer pay") or 0)
@@ -735,7 +753,7 @@ def tool_create_shift(nurse_name, facility, date, shift_type, shift_code=None, *
         "revenue": round(hours * hourly_rev, 2),
         "roles": template.get("roles"),
         "address": template.get("address"),
-        "res pricing": pricing["_id"],
+        pricing_key: pricing["_id"],
         "supervisor": template.get("supervisor"),
         "check in time": s_dt.isoformat(),
         "check out time": e_dt.isoformat(),
