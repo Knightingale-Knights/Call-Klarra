@@ -10,6 +10,9 @@ set of tools and decides what to call, so Paul never has to follow a script:
   check_replies        who has said yes / no / nothing yet
   create_shift         create a facility shift in Bubble (and Supabase) for a named carer
   create_ndis_shift    create an NDIS shift (participant + NDIS Pricing item)
+  set_reminder         schedule a reminder text to Paul (reminders.py)
+  list_reminders       show upcoming reminders
+  cancel_reminder      cancel one
   not_an_admin_request hand the message back to the normal routing
 
 Conversation memory: the last few turns are kept per phone in admin_threads for
@@ -34,6 +37,7 @@ import anthropic
 import requests
 
 import db
+import reminders
 
 logger = logging.getLogger("knightingale-admin-agent")
 
@@ -97,6 +101,15 @@ def _system() -> str:
         "0600. Never guess them. When it succeeds, send reply_text exactly as given. "
         "DSW carers work NDIS shifts. A named site means a facility shift (5), a "
         "named participant means an NDIS shift (6).\n"
+        "7. Personal reminders for Paul (set_reminder, list_reminders, "
+        "cancel_reminder). When Paul asks to be reminded or texted about something "
+        "at or before a time, work out the exact Melbourne time to send it yourself "
+        "(for example a call Wed 21 at 9am with 'text me 20 mins before' means "
+        "remind_at 08:40 on that Wednesday) and write a short reminder message such "
+        "as 'Call with Jane Doe at 9am'. If he gives no lead time, remind him at the "
+        "time itself. If the date or time is unclear, ask one short question. To "
+        "cancel, call list_reminders first to find the right id. Send reply_text "
+        "exactly as given.\n"
         "If the message is not addressed to you as an assistant, for example a "
         "facility style request to fill a shift through the normal system such as "
         "'EN morning shift tomorrow at Port Melbourne' stated as a need rather than a "
@@ -210,6 +223,35 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {"date": {"type": "string", "description": "YYYY-MM-DD"}},
+        },
+    },
+    {
+        "name": "set_reminder",
+        "description": (
+            "Schedule a reminder text to Paul. remind_at is when the text should be "
+            "sent, already adjusted for any lead time he asked for."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "remind_at": {"type": "string", "description": "YYYY-MM-DD HH:MM, 24 hour, Melbourne time"},
+                "message": {"type": "string", "description": "Short reminder text, e.g. 'Call with Jane Doe at 9am'"},
+            },
+            "required": ["remind_at", "message"],
+        },
+    },
+    {
+        "name": "list_reminders",
+        "description": "List Paul's upcoming (not yet sent) reminders with their ids.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "cancel_reminder",
+        "description": "Cancel one pending reminder by id (get the id from list_reminders).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"reminder_id": {"type": "string"}},
+            "required": ["reminder_id"],
         },
     },
     {
@@ -963,6 +1005,18 @@ def tool_create_ndis_shift(nurse_name, participant, date, start_time, end_time,
     return {"reply_text": text, "bubble_shift_id": new_id}
 
 
+def tool_set_reminder(remind_at, message, _phone=None, _body=None, **_):
+    return reminders.add(_phone, message, remind_at, source_text=_body)
+
+
+def tool_list_reminders(_phone=None, **_):
+    return reminders.list_pending(_phone)
+
+
+def tool_cancel_reminder(reminder_id, _phone=None, **_):
+    return reminders.cancel(_phone, reminder_id)
+
+
 TOOL_FUNCS = {
     "check_availability": tool_check_availability,
     "check_nurse": tool_check_nurse,
@@ -970,15 +1024,25 @@ TOOL_FUNCS = {
     "check_replies": tool_check_replies,
     "create_shift": tool_create_shift,
     "create_ndis_shift": tool_create_ndis_shift,
+    "set_reminder": tool_set_reminder,
+    "list_reminders": tool_list_reminders,
+    "cancel_reminder": tool_cancel_reminder,
 }
 
+# Tools that need to know who is texting (reminders are per phone).
+PHONE_TOOLS = {"set_reminder", "list_reminders", "cancel_reminder"}
 
-def _call(name: str, args: dict):
+
+def _call(name: str, args: dict, phone: str | None = None, body: str | None = None):
     fn = TOOL_FUNCS.get(name)
     if not fn:
         return {"error": f"unknown tool {name}"}
+    args = dict(args or {})
+    if name in PHONE_TOOLS:
+        args["_phone"] = phone
+        args["_body"] = body
     try:
-        return fn(**(args or {}))
+        return fn(**args)
     except Exception as e:
         logger.exception("Tool %s failed", name)
         return {"error": f"{name} failed: {e}"}
@@ -1050,7 +1114,7 @@ def run(phone: str, body: str) -> str | None:
             if block.name == "not_an_admin_request":
                 return None
             logger.info("Admin agent tool %s %s", block.name, block.input)
-            result = _call(block.name, block.input)
+            result = _call(block.name, block.input, phone=phone, body=body)
             results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
