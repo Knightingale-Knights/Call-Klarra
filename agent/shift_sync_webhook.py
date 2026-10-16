@@ -38,6 +38,9 @@ Bubble workflow contract (on shift created/edited), POST form fields:
   wage                  - the carer's pay rate (number)
   revenue               - the item's hourly revenue rate (number)
 
+DELETES: Bubble calls /shift-delete (POST form field shift_bubble_id) when a shift is
+deleted. The shift is removed from Supabase and its weekly series is stopped.
+
 shift_type (Morning/Afternoon/Night) is derived from start_time here, so Bubble
 doesn't need to compute or send it.
 
@@ -268,6 +271,31 @@ def shift_sync():
     logger.info("Synced shift %s (nurse=%s %s %s)", shift_bubble_id, nurse_id, date, shift_type)
     return jsonify({"ok": True, "recurring_template_id": recurring_template_id,
                     "note": template_note})
+
+
+@app.route("/shift-delete", methods=["POST"])
+def shift_delete():
+    """Called by Bubble when a shift is deleted (POST form field: shift_bubble_id).
+    Removes the shift from Supabase and, if it belonged to a weekly series, stops that
+    series (the template is switched to inactive, so nothing more is generated).
+    Shifts already created in Bubble for later weeks are left alone."""
+    shift_bubble_id = request.form.get("shift_bubble_id")
+    if not shift_bubble_id:
+        return jsonify({"error": "missing shift_bubble_id"}), 400
+
+    existing = db.get_shift_by_bubble_id(shift_bubble_id)
+    if not existing:
+        logger.info("Delete for %s: not in Supabase, nothing to do", shift_bubble_id)
+        return jsonify({"ok": True, "note": "shift not in Supabase"})
+
+    template_id = existing.get("recurring_template_id")
+    if template_id:
+        db.deactivate_recurring_template(template_id)
+        logger.info("Series %s stopped (shift %s deleted in Bubble)", template_id, shift_bubble_id)
+
+    db.delete_shift(existing["id"])
+    logger.info("Deleted shift %s from Supabase", shift_bubble_id)
+    return jsonify({"ok": True, "series_stopped": bool(template_id)})
 
 
 if __name__ == "__main__":
