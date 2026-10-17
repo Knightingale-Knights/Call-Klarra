@@ -1,5 +1,5 @@
 """
-Carer help desk over SMS.
+Carer help desk over SMS. Klarra is always the intermediary between carers and Paul.
 
 Every text from a known carer (a row in `nurses`) that isn't part of another flow
 (questionnaire, shift offer, check-in/out link) lands here:
@@ -7,16 +7,18 @@ Every text from a known carer (a row in `nurses`) that isn't part of another flo
   1. The text is embedded (OpenAI text-embedding-3-small) and the 3 closest saved
      answers are pulled from `helpdesk_kb` via the match_helpdesk_kb RPC.
   2. Claude (fast model) reads just those 3 and decides:
-       answered - the saved answers cover it -> reply straight away
-       chat     - small talk / acknowledgement -> short friendly reply, no escalation
-       unknown  - a general question we have no answer for yet
-       personal - about their own situation (sick, late, pay, a specific shift or
-                  participant) or a message meant for Paul
-  3. unknown / personal: the carer gets "Just a sec, working on this." and Paul gets
-     "Q12 from Kelly: ...". Paul replies "Q12 <answer>". Klarra turns that into a reply
-     for the carer, texts it, and (for general questions only) saves the Q&A to
-     helpdesk_kb with an embedding, so the next carer asking the same thing, in any
-     wording, gets answered automatically.
+       answered - the saved answers cover it -> Klarra replies straight away
+       chat     - small talk / acknowledgement -> short friendly reply
+       unknown  - nothing saved covers it yet
+     plus notify_paul: true when it's something Paul needs to know about (sick,
+     running late, can't make a shift, pay or timesheet issue, incident, anything
+     about a participant). Then Paul gets an FYI text with what the carer said and
+     what Klarra replied.
+  3. unknown: the carer gets "Just a sec, working on this." and Paul gets
+     "Q12 from Kelly: ...". Paul replies "Q12 <answer>" to Klarra. Klarra learns it
+     (saves a general version of the Q&A to helpdesk_kb, embedded), then texts the
+     carer the reply herself. Next time anyone asks the same thing, in any wording,
+     she answers on her own (and still FYIs Paul if it's a notify-type message).
 
 Paul can test it from his own number by starting a text with "?" ("? what's the uniform").
 
@@ -74,6 +76,10 @@ def _json(text: str) -> dict:
     return json.loads(m.group(0)) if m else {}
 
 
+def _clean(text: str) -> str:
+    return (text or "").replace("—", ",").replace("–", "-").strip()
+
+
 def _embed(text: str) -> list[float] | None:
     try:
         return db.embed_situation(text)
@@ -123,25 +129,36 @@ def carer_for(phone: str) -> dict | None:
     return r.data[0] if r.data else None
 
 
+def _text_paul(body: str) -> None:
+    try:
+        db.send_sms(ADMIN_PHONE, body)
+    except Exception:
+        logger.exception("Failed to text Paul from help desk")
+
+
 # --- carer side ---
 
 TRIAGE_SYSTEM = (
-    "You run the SMS help desk for Knightingale, a Melbourne aged care and NDIS nursing "
-    "staffing agency run by Paul. A carer (nurse or support worker) has texted. You are "
-    "given a few saved answers from the help desk knowledge base. Decide ONE kind:\n"
-    "answered = the saved answers clearly cover what they asked. Write the reply using "
-    "ONLY facts in the saved answers. Never guess or add anything.\n"
-    "chat = small talk or an acknowledgement with nothing to answer (ok, sounds good, "
+    "You are Klarra, the SMS help desk for Knightingale, a Melbourne aged care and NDIS "
+    "nursing staffing agency run by Paul. A carer (nurse or support worker) has texted. "
+    "You are given a few saved answers Paul has taught you. Decide:\n"
+    "kind:\n"
+    "  answered = the saved answers clearly cover this kind of message (questions, and "
+    "also situations like being sick, running late, can't make a shift, pay or timesheet "
+    "issues). Write the reply using ONLY what the saved answers say. Never guess or add "
+    "anything.\n"
+    "  chat = small talk or an acknowledgement with nothing to answer (ok, sounds good, "
     "good morning). Write a very short friendly reply.\n"
-    "unknown = a general question about working at Knightingale (policies, pay rules, "
-    "uniforms, procedures, the app, facilities) that the saved answers do not fully cover.\n"
-    "personal = about their own situation that Paul needs to handle (sick, running late, "
-    "can't make a shift, swapping shifts, their own pay or timesheet, an incident, a "
-    "specific participant), or a message meant for Paul.\n"
-    "If in doubt between answered and unknown, choose unknown.\n"
+    "  unknown = the saved answers do not fully cover it. If in doubt, choose unknown.\n"
+    "notify_paul: true if Paul needs to know about this message even when you can answer "
+    "it (sick, running late, can't make or wants to swap a shift, pay or timesheet "
+    "problem, an incident or injury, anything about a participant's wellbeing, a "
+    "complaint). false for general questions and chat.\n"
+    "summary: one short line for Paul of what the carer said.\n"
     "Replies are SMS: warm, plain, brief, Australian English, no markdown, no em dashes, "
     "use their first name at most once.\n"
-    'Respond ONLY with JSON: {"kind":"answered|chat|unknown|personal","reply":"text or empty"}'
+    'Respond ONLY with JSON: {"kind":"answered|chat|unknown","notify_paul":true|false,'
+    '"summary":"...","reply":"text or empty"}'
 )
 
 
@@ -156,6 +173,7 @@ def handle_carer_text(phone: str, body: str, carer: dict | None = None,
     if not carer:
         return None
     name = carer.get("first_name") or "Carer"
+    who = f"{name} {carer.get('last_name') or ''}".strip() + (" (test)" if test else "")
 
     candidates = _candidates(body)
     kb_text = "\n\n".join(
@@ -173,7 +191,8 @@ def handle_carer_text(phone: str, body: str, carer: dict | None = None,
         decision = {}
 
     kind = (decision.get("kind") or "unknown").lower()
-    reply = (decision.get("reply") or "").replace("—", ",").strip()
+    notify = bool(decision.get("notify_paul"))
+    reply = _clean(decision.get("reply"))
 
     client = db.get_client()
     row = {
@@ -181,47 +200,44 @@ def handle_carer_text(phone: str, body: str, carer: dict | None = None,
         "nurse_id": carer.get("id"),
         "carer_name": name,
         "question": body,
+        "kind": "notify" if notify else ("chat" if kind == "chat" else "general"),
     }
 
     if kind in ("answered", "chat") and reply:
         client.table("helpdesk_questions").insert({
-            **row, "kind": "general" if kind == "answered" else "chat",
-            "status": "auto_answered", "reply_sent": reply, "answered_at": _now(),
+            **row, "status": "auto_answered", "reply_sent": reply, "answered_at": _now(),
         }).execute()
+        if notify:
+            _text_paul(f"FYI from {who}:\n{body}\n\nI replied: {reply}")
         return reply
 
-    kind = "personal" if kind == "personal" else "general"
-    q = client.table("helpdesk_questions").insert({**row, "kind": kind}).execute().data[0]
-    who = f"{name} {carer.get('last_name') or ''}".strip()
-    if test:
-        who += " (test)"
-    try:
-        db.send_sms(ADMIN_PHONE, f"Q{q['id']} from {who}:\n{body}\n\nReply Q{q['id']} + your answer.")
-    except Exception:
-        logger.exception("Failed to text Paul help desk question Q%s", q["id"])
+    q = client.table("helpdesk_questions").insert(row).execute().data[0]
+    _text_paul(f"Q{q['id']} from {who}:\n{body}\n\nReply Q{q['id']} + your answer.")
     return HOLDING_REPLY
 
 
 # --- Paul side ---
 
 COMPOSE_SYSTEM = (
-    "You help Paul, director of Knightingale (a Melbourne aged care and NDIS staffing "
-    "agency), answer a carer's text. You get the carer's message and Paul's answer, which "
-    "may be terse. Write:\n"
-    "reply = the SMS to send the carer. Use ONLY what Paul said; never add facts, "
-    "conditions or advice. Warm, plain, brief, Australian English, no markdown, no em "
-    "dashes. Don't sign off as Paul and don't mention Paul unless his answer does.\n"
-    "kb_question = the carer's question rewritten as a general question anyone could ask "
-    "(no names or dates specific to this carer).\n"
-    "kb_answer = Paul's answer as a general, standalone answer to kb_question, again "
-    "using only what Paul said.\n"
+    "You are Klarra, the SMS assistant for Knightingale (a Melbourne aged care and NDIS "
+    "staffing agency). A carer texted, and Paul (the director) has told you how to "
+    "respond. His answer may be terse. Write:\n"
+    "reply = the SMS you, Klarra, send the carer. Use ONLY what Paul said; never add "
+    "facts, conditions or advice. Warm, plain, brief, Australian English, no markdown, "
+    "no em dashes. You may say you've checked with Paul.\n"
+    "kb_question = the carer's message rewritten as a general situation or question any "
+    "carer could send (no names, dates or details specific to this carer), e.g. "
+    "\"What should I do if I'm sick and can't make my shift?\".\n"
+    "kb_answer = how to respond to kb_question in future, as a general standalone answer, "
+    "using only what Paul said (drop anything only true for this carer this time).\n"
     'Respond ONLY with JSON: {"reply":"...","kb_question":"...","kb_answer":"..."}'
 )
 
 
 def handle_paul_answer(body: str) -> str | None:
-    """Paul's 'Q12 <answer>' text. Returns the confirmation reply for Paul, or None if
-    the text isn't a help desk answer (caller carries on)."""
+    """Paul's 'Q12 <answer>' text. Klarra learns from it, then texts the carer.
+    Returns the confirmation reply for Paul, or None if the text isn't a help desk
+    answer (caller carries on)."""
     m = ANSWER_PATTERN.match(body or "")
     if not m:
         return None
@@ -245,35 +261,37 @@ def handle_paul_answer(body: str) -> str | None:
             max_tokens=500,
         ))
     except Exception:
-        logger.exception("Help desk compose failed, sending Paul's answer as written")
+        logger.exception("Help desk compose failed, using Paul's answer as written")
         out = {}
 
-    reply = (out.get("reply") or answer).replace("—", ",").strip()
+    # Learn first, so the answer is saved even if the text to the carer fails.
+    kb_id = q.get("kb_id")  # already learnt on an earlier attempt whose text failed
+    kb_q = (out.get("kb_question") or q["question"]).strip()
+    kb_a = _clean(out.get("kb_answer") or answer)
+    try:
+        payload = {"question": kb_q, "answer": kb_a, "embedding": _embed(f"{kb_q}\n{kb_a}")}
+        if kb_id:
+            client.table("helpdesk_kb").update(payload).eq("id", kb_id).execute()
+        else:
+            kb = client.table("helpdesk_kb").insert({
+                **payload, "source": "paul", "source_question_id": qid,
+            }).execute().data[0]
+            kb_id = kb["id"]
+    except Exception:
+        logger.exception("Failed to save help desk answer for Q%s", qid)
 
+    reply = _clean(out.get("reply") or answer)
+    name = q.get("carer_name") or "the carer"
     try:
         db.send_sms(q["phone"], reply)
     except Exception:
         logger.exception("Failed to text help desk answer for Q%s", qid)
-        return f"Couldn't text {q.get('carer_name') or 'the carer'} just now. Try Q{qid} again in a minute."
-
-    kb_id = None
-    if q.get("kind") == "general":
-        kb_q = (out.get("kb_question") or q["question"]).strip()
-        kb_a = (out.get("kb_answer") or answer).strip()
-        try:
-            kb = client.table("helpdesk_kb").insert({
-                "question": kb_q, "answer": kb_a, "source": "paul",
-                "source_question_id": qid,
-                "embedding": _embed(f"{kb_q}\n{kb_a}"),
-            }).execute().data[0]
-            kb_id = kb["id"]
-        except Exception:
-            logger.exception("Failed to save help desk answer for Q%s", qid)
+        client.table("helpdesk_questions").update({"kb_id": kb_id}).eq("id", qid).execute()
+        return f"Learnt it, but couldn't text {name} just now. Try Q{qid} again in a minute."
 
     client.table("helpdesk_questions").update({
         "status": "answered", "paul_answer": answer, "reply_sent": reply,
         "kb_id": kb_id, "answered_at": _now(),
     }).eq("id", qid).execute()
 
-    name = q.get("carer_name") or "the carer"
-    return f"Sent to {name}." + (" Saved for next time." if kb_id else "")
+    return (f"Learnt it and texted {name}." if kb_id else f"Texted {name}.") + f"\nSent: {reply}"
