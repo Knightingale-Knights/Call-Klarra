@@ -37,7 +37,10 @@ Routing order matters, and is deliberately this order:
      the shift if nobody else has, otherwise they're told another carer got it.
      (A late ad hoc reply is already caught by step 2 — an ad hoc offer stays
      'active' until answered.)
-  5. Otherwise -> afterhours chat / unrecognised-number fallback.
+  5. A known carer (row in nurses) -> help desk (helpdesk.py): answers from saved
+     answers or escalates to Paul as "Q12 ..."; Paul's "Q12 <answer>" reply is
+     handled at the top of his admin routing, ahead of the admin agent.
+  6. Otherwise -> afterhours chat / unrecognised-number fallback.
 
 Run:  python agent/sms_webhook.py
 """
@@ -59,6 +62,7 @@ import requests
 import db
 import admin_agent
 import questionnaire_sms
+import helpdesk
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -677,6 +681,22 @@ def sms():
         if dup_response is not None:
             return dup_response
 
+        # Help desk: Paul answering a carer's question ("Q12 <answer>"), or testing
+        # the help desk himself ("? what's the uniform").
+        try:
+            hd_answer = helpdesk.handle_paul_answer(body)
+            if hd_answer:
+                return twiml_reply(hd_answer)
+            if body.strip().startswith("?") and body.strip().lstrip("?").strip():
+                hd_reply = helpdesk.handle_carer_text(
+                    from_number, body.strip().lstrip("?").strip(),
+                    carer={"id": None, "first_name": "Paul", "last_name": ""}, test=True,
+                )
+                if hd_reply:
+                    return twiml_reply(hd_reply)
+        except Exception:
+            logger.exception("Help desk (admin side) failed, continuing normal routing")
+
         # A bare YES/NO while an offer is waiting on this number is a nurse-style
         # reply (dev stand-in), not a command: skip the agent.
         bare_reply = _parse_yes_no(body) and (
@@ -747,6 +767,14 @@ def sms():
         auto_response = handle_carer_link_request(from_number, body, allow_auto=True)
         if auto_response is not None:
             return auto_response
+        # Any other text from a known carer goes to the help desk: answered from saved
+        # answers, or escalated to Paul as a Q-numbered question.
+        try:
+            hd_reply = helpdesk.handle_carer_text(from_number, body)
+            if hd_reply:
+                return twiml_reply(hd_reply)
+        except Exception:
+            logger.exception("Help desk failed, continuing normal routing")
         # Unknown number. Afterhours -> have a conversation; daytime -> brief reply.
         if _afterhours_now():
             return handle_afterhours_chat(from_number, body)
