@@ -692,8 +692,8 @@ def sms():
                     from_number, body.strip().lstrip("?").strip(),
                     carer={"id": None, "first_name": "Paul", "last_name": ""}, test=True,
                 )
-                if hd_reply:
-                    return twiml_reply(hd_reply)
+                if hd_reply is not None:
+                    return twiml_reply(hd_reply or "(No reply: that reads as an acknowledgement.)")
         except Exception:
             logger.exception("Help desk (admin side) failed, continuing normal routing")
 
@@ -771,6 +771,9 @@ def sms():
         # answers, or escalated to Paul as a Q-numbered question.
         try:
             hd_reply = helpdesk.handle_carer_text(from_number, body)
+            if hd_reply == "":
+                return Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
+                                mimetype="text/xml")
             if hd_reply:
                 return twiml_reply(hd_reply)
         except Exception:

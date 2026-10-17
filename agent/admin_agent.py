@@ -13,6 +13,9 @@ set of tools and decides what to call, so Paul never has to follow a script:
   set_reminder         schedule a reminder text to Paul (reminders.py)
   list_reminders       show upcoming reminders
   cancel_reminder      cancel one
+  message_carer        pass Paul's message to one or more carers, in Klarra's voice
+                       (helpdesk.relay_to_carer); their replies come back through the
+                       help desk for Paul to approve
   not_an_admin_request hand the message back to the normal routing
 
 Conversation memory: the last few turns are kept per phone in admin_threads for
@@ -38,6 +41,7 @@ import requests
 
 import db
 import reminders
+import helpdesk
 
 logger = logging.getLogger("knightingale-admin-agent")
 
@@ -110,6 +114,12 @@ def _system() -> str:
         "time itself. If the date or time is unclear, ask one short question. To "
         "cancel, call list_reminders first to find the right id. Send reply_text "
         "exactly as given.\n"
+        "8. Pass a message to one or more carers (message_carer), for example 'tell "
+        "Kelly her uniform arrives Monday' or 'text Sam and Jo: can you do your progress "
+        "notes tonight'. Only when Paul clearly asks you to tell, text, message or let a "
+        "carer know something that is not a shift offer (shift offers use offer_shift). "
+        "Pass his message in full; you will reword it as the text. After it succeeds, "
+        "confirm briefly who you texted and say you'll check their reply with him.\n"
         "If the message is not addressed to you as an assistant, for example a "
         "facility style request to fill a shift through the normal system such as "
         "'EN morning shift tomorrow at Port Melbourne' stated as a need rather than a "
@@ -252,6 +262,22 @@ TOOLS = [
             "type": "object",
             "properties": {"reminder_id": {"type": "string"}},
             "required": ["reminder_id"],
+        },
+    },
+    {
+        "name": "message_carer",
+        "description": (
+            "Text one or more named carers a message from Paul (not a shift offer). "
+            "Sends real SMS in Klarra's voice. Sends nothing if any name is ambiguous "
+            "or unknown."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nurse_names": {"type": "array", "items": {"type": "string"}},
+                "message": {"type": "string", "description": "What Paul wants them told, in full"},
+            },
+            "required": ["nurse_names", "message"],
         },
     },
     {
@@ -1035,7 +1061,30 @@ def tool_cancel_reminder(reminder_id, _phone=None, **_):
     return reminders.cancel(_phone, reminder_id)
 
 
+def tool_message_carer(nurse_names, message, **_):
+    if db.MID:
+        return {"error": "KLARRA_MODE is mid, so carers cannot be contacted. Nothing sent."}
+    names = [n for n in (nurse_names or []) if str(n).strip()]
+    if not names:
+        return {"error": "No carer named."}
+    resolved, problems = [], []
+    for name in names:
+        nurse, candidates = db.find_nurse_by_name(name)
+        if nurse:
+            resolved.append(nurse)
+        elif candidates:
+            opts = ", ".join(f"{c['first_name']} {c['last_name']}" for c in candidates)
+            problems.append(f"'{name}' could be {opts}")
+        else:
+            problems.append(f"no carer called '{name}'")
+    if problems:
+        return {"error": "Nothing sent: " + "; ".join(problems)}
+    results = [helpdesk.relay_to_carer(n, message) for n in resolved]
+    return {"results": results}
+
+
 TOOL_FUNCS = {
+    "message_carer": tool_message_carer,
     "check_availability": tool_check_availability,
     "check_nurse": tool_check_nurse,
     "offer_shift": tool_offer_shift,
