@@ -29,7 +29,9 @@ Paul -> Klarra:
 
 Tables: helpdesk_kb (approvals / corrections counted per saved answer),
 helpdesk_questions (one row per carer text, status pending | draft | answered |
-approved | corrected | ack), helpdesk_messages (full carer conversation log).
+approved | corrected | ack, plus a topic from TOPICS), helpdesk_messages (full carer
+conversation log). View helpdesk_topic_stats: approve vs correct rate and current
+approval streak per topic, so Paul can see what Klarra is good at.
 If embeddings fail (e.g. OpenAI quota) it falls back to the most recent saved answers.
 """
 
@@ -57,6 +59,21 @@ FALLBACK_KB_ROWS = 40
 HISTORY_DAYS = 7
 HISTORY_MESSAGES = 8
 MELB = ZoneInfo("Australia/Melbourne")
+
+# Topics used to measure how often Paul approves vs corrects Klarra
+# (view helpdesk_topic_stats). Keep this list stable: the stats group by it.
+TOPICS = [
+    "shifts_roster",          # when/where am I working, shift details, start times
+    "shift_changes",          # swaps, cancellations, picking up or dropping shifts
+    "sick_late",              # sick, running late, can't make it
+    "pay_timesheets",         # pay, rates, timesheets, invoices, super, kms
+    "checkin_app",            # check-in/out, the app, links, progress note submission
+    "participants_care",      # how to support a participant, care questions
+    "incidents_safety",       # incidents, injuries, safety concerns, complaints
+    "policies_procedures",    # policies, procedures, rules, uniform, conduct
+    "training_compliance",    # training, certificates, checks, documents
+    "other",
+]
 
 ANSWER_PATTERN = re.compile(r"^\s*q\s*(\d+)\b[\s:.\-]*(.*)$", re.IGNORECASE | re.DOTALL)
 YES_WORDS = {"yes", "y", "yep", "yeah", "yup", "good", "great", "correct", "ok", "okay",
@@ -179,10 +196,12 @@ def _candidates(text: str) -> list[dict]:
 
 
 def _save_kb(question: str, answer: str, source: str, question_id: int | None = None,
-             replace_id: int | None = None) -> int | None:
+             replace_id: int | None = None, topic: str | None = None) -> int | None:
     client = db.get_client()
     payload = {"question": question.strip(), "answer": _clean(answer),
                "embedding": _embed(f"{question}\n{answer}")}
+    if topic:
+        payload["topic"] = topic
     try:
         if replace_id:
             client.table("helpdesk_kb").update(payload).eq("id", replace_id).execute()
@@ -301,10 +320,11 @@ TRIAGE_SYSTEM = (
     "other carers' personal details (phone, address, pay, availability) or participants' "
     "health details beyond what the carer needs for their shift.\n"
     "used_kb_id: the [number] of the saved answer you relied on, or null.\n"
+    "topic: one of " + ", ".join(TOPICS) + ".\n"
     "Replies are SMS: warm, plain, brief, Australian English, no markdown, no em dashes, "
     "use their first name at most once.\n"
     'Respond ONLY with JSON: {"kind":"draft|unknown|ack","used_kb_id":number|null,'
-    '"reply":"text or empty"}'
+    '"topic":"...","reply":"text or empty"}'
 )
 
 
@@ -349,6 +369,10 @@ def handle_carer_text(phone: str, body: str, carer: dict | None = None,
     used = decision.get("used_kb_id")
     used = used if isinstance(used, int) and any(c.get("id") == used for c in candidates) else None
 
+    topic = (decision.get("topic") or "other").strip().lower()
+    if topic not in TOPICS:
+        topic = "other"
+
     client = db.get_client()
     row = {
         "phone": db.normalise_phone(phone),
@@ -356,6 +380,7 @@ def handle_carer_text(phone: str, body: str, carer: dict | None = None,
         "carer_name": name,
         "question": body,
         "kind": "general",
+        "topic": topic,
     }
 
     if kind == "ack":
@@ -486,7 +511,8 @@ def handle_paul_answer(body: str) -> str | None:
             # Drafted from the conversation, not a saved answer: learn it now.
             out = _json(_safe_compose(q, draft, None))
             if out.get("kb_question") and out.get("kb_answer"):
-                kb_id = _save_kb(out["kb_question"], out["kb_answer"], "approved_draft", qid)
+                kb_id = _save_kb(out["kb_question"], out["kb_answer"], "approved_draft", qid,
+                                 topic=q.get("topic"))
                 _bump_kb(kb_id, "approvals")
         client.table("helpdesk_questions").update({
             "status": "approved", "paul_answer": answer, "reply_sent": draft,
@@ -512,7 +538,7 @@ def handle_paul_answer(body: str) -> str | None:
     kb_q = out.get("kb_question") or q["question"]
     kb_a = out.get("kb_answer") or answer
     replace_id = saved["id"] if saved and out.get("saved_answer_wrong") else None
-    kb_id = _save_kb(kb_q, kb_a, "paul", qid, replace_id=replace_id)
+    kb_id = _save_kb(kb_q, kb_a, "paul", qid, replace_id=replace_id, topic=q.get("topic"))
     if q["status"] == "draft" and saved:
         _bump_kb(saved["id"], "corrections")
 
