@@ -37,6 +37,7 @@ import os
 import re
 import json
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -358,11 +359,7 @@ def handle_carer_text(phone: str, body: str, carer: dict | None = None,
     }
 
     if kind == "ack":
-        client.table("helpdesk_questions").insert({
-            **row, "kind": "chat", "status": "ack", "answered_at": _now(),
-        }).execute()
-        if was_relay or test:
-            _text_paul(f"{who} replied: {body}")
+        _record_ack(row, who, was_relay or test)
         return ""
 
     if kind == "draft" and draft:
@@ -379,6 +376,54 @@ def handle_carer_text(phone: str, body: str, carer: dict | None = None,
 
     _log(phone, "out", HOLDING_REPLY, nurse_id=carer.get("id"), source="holding",
          question_id=q["id"])
+    return HOLDING_REPLY
+
+
+ACK_RE = re.compile(
+    r"^(ok(ay)?|k|kk|thanks?( you)?( so much)?|thankyou|ty|ta|cheers|will do|noted|got it|"
+    r"sounds good|no worries|no problem|all good|perfect|great|cool|done|yep|yes|yeah|no|"
+    r"nope|sure|of course|\U0001F44D|\U0001F64F|\U0001F60A)[\s!.]*$",
+    re.IGNORECASE,
+)
+
+
+def _record_ack(row: dict, who: str, tell_paul: bool) -> None:
+    db.get_client().table("helpdesk_questions").insert({
+        **row, "kind": "chat", "status": "ack", "answered_at": _now(),
+    }).execute()
+    if tell_paul:
+        _text_paul(f"{who} replied: {row['question']}")
+
+
+def start_carer_text(phone: str, body: str, carer: dict | None = None,
+                     test: bool = False) -> str | None:
+    """Webhook entry point. Twilio only waits ~15s, and drafting can take longer when
+    Klarra looks things up, so: a bare acknowledgement is handled now (no reply), and
+    anything else gets the holding text straight away while the drafting and Paul's
+    text happen in the background. Returns None if this isn't a known carer."""
+    body = (body or "").strip()
+    if not body:
+        return None
+    carer = carer or carer_for(phone)
+    if not carer:
+        return None
+    if ACK_RE.match(body):
+        name = carer.get("first_name") or "Carer"
+        who = f"{name} {carer.get('last_name') or ''}".strip() + (" (test)" if test else "")
+        tell = _last_out_was_relay(phone) or test
+        _log(phone, "in", body, nurse_id=carer.get("id"), source="test" if test else None)
+        _record_ack({"phone": db.normalise_phone(phone), "nurse_id": carer.get("id"),
+                     "carer_name": name, "question": body}, who, tell)
+        return ""
+
+    def work():
+        try:
+            handle_carer_text(phone, body, carer=carer, test=test)
+        except Exception:
+            logger.exception("Help desk background handling failed")
+            _text_paul(f"Help desk error on a text from {carer.get('first_name')}: {body}")
+
+    threading.Thread(target=work, daemon=True).start()
     return HOLDING_REPLY
 
 

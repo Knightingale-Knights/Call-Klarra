@@ -653,6 +653,47 @@ def handle_carer_link_request(phone: str, body: str, allow_auto: bool = False) -
     )
 
 
+AGENT_DEADLINE_SECONDS = 11
+
+
+def _run_with_deadline(fn, phone: str, body: str):
+    """Run fn(phone, body). Twilio only waits ~15s for our reply, so if it isn't done in
+    AGENT_DEADLINE_SECONDS, return (False, None) and let it finish in the background,
+    texting its reply to the sender. Otherwise (True, result). Exceptions propagate."""
+    import threading
+    box = {"done": False, "late": False}
+    lock = threading.Lock()
+
+    def work():
+        result, error = None, None
+        try:
+            result = fn(phone, body)
+        except Exception as e:
+            error = e
+        with lock:
+            box.update(done=True, result=result, error=error)
+            late = box["late"]
+        if late:
+            if result:
+                try:
+                    db.send_sms(phone, result)
+                except Exception:
+                    logger.exception("Failed to text late agent reply")
+            elif error:
+                logger.error("Late agent run failed: %s", error)
+
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    t.join(AGENT_DEADLINE_SECONDS)
+    with lock:
+        if not box["done"]:
+            box["late"] = True
+            return False, None
+    if box.get("error"):
+        raise box["error"]
+    return True, box.get("result")
+
+
 @app.route("/sms", methods=["POST"])
 def sms():
     from_number = request.form.get("From")
@@ -688,7 +729,7 @@ def sms():
             if hd_answer:
                 return twiml_reply(hd_answer)
             if body.strip().startswith("?") and body.strip().lstrip("?").strip():
-                hd_reply = helpdesk.handle_carer_text(
+                hd_reply = helpdesk.start_carer_text(
                     from_number, body.strip().lstrip("?").strip(),
                     carer={"id": None, "first_name": "Paul", "last_name": ""}, test=True,
                 )
@@ -708,7 +749,11 @@ def sms():
             if db.get_pending_admin_approval() and re.fullmatch(r"\s*ok(ay)?[!. ]*", body.lower()):
                 return handle_admin_reply(body)
             try:
-                agent_reply = admin_agent.run(from_number, body)
+                done, agent_reply = _run_with_deadline(admin_agent.run, from_number, body)
+                if not done:
+                    # Still working (lookups): the answer will be texted when ready.
+                    return Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
+                                    mimetype="text/xml")
                 if agent_reply:
                     return twiml_reply(agent_reply)
                 # None: not an admin request, continue normal routing below.
@@ -770,7 +815,7 @@ def sms():
         # Any other text from a known carer goes to the help desk: answered from saved
         # answers, or escalated to Paul as a Q-numbered question.
         try:
-            hd_reply = helpdesk.handle_carer_text(from_number, body)
+            hd_reply = helpdesk.start_carer_text(from_number, body)
             if hd_reply == "":
                 return Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
                                 mimetype="text/xml")
