@@ -10,6 +10,7 @@ Field kinds
   safety  Safety Check option set: Safe / Unsafe / N/A
   list    list of an option set; anything not in the set goes to "<field> other"
   notes   free text that is appended to, never replaced (home safety notes)
+  address a street address (Bubble geographic address; sent as text, Bubble geocodes it)
 
 "<x> other" fields are never asked directly. They are filled by save_answer when a
 list answer contains something not in the option set, and are only "missing" when
@@ -95,10 +96,20 @@ SECTIONS = {
               "Second emergency contact's phone number ('None' if no second contact)."),
             F("emergency contact relationship two", "text", "emergency contacts",
               "Second emergency contact's relationship ('None' if no second contact)."),
+            F("doctor name", "text", "their doctor",
+              "Who is their doctor (GP)?"),
+            F("doctor clinic", "text", "their doctor",
+              "What is the name of their doctor's clinic?"),
+            F("doctor phone", "text", "their doctor",
+              "What is their doctor's phone number?"),
+            F("doctor address", "address", "their doctor",
+              "What is the address of their doctor's clinic?"),
             F("pharmacist name", "text", "their pharmacist",
               "Who is their pharmacist or pharmacy?"),
             F("pharmacist phone", "text", "their pharmacist",
               "Pharmacist's phone number."),
+            F("pharmacy address", "address", "their pharmacist",
+              "What is the address of their pharmacy?"),
             F("ndis primary diagnosis", "text", "their NDIS diagnosis",
               "What is their primary formal NDIS diagnosis?"),
             F("ndis secondary diagnosis", "text", "their NDIS diagnosis",
@@ -477,7 +488,7 @@ def normalise_answer(section: str, key: str, value: str) -> tuple[dict, str]:
     value = (value or "").strip()
     if not value:
         raise ValueError("Empty value. Use skip_question if they don't know.")
-    if kind in ("text", "notes"):
+    if kind in ("text", "notes", "address"):
         return {key: value}, "Saved."
     if kind in ("answer", "safety"):
         opts = ANSWER if kind == "answer" else SAFETY
