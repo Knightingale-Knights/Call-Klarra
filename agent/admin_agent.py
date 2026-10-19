@@ -695,6 +695,9 @@ def _find_shift_template(location_id: str, start_num: int, role: str):
     return None
 
 
+RES_PRICING_KEY = "res pricing "
+
+
 def _res_pricing_key(template: dict) -> str | None:
     """The Data API name of the Shift field linking to Residential Pricing, read
     off a real shift. Bubble keeps a field's original API name after a rename, so
@@ -705,7 +708,10 @@ def _res_pricing_key(template: dict) -> str | None:
         kl = k.lower()
         if "pricing" in kl and "ndis" not in kl:
             return k
-    return None
+    # Bubble leaves empty fields out of the API response, so a template shift with no
+    # pricing set doesn't show the key at all. Fall back to the known API name
+    # (note the trailing space), confirmed working on a live create in Oct 2026.
+    return RES_PRICING_KEY
 
 
 def tool_create_shift(nurse_name, facility, date, shift_type, shift_code=None, **_):
