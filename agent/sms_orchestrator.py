@@ -36,7 +36,8 @@ NOTE ON MID: the name goes to the facility at 30s whether or not that nurse has
 agreed to anything. If they later decline, the facility has already been told they're
 covering it and someone has to walk that back manually.
 
-Also runs the reminders.py sender on a background thread (Paul's personal
+Also runs helpdesk.py's timeout checker (carers told "Checking with Paul" after 15 min
+waiting) and the reminders.py sender on background threads (Paul's personal
 reminders, set by texting Klarra).
 
 Run:  python agent/sms_orchestrator.py
@@ -53,6 +54,7 @@ from dotenv import load_dotenv
 
 import db
 import reminders
+import helpdesk
 from orchestrator import rank_pool, rotate_top10
 
 load_dotenv()
@@ -465,6 +467,7 @@ def main():
     logger.info("SMS orchestrator running (KLARRA_MODE=%s). Polling every %ss.",
                 db.KLARRA_MODE, POLL_SECONDS)
     reminders.start_worker()
+    helpdesk.start_worker()
     while True:
         try:
             check_adhoc_timeouts()

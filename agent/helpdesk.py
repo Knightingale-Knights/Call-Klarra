@@ -807,3 +807,51 @@ def _correct_auto_answer(q: dict, answer: str) -> str:
     if not sent:
         return f"{learnt}, but couldn't text {name} the correction." + note
     return f"{learnt} and texted {name}:\n{reply}" + note
+
+
+# --- timeout: don't leave carers hanging ------------------------------------------
+
+TIMEOUT_MINUTES = int(os.environ.get("HELPDESK_TIMEOUT_MINUTES", "15"))
+TIMEOUT_REPLY = "Checking with Paul, back to you soon."
+TIMEOUT_POLL_SECONDS = 60
+
+
+def check_timeouts() -> int:
+    """Any carer text still waiting on Paul after TIMEOUT_MINUTES: text the carer once
+    that Klarra is checking with Paul, and nudge Paul once. Returns how many."""
+    if db.MID:
+        return 0
+    client = db.get_client()
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=TIMEOUT_MINUTES)).isoformat()
+    rows = (client.table("helpdesk_questions").select("*")
+            .in_("status", ["pending", "draft"]).is_("timeout_sent_at", "null")
+            .lt("created_at", cutoff).limit(20).execute().data or [])
+    for q in rows:
+        # Claim it first so two workers never double-text.
+        claimed = (client.table("helpdesk_questions").update({"timeout_sent_at": _now()})
+                   .eq("id", q["id"]).is_("timeout_sent_at", "null").execute().data or [])
+        if not claimed:
+            continue
+        if q["phone"] != db.normalise_phone(ADMIN_PHONE):
+            _send_carer(q, TIMEOUT_REPLY, "timeout")
+        name = q.get("carer_name") or "a carer"
+        how = (f"Reply Q{q['id']} yes, or Q{q['id']} + the right answer."
+               if q["status"] == "draft" else f"Reply Q{q['id']} + your answer.")
+        _text_paul(f"Q{q['id']} still waiting ({name}, {TIMEOUT_MINUTES} min): {q['question']}\n"
+                   f"I've told them I'm checking with you. {how}")
+    return len(rows)
+
+
+def _timeout_loop() -> None:
+    import time
+    while True:
+        try:
+            check_timeouts()
+        except Exception:
+            logger.exception("Help desk timeout check failed")
+        time.sleep(TIMEOUT_POLL_SECONDS)
+
+
+def start_worker() -> None:
+    """Run the timeout checker on its own thread (started by sms_orchestrator.py)."""
+    threading.Thread(target=_timeout_loop, name="helpdesk-timeouts", daemon=True).start()
