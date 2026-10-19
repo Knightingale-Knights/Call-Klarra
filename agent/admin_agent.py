@@ -128,9 +128,17 @@ def _system() -> str:
         "with query_database. It is read-only. Look things up rather than guessing, keep "
         "queries small, and reply with just the answer.\n"
         "10. When Paul asks how you're going, how accurate you are, or your stats, "
-        "query helpdesk_topic_stats and reply with one short line per topic (approval "
-        "% and how many reviewed, current streak), best first, plus anything waiting on "
-        "him.\n"
+        "query helpdesk_topics and reply with one short line per topic that has activity "
+        "(mode, approval % and how many reviewed, current streak out of threshold), best "
+        "first, plus anything waiting on him.\n"
+        "11. Topic handover (set_topic_mode). Carer help desk topics: shifts and roster, "
+        "shift changes, sick or late, pay and timesheets, check-in and the app, "
+        "participant care, incidents and safety, policies, training, other. Modes: "
+        "review (you check every reply with Paul), auto (you answer confident, "
+        "non-sensitive ones yourself and FYI him), never_auto (always check with him). "
+        "Use it when Paul says things like 'handle pay questions yourself' (auto), "
+        "'check sick or late with me' (review), or 'never answer training on your own' "
+        "(never_auto). Topics switch to auto by themselves after 20 approvals in a row.\n"
         "If the message is not addressed to you as an assistant, for example a "
         "facility style request to fill a shift through the normal system such as "
         "'EN morning shift tomorrow at Port Melbourne' stated as a need rather than a "
@@ -274,6 +282,18 @@ TOOLS = [
             "type": "object",
             "properties": {"reminder_id": {"type": "string"}},
             "required": ["reminder_id"],
+        },
+    },
+    {
+        "name": "set_topic_mode",
+        "description": "Set how Klarra handles one help desk topic: review, auto or never_auto.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string", "enum": list(helpdesk.TOPICS)},
+                "mode": {"type": "string", "enum": list(helpdesk.MODES)},
+            },
+            "required": ["topic", "mode"],
         },
     },
     {
@@ -1099,7 +1119,12 @@ def tool_query_database(sql, **_):
     return klarra_data.query(sql)
 
 
+def tool_set_topic_mode(topic, mode, **_):
+    return helpdesk.set_topic_mode(topic, mode, by="paul")
+
+
 TOOL_FUNCS = {
+    "set_topic_mode": tool_set_topic_mode,
     "query_database": tool_query_database,
     "message_carer": tool_message_carer,
     "check_availability": tool_check_availability,

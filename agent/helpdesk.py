@@ -30,8 +30,9 @@ Paul -> Klarra:
 Tables: helpdesk_kb (approvals / corrections counted per saved answer),
 helpdesk_questions (one row per carer text, status pending | draft | answered |
 approved | corrected | ack, plus a topic from TOPICS), helpdesk_messages (full carer
-conversation log). View helpdesk_topic_stats: approve vs correct rate and current
-approval streak per topic, so Paul can see what Klarra is good at.
+conversation log). View helpdesk_topics: mode, approve vs correct rate and current
+approval streak per topic. Topics hand over to Klarra after 20 approvals in a row
+(see "topic handover" below); helpdesk_topic_settings holds each topic's mode.
 If embeddings fail (e.g. OpenAI quota) it falls back to the most recent saved answers.
 """
 
@@ -74,6 +75,15 @@ TOPICS = [
     "training_compliance",    # training, certificates, checks, documents
     "other",
 ]
+
+TOPIC_LABELS = {
+    "shifts_roster": "shifts and roster", "shift_changes": "shift changes",
+    "sick_late": "sick or late", "pay_timesheets": "pay and timesheets",
+    "checkin_app": "check-in and the app", "participants_care": "participant care",
+    "incidents_safety": "incidents and safety", "policies_procedures": "policies",
+    "training_compliance": "training", "other": "other",
+}
+MODES = ("review", "auto", "never_auto")
 
 ANSWER_PATTERN = re.compile(r"^\s*q\s*(\d+)\b[\s:.\-]*(.*)$", re.IGNORECASE | re.DOTALL)
 YES_WORDS = {"yes", "y", "yep", "yeah", "yup", "good", "great", "correct", "ok", "okay",
@@ -298,14 +308,78 @@ def _send_carer(q: dict, text: str, source: str) -> bool:
     return True
 
 
+# --- topic handover ----------------------------------------------------------
+#
+# Each topic is in one of three modes (helpdesk_topic_settings):
+#   review     - every draft goes to Paul first (the default)
+#   auto       - Klarra sends confident, non-sensitive drafts herself and FYIs Paul
+#   never_auto - always goes to Paul, never switches to auto (incidents_safety)
+# A review topic switches to auto by itself once Paul has approved `threshold` (20)
+# drafts in a row. Any correction of an auto-sent answer switches it back to review.
+
+def topic_mode(topic: str) -> str:
+    try:
+        r = (db.get_client().table("helpdesk_topic_settings").select("mode")
+             .eq("topic", topic).limit(1).execute().data or [])
+        return r[0]["mode"] if r else "review"
+    except Exception:
+        logger.exception("Could not read topic mode")
+        return "review"
+
+
+def set_topic_mode(topic: str, mode: str, by: str = "paul") -> dict:
+    topic = (topic or "").strip().lower()
+    if topic not in TOPICS:
+        # Accept the friendly label too ("sick or late").
+        by_label = {v: k for k, v in TOPIC_LABELS.items()}
+        topic = by_label.get(topic, topic)
+    if topic not in TOPICS:
+        return {"error": f"unknown topic. Topics: {', '.join(TOPIC_LABELS.values())}"}
+    if mode not in MODES:
+        return {"error": f"mode must be one of {', '.join(MODES)}"}
+    db.get_client().table("helpdesk_topic_settings").upsert({
+        "topic": topic, "mode": mode, "changed_at": _now(), "changed_by": by,
+    }).execute()
+    return {"topic": topic, "label": TOPIC_LABELS[topic], "mode": mode}
+
+
+def _topic_stats(topic: str) -> dict:
+    try:
+        r = (db.get_client().table("helpdesk_topics").select("*")
+             .eq("topic", topic).limit(1).execute().data or [])
+        return r[0] if r else {}
+    except Exception:
+        logger.exception("Could not read topic stats")
+        return {}
+
+
+def _maybe_hand_over(topic: str | None) -> str:
+    """After an approval: switch the topic to auto once the streak reaches the
+    threshold. Returns a note for Paul, or ''."""
+    if not topic:
+        return ""
+    st = _topic_stats(topic)
+    if st.get("mode") != "review":
+        return ""
+    streak, threshold = st.get("approved_streak") or 0, st.get("threshold") or 20
+    label = TOPIC_LABELS.get(topic, topic)
+    if streak >= threshold:
+        set_topic_mode(topic, "auto", by="streak")
+        return (f"\n\nThat's {streak} {label} answers in a row you've approved, so I'll "
+                f"send those myself from now on and FYI you. Text \"check {label} with me\" "
+                "to switch back.")
+    if threshold - streak <= 3:
+        return f"\n({label}: {streak}/{threshold} in a row before I take these over.)"
+    return ""
+
+
 # --- carer side ------------------------------------------------------------
 
 TRIAGE_SYSTEM = (
     "You are Klarra, the SMS assistant for Knightingale, a Melbourne aged care and NDIS "
     "nursing staffing agency run by Paul. A carer (nurse or support worker) has texted. "
     "You get the recent conversation with them and a few saved answers Paul has taught "
-    "you. Paul checks every answer before the carer sees it, so draft the reply you "
-    "would send. Decide kind:\n"
+    "you. Draft the reply you would send. Decide kind:\n"
     "  draft = the saved answers, the database or the conversation give you what you need to reply "
     "(questions, and also situations like being sick, running late, can't make a shift, "
     "pay or timesheet issues). Write the reply using ONLY what the saved answers, the "
@@ -321,10 +395,15 @@ TRIAGE_SYSTEM = (
     "health details beyond what the carer needs for their shift.\n"
     "used_kb_id: the [number] of the saved answer you relied on, or null.\n"
     "topic: one of " + ", ".join(TOPICS) + ".\n"
+    "confident: true only if every fact in your reply comes straight from a saved "
+    "answer, the database or the conversation, and it fully answers them.\n"
+    "sensitive: true if it involves an injury, incident, abuse or neglect, a participant's "
+    "health, medication or wellbeing, a complaint, a safety risk, or anything legal or "
+    "disciplinary. These always go to Paul.\n"
     "Replies are SMS: warm, plain, brief, Australian English, no markdown, no em dashes, "
     "use their first name at most once.\n"
     'Respond ONLY with JSON: {"kind":"draft|unknown|ack","used_kb_id":number|null,'
-    '"topic":"...","reply":"text or empty"}'
+    '"topic":"...","confident":true|false,"sensitive":true|false,"reply":"text or empty"}'
 )
 
 
@@ -387,7 +466,34 @@ def handle_carer_text(phone: str, body: str, carer: dict | None = None,
         _record_ack(row, who, was_relay or test)
         return ""
 
-    if kind == "draft" and draft:
+    can_auto = (
+        kind == "draft" and draft
+        and decision.get("confident") is True and decision.get("sensitive") is False
+        and topic_mode(topic) == "auto"
+        and not db.MID
+    )
+    if can_auto:
+        q = client.table("helpdesk_questions").insert({
+            **row, "status": "auto_sent", "draft_reply": draft, "reply_sent": draft,
+            "kb_id": used, "answered_at": _now(),
+        }).execute().data[0]
+        _log(phone, "out", HOLDING_REPLY, nurse_id=carer.get("id"), source="holding",
+             question_id=q["id"])
+        if _send_carer(q, draft, "auto"):
+            _text_paul(
+                f"Q{q['id']} FYI I answered {who} ({TOPIC_LABELS.get(topic, topic)}):\n"
+                f"They said: {body}\nI replied: {draft}\n\n"
+                f"Reply Q{q['id']} + the right answer if that's wrong."
+            )
+            return HOLDING_REPLY
+        # Text failed: fall back to asking Paul (holding text already logged above).
+        client.table("helpdesk_questions").update({"status": "draft", "reply_sent": None,
+                                                   "answered_at": None}).eq("id", q["id"]).execute()
+        _text_paul(
+            f"Q{q['id']} {who} said:\n{body}\n\nI'd reply:\n{draft}\n\n"
+            f"Reply Q{q['id']} yes, or Q{q['id']} + the right answer."
+        )
+    elif kind == "draft" and draft:
         q = client.table("helpdesk_questions").insert({
             **row, "status": "draft", "draft_reply": draft, "kb_id": used,
         }).execute().data[0]
@@ -399,8 +505,9 @@ def handle_carer_text(phone: str, body: str, carer: dict | None = None,
         q = client.table("helpdesk_questions").insert({**row, "status": "pending"}).execute().data[0]
         _text_paul(f"Q{q['id']} from {who}:\n{body}\n\nReply Q{q['id']} + your answer.")
 
-    _log(phone, "out", HOLDING_REPLY, nurse_id=carer.get("id"), source="holding",
-         question_id=q["id"])
+    if not can_auto:
+        _log(phone, "out", HOLDING_REPLY, nurse_id=carer.get("id"), source="holding",
+             question_id=q["id"])
     return HOLDING_REPLY
 
 
@@ -490,6 +597,14 @@ def handle_paul_answer(body: str) -> str | None:
     q = r.data[0]
     name = q.get("carer_name") or "the carer"
 
+    if q["status"] == "auto_sent":
+        if not answer or _words(answer) in YES_WORDS:
+            client.table("helpdesk_questions").update(
+                {"paul_answer": answer or "ok"}).eq("id", qid).execute()
+            return f"Thanks, noted Q{qid} as right."
+        if db.MID:
+            return "KLARRA_MODE is mid, so carers can't be texted. Nothing sent."
+        return _correct_auto_answer(q, answer)
     if q["status"] not in ("pending", "draft"):
         return f"Q{qid} is already sorted."
     if not answer:
@@ -518,7 +633,7 @@ def handle_paul_answer(body: str) -> str | None:
             "status": "approved", "paul_answer": answer, "reply_sent": draft,
             "kb_id": kb_id, "answered_at": _now(),
         }).eq("id", qid).execute()
-        return f"Sent to {name}."
+        return f"Sent to {name}." + _maybe_hand_over(q.get("topic"))
 
     if w in NO_WORDS:
         return f"What should I tell {name}? Reply Q{qid} + the right answer."
@@ -629,3 +744,66 @@ def relay_to_carer(nurse: dict, message: str) -> dict:
 
     return {"sent_to": f"{name} {nurse.get('last_name') or ''}".strip(), "text": text,
             "learnt_general_info": learnt}
+
+
+# --- Paul correcting an answer Klarra sent on her own ---------------------------
+
+CORRECTION_SYSTEM = (
+    "You are Klarra, the SMS assistant for Knightingale (a Melbourne aged care and NDIS "
+    "staffing agency). You already texted a carer an answer on your own, and Paul (the "
+    "director) says it was wrong. His correction may be terse. Write:\n"
+    "reply = a follow-up SMS to the carer, starting \"Quick update on my last message:\", "
+    "giving the right answer. Use ONLY what Paul said. Warm, plain, brief, Australian "
+    "English, no markdown, no em dashes.\n"
+    "kb_question = the carer's message as a general question any carer could send.\n"
+    "kb_answer = the right general answer, using only what Paul said.\n"
+    "saved_answer_wrong = true if the saved answer shown is itself wrong (replace it), "
+    "false if it was fine but didn't fit this message.\n"
+    'Respond ONLY with JSON: {"reply":"...","kb_question":"...","kb_answer":"...",'
+    '"saved_answer_wrong":true|false}'
+)
+
+
+def _correct_auto_answer(q: dict, answer: str) -> str:
+    client = db.get_client()
+    qid, name = q["id"], q.get("carer_name") or "the carer"
+    saved = None
+    if q.get("kb_id"):
+        r = (client.table("helpdesk_kb").select("id, question, answer")
+             .eq("id", q["kb_id"]).limit(1).execute().data or [])
+        saved = r[0] if r else None
+    try:
+        out = _json(_claude(
+            CORRECTION_SYSTEM,
+            f"Carer: {name}\nCarer's message: \"{q['question']}\"\n"
+            f"What you sent: \"{q.get('reply_sent')}\"\n"
+            f"Saved answer used: {json.dumps(saved) if saved else 'none'}\n\n"
+            f"Paul's correction: \"{answer}\"",
+            max_tokens=500,
+        ))
+    except Exception:
+        logger.exception("Correction compose failed, using Paul's words")
+        out = {}
+
+    replace_id = saved["id"] if saved and out.get("saved_answer_wrong") else None
+    kb_id = _save_kb(out.get("kb_question") or q["question"], out.get("kb_answer") or answer,
+                     "paul", qid, replace_id=replace_id, topic=q.get("topic"))
+    if saved:
+        _bump_kb(saved["id"], "corrections")
+
+    reply = _clean(out.get("reply") or f"Quick update on my last message: {answer}")
+    sent = _send_carer(q, reply, "paul")
+    client.table("helpdesk_questions").update({
+        "status": "auto_corrected", "paul_answer": answer, "kb_id": kb_id,
+        "reply_sent": reply if sent else q.get("reply_sent"),
+    }).eq("id", qid).execute()
+
+    topic = q.get("topic") or "other"
+    note = ""
+    if topic_mode(topic) == "auto":
+        set_topic_mode(topic, "review", by="correction")
+        note = f"\nI'll check {TOPIC_LABELS.get(topic, topic)} answers with you again for now."
+    learnt = "Updated what I knew" if replace_id else "Learnt it"
+    if not sent:
+        return f"{learnt}, but couldn't text {name} the correction." + note
+    return f"{learnt} and texted {name}:\n{reply}" + note
