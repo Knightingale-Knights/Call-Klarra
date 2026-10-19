@@ -13,6 +13,8 @@ set of tools and decides what to call, so Paul never has to follow a script:
   set_reminder         schedule a reminder text to Paul (reminders.py)
   list_reminders       show upcoming reminders
   cancel_reminder      cancel one
+  query_database       read-only SQL over every Supabase table (klarra_data.py), for
+                       any question about carers, shifts, participants and so on
   message_carer        pass Paul's message to one or more carers, in Klarra's voice
                        (helpdesk.relay_to_carer); their replies come back through the
                        help desk for Paul to approve
@@ -42,13 +44,14 @@ import requests
 import db
 import reminders
 import helpdesk
+import klarra_data
 
 logger = logging.getLogger("knightingale-admin-agent")
 
 MODEL = "claude-sonnet-4-6"
 ROLES = ["RN", "EN", "PCA", "DSW"]
 BLOCKS = ["Morning", "Afternoon", "Night"]
-MAX_STEPS = 8
+MAX_STEPS = 10
 THREAD_MINUTES = 30
 MAX_HISTORY = 10  # messages kept per thread (user + assistant)
 
@@ -120,14 +123,19 @@ def _system() -> str:
         "carer know something that is not a shift offer (shift offers use offer_shift). "
         "Pass his message in full; you will reword it as the text. After it succeeds, "
         "confirm briefly who you texted and say you'll check their reply with him.\n"
+        "9. Answer any other question about the business (carers, shifts, rosters, "
+        "participants, offers, progress notes, hours, who worked where) by looking it up "
+        "with query_database. It is read-only. Look things up rather than guessing, keep "
+        "queries small, and reply with just the answer.\n"
         "If the message is not addressed to you as an assistant, for example a "
         "facility style request to fill a shift through the normal system such as "
         "'EN morning shift tomorrow at Port Melbourne' stated as a need rather than a "
         "question about who is free, call not_an_admin_request."
-    )
+    ) + klarra_data.schema_prompt()
 
 
 TOOLS = [
+    klarra_data.TOOL,
     {
         "name": "check_availability",
         "description": (
@@ -1083,7 +1091,12 @@ def tool_message_carer(nurse_names, message, **_):
     return {"results": results}
 
 
+def tool_query_database(sql, **_):
+    return klarra_data.query(sql)
+
+
 TOOL_FUNCS = {
+    "query_database": tool_query_database,
     "message_carer": tool_message_carer,
     "check_availability": tool_check_availability,
     "check_nurse": tool_check_nurse,
@@ -1185,7 +1198,7 @@ def run(phone: str, body: str) -> str | None:
             results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
-                "content": json.dumps(result, default=str),
+                "content": json.dumps(result, default=str)[:klarra_data.MAX_RESULT_CHARS],
             })
         messages.append({"role": "user", "content": results})
 

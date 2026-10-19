@@ -5,7 +5,9 @@ and carers, and checks every answer with Paul before a carer sees it.
 Carer -> Klarra (any text from a known carer not caught by another flow):
   1. The text is embedded and the 3 closest saved answers are pulled from helpdesk_kb
      (match_helpdesk_kb RPC). The recent conversation with this carer (helpdesk_messages)
-     is included, so replies to Paul's relayed messages make sense.
+     is included, so replies to Paul's relayed messages make sense. She can also look
+     things up in every Supabase table (read-only, klarra_data.query_database), e.g.
+     the carer's own roster, before drafting.
   2. Claude (fast model) decides:
        draft   - she has an answer (from saved answers / the conversation). It is NOT
                  sent. The carer gets "Just a sec, working on this." and Paul gets
@@ -36,10 +38,12 @@ import re
 import json
 import logging
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import anthropic
 
 import db
+import klarra_data
 
 logger = logging.getLogger("knightingale-helpdesk")
 
@@ -51,6 +55,7 @@ TOP_K = 3
 FALLBACK_KB_ROWS = 40
 HISTORY_DAYS = 7
 HISTORY_MESSAGES = 8
+MELB = ZoneInfo("Australia/Melbourne")
 
 ANSWER_PATTERN = re.compile(r"^\s*q\s*(\d+)\b[\s:.\-]*(.*)$", re.IGNORECASE | re.DOTALL)
 YES_WORDS = {"yes", "y", "yep", "yeah", "yup", "good", "great", "correct", "ok", "okay",
@@ -71,6 +76,43 @@ def _claude(system: str, user: str, max_tokens: int = 400) -> str:
                 messages=[{"role": "user", "content": user}],
             )
             return "".join(b.text for b in msg.content if b.type == "text").strip()
+        except Exception as e:
+            last_err = e
+            logger.warning("Help desk model %s failed: %s", model, e)
+    raise last_err
+
+
+TRIAGE_MAX_STEPS = 6
+
+
+def _claude_with_data(system: str, user: str, max_tokens: int = 600) -> str:
+    """Like _claude, but Claude may look things up with query_database first.
+    Returns the final text."""
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    last_err = None
+    for model in (MODEL, FALLBACK_MODEL):
+        try:
+            messages = [{"role": "user", "content": user}]
+            for _ in range(TRIAGE_MAX_STEPS):
+                resp = client.messages.create(
+                    model=model, max_tokens=max_tokens, system=system,
+                    tools=[klarra_data.TOOL], messages=messages,
+                )
+                if resp.stop_reason != "tool_use":
+                    return "".join(b.text for b in resp.content if b.type == "text").strip()
+                messages.append({"role": "assistant", "content": resp.content})
+                results = []
+                for b in resp.content:
+                    if b.type == "tool_use":
+                        logger.info("Help desk lookup: %s", (b.input or {}).get("sql"))
+                        results.append({"type": "tool_result", "tool_use_id": b.id,
+                                        "content": klarra_data.call(b.input)})
+                messages.append({"role": "user", "content": results})
+            # Out of steps: ask for the answer without tools.
+            messages.append({"role": "user", "content": "Give your final JSON answer now."})
+            resp = client.messages.create(model=model, max_tokens=max_tokens,
+                                          system=system, messages=messages)
+            return "".join(b.text for b in resp.content if b.type == "text").strip()
         except Exception as e:
             last_err = e
             logger.warning("Help desk model %s failed: %s", model, e)
@@ -244,12 +286,19 @@ TRIAGE_SYSTEM = (
     "You get the recent conversation with them and a few saved answers Paul has taught "
     "you. Paul checks every answer before the carer sees it, so draft the reply you "
     "would send. Decide kind:\n"
-    "  draft = the saved answers or the conversation give you what you need to reply "
+    "  draft = the saved answers, the database or the conversation give you what you need to reply "
     "(questions, and also situations like being sick, running late, can't make a shift, "
-    "pay or timesheet issues). Write the reply using ONLY what the saved answers and "
-    "conversation say. Never guess or add facts.\n"
+    "pay or timesheet issues). Write the reply using ONLY what the saved answers, the "
+    "database and the conversation say. Never guess or add facts.\n"
     "  unknown = you don't have what you need to reply. If in doubt, choose unknown.\n"
     "  ack = a bare acknowledgement with nothing to answer (ok, will do, thanks, noted).\n"
+    "You can look things up in the database with query_database (read-only): their "
+    "own shifts, roster, hours, availability and offers, the participants and sites "
+    "they work with, policies. Look up what you need rather than guessing. You are told "
+    "the carer's nurses.id. Only share information about this carer, their own shifts, "
+    "and what they need to know for the people and sites they work with. Never share "
+    "other carers' personal details (phone, address, pay, availability) or participants' "
+    "health details beyond what the carer needs for their shift.\n"
     "used_kb_id: the [number] of the saved answer you relied on, or null.\n"
     "Replies are SMS: warm, plain, brief, Australian English, no markdown, no em dashes, "
     "use their first name at most once.\n"
@@ -281,11 +330,14 @@ def handle_carer_text(phone: str, body: str, carer: dict | None = None,
     ) or "(no saved answers yet)"
 
     try:
-        decision = _json(_claude(
-            TRIAGE_SYSTEM,
-            f"Carer first name: {name}\n\nRecent conversation:\n{history or '(none)'}\n\n"
+        now = datetime.now(timezone.utc).astimezone(MELB)
+        decision = _json(_claude_with_data(
+            TRIAGE_SYSTEM + klarra_data.schema_prompt(),
+            f"Today is {now.strftime('%A %d %B %Y, %H:%M')} Melbourne time.\n"
+            f"Carer: {who} (nurses.id {carer.get('id')}, phone {db.normalise_phone(phone)})\n\n"
+            f"Recent conversation:\n{history or '(none)'}\n\n"
             f"Saved answers:\n{kb_text}\n\nCarer's new text: \"{body}\"",
-            max_tokens=400,
+            max_tokens=600,
         ))
     except Exception:
         logger.exception("Help desk triage failed, escalating")
