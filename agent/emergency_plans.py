@@ -156,7 +156,7 @@ Return ONLY a JSON object with exactly these keys: {json.dumps(wanted)}"""
     text = "".join(b.text for b in msg.content if b.type == "text")
     m = re.search(r"\{.*\}", text, re.S)
     data = json.loads(m.group(0)) if m else {}
-    return {k: str(v).replace("—", ", ").replace("–", "-").strip()
+    return {k: re.sub(r"\s*[—–]\s*", ", ", str(v)).strip()
             for k, v in data.items() if k in wanted and str(v or "").strip()}
 
 
