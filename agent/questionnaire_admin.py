@@ -5,6 +5,10 @@ Paul's text commands for participant questionnaires (tools for admin_agent.py).
       Paul answers himself. Next incomplete section, one question per text, 15 min
       limit. Anything he doesn't know is left for carers (not flagged, no email).
 
+  create_emergency_plan(participant, redo=False)
+      Write the participant's Bubble Emergency Plan from their answers, risks and
+      progress notes (emergency_plans.py). Texts Paul when it's saved.
+
   text_carer_questionnaire(participant, carer=None)
       Find today's shift for the participant (optionally checking the carer's name),
       text the carer a heads-up now, and start the questions 30 min after the shift
@@ -16,6 +20,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 import db
+import emergency_plans
 import questionnaire as q
 import questionnaire_sms as qs
 
@@ -124,3 +129,15 @@ def text_carer_questionnaire(participant: str, carer: str | None = None, **_) ->
         text = (f"Done. I've given {res['carer_name']} a heads-up and will text them "
                 f"{p_name}'s {res['section']} questions at {q.pretty_time(start_at)}.")
     return {"reply_text": text}
+
+
+def create_emergency_plan(participant: str, phone: str, redo: bool = False, **_) -> dict:
+    """Write the participant's Emergency Plan in the background; Paul gets a text when done."""
+    user, problem = resolve_participant(participant)
+    if problem:
+        return {"error": problem}
+    emergency_plans.build_in_background(user, db.normalise_phone(phone), redo=bool(redo))
+    p = q.first_name(user)
+    what = "rewriting" if redo else "writing"
+    return {"reply_text": f"On it. I'm {what} {p}'s emergency plan now and will text you when "
+                          f"it's in Bubble (about a minute)."}

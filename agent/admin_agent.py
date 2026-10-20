@@ -12,6 +12,7 @@ set of tools and decides what to call, so Paul never has to follow a script:
   create_ndis_shift    create an NDIS shift (participant + NDIS Pricing item)
   start_my_questionnaire     Paul answers a participant's questionnaire himself by text
   text_carer_questionnaire   text the carer on today's shift a participant's questionnaire
+  create_emergency_plan      write a participant's Emergency Plan in Bubble
   not_an_admin_request hand the message back to the normal routing
 
 Conversation memory: the last few turns are kept per phone in admin_threads for
@@ -107,6 +108,9 @@ def _system() -> str:
         "participant to do the questionnaire, call text_carer_questionnaire with the "
         "participant's name and the carer's name if given. For both, send reply_text "
         "exactly as given. If a tool returns an error, tell Paul plainly.\n"
+        "8. If Paul asks you to create, write or fill in a participant's emergency plan, "
+        "call create_emergency_plan with the participant's name. Set redo to true only "
+        "if he asks to redo, rewrite or regenerate it. Send reply_text exactly as given.\n"
         "If the message is not addressed to you as an assistant, for example a "
         "facility style request to fill a shift through the normal system such as "
         "'EN morning shift tomorrow at Port Melbourne' stated as a need rather than a "
@@ -250,6 +254,21 @@ TOOLS = [
                 "participant": {"type": "string"},
                 "carer": {"type": "string", "description": "carer's name if Paul gave one"},
             },
+            "required": ["participant"],
+        },
+    },
+    {
+        "name": "create_emergency_plan",
+        "description": (
+            "Write a participant's Emergency Plan in Bubble (fire, hospital, infectious "
+            "disease, natural disaster, power outage, backup power, supplies) from their "
+            "questionnaire answers, risks and progress notes. Fills empty sections only "
+            "unless redo is true. Runs in the background; Paul gets a text when done."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"participant": {"type": "string"},
+                           "redo": {"type": "boolean"}},
             "required": ["participant"],
         },
     },
@@ -1014,6 +1033,8 @@ TOOL_FUNCS = {
     "start_my_questionnaire": lambda **a: questionnaire_admin.start_my_questionnaire(
         phone=_CURRENT_PHONE, **a),
     "text_carer_questionnaire": questionnaire_admin.text_carer_questionnaire,
+    "create_emergency_plan": lambda **a: questionnaire_admin.create_emergency_plan(
+        phone=_CURRENT_PHONE, **a),
 }
 _CURRENT_PHONE = None  # set by run(): the admin number texting right now
 
@@ -1098,7 +1119,8 @@ def run(phone: str, body: str) -> str | None:
                 return None
             logger.info("Admin agent tool %s %s", block.name, block.input)
             result = _call(block.name, block.input)
-            if block.name in ("start_my_questionnaire", "text_carer_questionnaire") \
+            if block.name in ("start_my_questionnaire", "text_carer_questionnaire",
+                              "create_emergency_plan") \
                     and isinstance(result, dict) and result.get("reply_text"):
                 # Reply straight away (saves a model round trip inside Twilio's timeout).
                 text = result["reply_text"]
