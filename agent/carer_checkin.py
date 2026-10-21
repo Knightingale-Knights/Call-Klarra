@@ -6,7 +6,13 @@ Daily at 10am Melbourne, Klarra texts up to CHECKIN_DAILY_LIMIT (15) carers who 
   - no availability in the next 30 days,
   - are still active, and haven't been checked in with in the last 30 days
 (Supabase RPC carers_due_checkin, longest idle first). Each carer is re-checked against
-Bubble before texting, so anyone Paul has already deactivated there is skipped.
+Bubble before texting: anyone Paul has already deactivated there is skipped, and so is
+anyone with a shift in Bubble in the last 30 days (Supabase only holds facility shifts).
+
+Follow-up: 2 days after a check-in, carers who replied YES are checked for availability
+in Bubble. If they have some, nothing is sent; if not, one follow-up text (10am to 6pm).
+2 days after that, if there is still no availability, account status and active are set
+to no in Bubble and nurses.active=false. No further text to the carer; Paul gets an FYI.
 
 Replies (routed here by sms_webhook while a check-in is open, 7 days):
   YES -> asked to add availability in the app; Paul gets an FYI.
@@ -104,6 +110,54 @@ def _still_active_in_bubble(bubble_user_id: str | None) -> bool:
         return False
 
 
+def _bubble_search(datatype: str, constraints: list, limit: int = 20) -> list[dict] | None:
+    """Search a Bubble data type. Returns None if the request failed."""
+    import json
+    try:
+        r = requests.get(f"{BUBBLE_BASE}/{datatype}", headers=_bubble_headers(), timeout=20,
+                         params={"limit": limit, "constraints": json.dumps(constraints)})
+        r.raise_for_status()
+        return r.json().get("response", {}).get("results", [])
+    except Exception:
+        logger.exception("Bubble %s search failed", datatype)
+        return None
+
+
+def _worked_recently_in_bubble(bubble_user_id: str | None, days: int = 30) -> bool:
+    """True if Bubble has a non-cancelled shift for this carer in the last `days` days.
+    Supabase only holds facility shifts from the daily sync, so NDIS and other shifts
+    can be missing there. On a failed lookup, returns True (don't text)."""
+    if not bubble_user_id:
+        return False
+    today = datetime.now(MELB).date()
+    start = (today - timedelta(days=days + 1)).isoformat()
+    end = (today + timedelta(days=1)).isoformat()
+    shifts = _bubble_search("shift", [
+        {"key": "carer", "constraint_type": "equals", "value": bubble_user_id},
+        {"key": "date", "constraint_type": "greater than", "value": start},
+        {"key": "date", "constraint_type": "less than", "value": end},
+    ])
+    if shifts is None:
+        return True
+    return any(not s.get("cancelled") for s in shifts)
+
+
+def _has_future_availability_in_bubble(bubble_user_id: str | None) -> bool | None:
+    """True if the carer has any availability from today on in Bubble. None if the
+    lookup failed."""
+    if not bubble_user_id:
+        return False
+    yesterday = (datetime.now(MELB).date() - timedelta(days=1)).isoformat()
+    avails = _bubble_search("availability", [
+        {"key": "carer", "constraint_type": "equals", "value": bubble_user_id},
+        {"key": "available", "constraint_type": "equals", "value": "true"},
+        {"key": "date", "constraint_type": "greater than", "value": yesterday},
+    ], limit=1)
+    if avails is None:
+        return None
+    return len(avails) > 0
+
+
 # --- sending -----------------------------------------------------------------
 
 def sent_today() -> int:
@@ -135,6 +189,10 @@ def run_once(limit: int | None = None) -> int:
         if not _still_active_in_bubble(n.get("bubble_user_id")):
             client.table("nurses").update({"active": False}).eq("id", n["id"]).execute()
             logger.info("Check-in skipped: %s is inactive in Bubble", n.get("first_name"))
+            continue
+        if _worked_recently_in_bubble(n.get("bubble_user_id")):
+            logger.info("Check-in skipped: %s has a shift in Bubble in the last 30 days",
+                        n.get("first_name"))
             continue
         msg = _message(n.get("first_name"))
         row = client.table("carer_checkins").insert({
@@ -202,6 +260,110 @@ def expire_no_replies() -> int:
     return len(names)
 
 
+FOLLOWUP_DAYS = 2
+FOLLOWUP_LAST_HOUR = 18  # follow-ups only go out 10am to 6pm Melbourne
+
+
+def _followup_message(first_name: str) -> str:
+    name = (first_name or "").strip().split(" ")[0] or "there"
+    return (f"Hey {name}, just following up as I haven't seen your availability be updated? "
+            "Were you still interested in working with us? If YES, that's great, just update "
+            "your availability in the next couple days so we can send you shifts =)")
+
+
+def send_followups() -> int:
+    """Carers who replied YES to a check-in sent FOLLOWUP_DAYS+ ago: if they now have
+    availability in Bubble, nothing is sent; if not, one follow-up text. Each check-in
+    is followed up at most once (carer_checkins.followup_status)."""
+    if db.DEV or db.MID:
+        return 0
+    now = datetime.now(MELB)
+    if not (SEND_HOUR <= now.hour < FOLLOWUP_LAST_HOUR):
+        return 0
+    client = db.get_client()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=FOLLOWUP_DAYS)).isoformat()
+    rows = (client.table("carer_checkins")
+            .select("*, nurses(id, first_name, active, bubble_user_id)")
+            .eq("status", "yes").is_("followup_status", "null")
+            .lt("sent_at", cutoff).limit(50).execute().data or [])
+    sent = 0
+    for c in rows:
+        nurse = c.get("nurses") or {}
+        if not nurse.get("active"):
+            continue
+        has_avail = _has_future_availability_in_bubble(nurse.get("bubble_user_id"))
+        if has_avail is None:
+            continue  # Bubble lookup failed, try again next poll
+        stamp = datetime.now(timezone.utc).isoformat()
+        if has_avail:
+            client.table("carer_checkins").update({
+                "followup_status": "not_needed", "followup_at": stamp,
+            }).eq("id", c["id"]).execute()
+            continue
+        claimed = (client.table("carer_checkins").update({
+            "followup_status": "sent", "followup_at": stamp,
+        }).eq("id", c["id"]).is_("followup_status", "null").execute().data or [])
+        if not claimed:
+            continue
+        msg = _followup_message(nurse.get("first_name"))
+        try:
+            db.send_sms(c["phone"], msg)
+            _log(c["phone"], "out", msg, nurse_id=c["nurse_id"])
+            sent += 1
+        except Exception:
+            logger.exception("Follow-up text to %s failed", nurse.get("first_name"))
+            client.table("carer_checkins").update({"followup_status": "failed"}) \
+                .eq("id", c["id"]).execute()
+        time.sleep(1)
+    if sent:
+        logger.info("Sent %d check-in follow-ups", sent)
+    return sent
+
+
+def final_checks() -> int:
+    """FOLLOWUP_DAYS after the follow-up text: if the carer still has no availability in
+    Bubble, set account status and active to no (Bubble and Supabase). No text to the
+    carer; Paul gets one summary text."""
+    if db.DEV or db.MID:
+        return 0
+    client = db.get_client()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=FOLLOWUP_DAYS)).isoformat()
+    rows = (client.table("carer_checkins")
+            .select("*, nurses(id, first_name, last_name, active, bubble_user_id)")
+            .eq("followup_status", "sent").lt("followup_at", cutoff)
+            .limit(50).execute().data or [])
+    names, failed = [], []
+    for c in rows:
+        nurse = c.get("nurses") or {}
+        has_avail = _has_future_availability_in_bubble(nurse.get("bubble_user_id"))
+        if has_avail is None:
+            continue  # Bubble lookup failed, try again next poll
+        stamp = datetime.now(timezone.utc).isoformat()
+        if has_avail or not nurse.get("active"):
+            client.table("carer_checkins").update({
+                "followup_status": "updated" if has_avail else "already_inactive",
+                "followup_at": stamp,
+            }).eq("id", c["id"]).execute()
+            continue
+        claimed = (client.table("carer_checkins").update({
+            "followup_status": "deactivated", "followup_at": stamp,
+        }).eq("id", c["id"]).eq("followup_status", "sent").execute().data or [])
+        if not claimed:
+            continue
+        name = f"{nurse.get('first_name') or ''} {nurse.get('last_name') or ''}".strip() or "A carer"
+        if not _deactivate_in_bubble(nurse.get("bubble_user_id")):
+            failed.append(name)
+        client.table("nurses").update({"active": False}).eq("id", c["nurse_id"]).execute()
+        names.append(name)
+    if names:
+        msg = (f"Check-in: still no availability after the follow-up, so I've marked "
+               f"{len(names)} inactive: {', '.join(names)}.")
+        if failed:
+            msg += f" Couldn't update Bubble for {', '.join(failed)}, please do those by hand."
+        _text_paul(msg)
+    return len(names)
+
+
 def _loop() -> None:
     last_day = None
     while True:
@@ -217,6 +379,14 @@ def _loop() -> None:
             expire_no_replies()
         except Exception:
             logger.exception("Check-in expiry failed")
+        try:
+            send_followups()
+        except Exception:
+            logger.exception("Check-in follow-ups failed")
+        try:
+            final_checks()
+        except Exception:
+            logger.exception("Check-in final checks failed")
         time.sleep(POLL_SECONDS)
 
 
