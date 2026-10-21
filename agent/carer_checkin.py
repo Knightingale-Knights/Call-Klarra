@@ -12,7 +12,7 @@ Replies (routed here by sms_webhook while a check-in is open, 7 days):
   YES -> asked to add availability in the app; Paul gets an FYI.
   NO  -> marked inactive in Bubble (User 'account status' = no and 'active' = no) and in Supabase
          (nurses.active = false); Paul gets an FYI.
-  No reply within 24h -> treated as NO: marked inactive (no text to the carer), Paul
+  No reply within 24h -> treated as NO: marked inactive and sent a goodbye text, Paul
          gets one summary text. A YES within 7 days of the check-in still reactivates them.
   Anything else goes to the help desk as normal.
 
@@ -156,9 +156,17 @@ def run_once(limit: int | None = None) -> int:
 NO_REPLY_HOURS = 24
 
 
+def _goodbye_message(first_name: str) -> str:
+    name = (first_name or "").strip().split(" ")[0] or "there"
+    return (f"Hi {name}, I didn't hear back so I've paused your account for now. We hate to "
+            "see you go. If you ever want to change your mind, just reply YES. We now work "
+            "across Wintringham, Brotherhood of St Laurence and VMCH so we have plenty of "
+            "shifts to keep you busy =)")
+
+
 def expire_no_replies() -> int:
     """Check-ins with no reply after NO_REPLY_HOURS count as a NO: the carer is marked
-    inactive in Bubble and Supabase (no text to the carer), and Paul gets one summary
+    inactive in Bubble and Supabase and sent a goodbye text, and Paul gets one summary
     text. A YES that arrives later still reactivates them (see handle_reply)."""
     if db.DEV or db.MID:
         return 0
@@ -179,6 +187,12 @@ def expire_no_replies() -> int:
             failed.append(name)
         client.table("nurses").update({"active": False}).eq("id", c["nurse_id"]).execute()
         names.append(name)
+        bye = _goodbye_message(nurse.get("first_name"))
+        try:
+            db.send_sms(c["phone"], bye)
+            _log(c["phone"], "out", bye, nurse_id=c["nurse_id"])
+        except Exception:
+            logger.exception("Goodbye text to %s failed", name)
     if names:
         msg = (f"Check-in: no reply after {NO_REPLY_HOURS}h, so I've marked "
                f"{len(names)} inactive: {', '.join(names)}.")
