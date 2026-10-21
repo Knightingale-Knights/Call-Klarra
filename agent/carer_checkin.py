@@ -56,9 +56,10 @@ def _bubble_headers() -> dict:
 
 def _message(first_name: str) -> str:
     name = (first_name or "").strip().split(" ")[0] or "there"
-    return (f"Hi {name}, it's Klarra from Knightingale. We haven't seen you on a shift for "
-            "a while and there's no availability in the app for the next month. Would you "
-            "still like to work with us? Reply YES or NO.")
+    return (f"Hi {name}, it's Klarra from Knightingale. Nice to meet you. We haven't seen "
+            "you on a shift for a while and I can't see any availability for you? Taking "
+            "the opportunity to check if you'd still like to work with us. Please let me "
+            "know when you have a moment by replying YES or NO.")
 
 
 def _norm(text: str) -> str:
@@ -218,15 +219,16 @@ def handle_reply(phone: str, body: str) -> str | None:
     }).eq("id", checkin["id"]).execute()
 
     if answer == "yes":
-        reply = ("Great to hear! Please add your availability in the Knightingale app so we "
-                 "can start offering you shifts.")
+        reply = ("Oh that's great news. Thanks so much. When you have a sec, can you update "
+                 "your availability please?")
         _text_paul(f"Check-in: {name} still wants to work. I've asked them to add availability.")
     else:
         problem = "" if _deactivate_in_bubble(nurse.get("bubble_user_id")) else (
             " Couldn't update Bubble, please set account status and active to no there.")
         client.table("nurses").update({"active": False}).eq("id", checkin["nurse_id"]).execute()
-        reply = ("No worries, thanks for letting us know. I've updated your account. If you "
-                 "ever want to come back, just text this number.")
+        reply = ("Oh, that's such a shame. We hate to see you go. If you ever want to change "
+                 "your mind, please let us know. We now work across Wintringham, Brotherhood "
+                 "of St Laurence and VMCH so we have plenty of shifts to keep you busy =)")
         _text_paul(f"Check-in: {name} replied NO, so I've marked them inactive.{problem}")
 
     _log(phone, "out", reply, nurse_id=checkin["nurse_id"])
