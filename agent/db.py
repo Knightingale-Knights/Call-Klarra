@@ -1051,8 +1051,8 @@ def upsert_nurse(bubble_id: str, first_name: str, last_name: str, phone: str,
         "first_name": first_name, "last_name": last_name,
         "phone": normalise_phone(phone),
         "role": role, "address": address, "bubble_user_id": bubble_id,
-        # The sync only fetches carers who are active in Bubble, so this re-activates
-        # anyone switched back on there (carer_checkin.py sets it false on a NO).
+        # Only called for carers with active=yes AND account status=yes in Bubble, so
+        # this re-activates anyone switched back on there.
         "active": True,
     }
     if existing.data:
@@ -1061,6 +1061,17 @@ def upsert_nurse(bubble_id: str, first_name: str, last_name: str, phone: str,
         return nid
     resp = client.table("nurses").insert(payload).execute()
     return resp.data[0]["id"]
+
+
+def deactivate_nurse_by_bubble(bubble_id: str) -> bool:
+    """Mark a carer inactive (nurses.active=false) by Bubble _id, so they are never
+    offered shifts. Rows are kept for history. Returns True if a row was changed."""
+    if _blocked(f"deactivate_nurse_by_bubble {bubble_id}"):
+        return False
+    client = get_client()
+    r = (client.table("nurses").update({"active": False})
+         .eq("bubble_user_id", bubble_id).eq("active", True).execute())
+    return bool(r.data)
 
 
 def set_nurse_approvals(nurse_id: int, slugs: list[str]) -> None:

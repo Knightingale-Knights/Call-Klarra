@@ -4,7 +4,9 @@ Bubble -> Supabase sync.
 Pulls active carers and their availability from Bubble's Data API and upserts them
 into Supabase so Klarra works from real, current data.
 
-  - nurses:    User where account type=carer, active=true  -> nurses (+ approvals)
+  - nurses:    User where account type=carer, active=yes AND account status=yes
+               -> nurses (+ approvals). Carers failing either are not added, and any
+               already in Supabase are marked nurses.active=false (never offered shifts).
   - availability: Availability where available=true        -> availability
   - shifts:    Shift (facility shifts)                      -> shifts
 
@@ -175,17 +177,35 @@ def fetch_all(datatype: str, constraints: list | None = None) -> list[dict]:
     return results
 
 
+def is_eligible(u: dict) -> bool:
+    """A carer is synced only if BOTH 'active' and 'account status' are yes in Bubble.
+    'account status' is accepted as a yes/no field or as text 'yes'."""
+    status = u.get("account status")
+    status_yes = status is True or str(status).strip().lower() == "yes"
+    return u.get("active") is True and status_yes
+
+
 def sync_nurses(since: datetime | None = None):
+    # Fetch every carer (not just active ones) so a carer switched off in Bubble is
+    # seen and marked inactive in Supabase, instead of silently staying offerable.
     users = fetch_all("user", constraints=[
         {"key": "account type", "constraint_type": "equals", "value": "carer"},
-        {"key": "active", "constraint_type": "equals", "value": "true"},
     ] + modified_since(since))
     logger.info("Fetched %d carers from Bubble", len(users))
     synced = 0
     skipped_no_role = 0
     skipped_no_phone = 0
+    skipped_ineligible = 0
+    deactivated = 0
     by_role: dict[str, int] = {}
     for u in users:
+        if not is_eligible(u):
+            # Not added to Supabase; if already there, marked inactive so Klarra
+            # never offers them a shift. History and offers are kept.
+            skipped_ineligible += 1
+            if db.deactivate_nurse_by_bubble(u["_id"]):
+                deactivated += 1
+            continue
         role = pick_role(u.get("roles"))
         phone = u.get("phone number")
         if not role:
@@ -210,8 +230,9 @@ def sync_nurses(since: datetime | None = None):
         synced += 1
     logger.info("Synced %d nurses (%s)", synced,
                 ", ".join(f"{r}: {c}" for r, c in sorted(by_role.items())) or "none")
-    logger.info("Skipped: %d no staffable role, %d no phone",
-                skipped_no_role, skipped_no_phone)
+    logger.info("Skipped: %d not active/account status yes (%d newly marked inactive), "
+                "%d no staffable role, %d no phone",
+                skipped_ineligible, deactivated, skipped_no_role, skipped_no_phone)
     if _unmapped_roles:
         logger.warning("Unmapped Bubble roles seen (add to ROLE_ALIASES if staffable): %s",
                        ", ".join(sorted(_unmapped_roles)))
