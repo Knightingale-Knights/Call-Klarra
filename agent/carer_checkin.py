@@ -12,12 +12,14 @@ Replies (routed here by sms_webhook while a check-in is open, 7 days):
   YES -> asked to add availability in the app; Paul gets an FYI.
   NO  -> marked inactive in Bubble (User 'account status' = no and 'active' = no) and in Supabase
          (nurses.active = false); Paul gets an FYI.
+  No reply within 24h -> treated as NO: marked inactive (no text to the carer), Paul
+         gets one summary text. A YES within 7 days of the check-in still reactivates them.
   Anything else goes to the help desk as normal.
 
 Every check-in text and reply is also logged in helpdesk_messages, so Klarra has the
 context if the carer keeps texting.
 
-Table: carer_checkins (nurse_id, phone, message, status sent|yes|no|failed, reply,
+Table: carer_checkins (nurse_id, phone, message, status sent|yes|no|no_reply|failed, reply,
 sent_at, replied_at). Started by sms_orchestrator.py (start_worker).
 """
 
@@ -151,6 +153,41 @@ def run_once(limit: int | None = None) -> int:
     return sent
 
 
+NO_REPLY_HOURS = 24
+
+
+def expire_no_replies() -> int:
+    """Check-ins with no reply after NO_REPLY_HOURS count as a NO: the carer is marked
+    inactive in Bubble and Supabase (no text to the carer), and Paul gets one summary
+    text. A YES that arrives later still reactivates them (see handle_reply)."""
+    if db.DEV or db.MID:
+        return 0
+    client = db.get_client()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=NO_REPLY_HOURS)).isoformat()
+    rows = (client.table("carer_checkins")
+            .select("*, nurses(id, first_name, last_name, bubble_user_id)")
+            .eq("status", "sent").lt("sent_at", cutoff).limit(50).execute().data or [])
+    names, failed = [], []
+    for c in rows:
+        claimed = (client.table("carer_checkins").update({"status": "no_reply"})
+                   .eq("id", c["id"]).eq("status", "sent").execute().data or [])
+        if not claimed:
+            continue
+        nurse = c.get("nurses") or {}
+        name = f"{nurse.get('first_name') or ''} {nurse.get('last_name') or ''}".strip() or "A carer"
+        if not _deactivate_in_bubble(nurse.get("bubble_user_id")):
+            failed.append(name)
+        client.table("nurses").update({"active": False}).eq("id", c["nurse_id"]).execute()
+        names.append(name)
+    if names:
+        msg = (f"Check-in: no reply after {NO_REPLY_HOURS}h, so I've marked "
+               f"{len(names)} inactive: {', '.join(names)}.")
+        if failed:
+            msg += f" Couldn't update Bubble for {', '.join(failed)}, please do those by hand."
+        _text_paul(msg)
+    return len(names)
+
+
 def _loop() -> None:
     last_day = None
     while True:
@@ -162,11 +199,31 @@ def _loop() -> None:
                 last_day = now.date()
         except Exception:
             logger.exception("Check-in run failed")
+        try:
+            expire_no_replies()
+        except Exception:
+            logger.exception("Check-in expiry failed")
         time.sleep(POLL_SECONDS)
 
 
 def start_worker() -> None:
     threading.Thread(target=_loop, name="carer-checkins", daemon=True).start()
+
+
+def _reactivate_in_bubble(bubble_user_id: str | None) -> bool:
+    if not bubble_user_id:
+        return False
+    url = f"{BUBBLE_BASE}/user/{bubble_user_id}"
+    for status_value in (True, "yes"):
+        try:
+            r = requests.patch(url, headers=_bubble_headers(), timeout=20,
+                               json={"active": True, "account status": status_value})
+            if r.ok:
+                return True
+            logger.warning("Bubble reactivate attempt failed (%s): %s", r.status_code, r.text)
+        except Exception:
+            logger.exception("Bubble reactivate request failed")
+    return False
 
 
 def _deactivate_in_bubble(bubble_user_id: str | None) -> bool:
@@ -193,7 +250,7 @@ def open_checkin(phone: str) -> dict | None:
     since = (datetime.now(timezone.utc) - timedelta(days=REPLY_WINDOW_DAYS)).isoformat()
     r = (db.get_client().table("carer_checkins")
          .select("*, nurses(id, first_name, last_name, bubble_user_id)")
-         .eq("phone", db.normalise_phone(phone)).eq("status", "sent")
+         .eq("phone", db.normalise_phone(phone)).in_("status", ["sent", "no_reply"])
          .gte("sent_at", since).order("sent_at", desc=True).limit(1).execute())
     return r.data[0] if r.data else None
 
@@ -208,6 +265,13 @@ def handle_reply(phone: str, body: str) -> str | None:
     answer = "yes" if t in YES else "no" if t in NO else None
     if not answer:
         return None
+    late = checkin["status"] == "no_reply"
+    if late and answer == "no":
+        # Already treated as a NO: just record what they said.
+        db.get_client().table("carer_checkins").update({
+            "status": "no", "reply": body,
+            "replied_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", checkin["id"]).execute()
 
     client = db.get_client()
     nurse = checkin.get("nurses") or {}
@@ -221,7 +285,19 @@ def handle_reply(phone: str, body: str) -> str | None:
     if answer == "yes":
         reply = ("Oh that's great news. Thanks so much. When you have a sec, can you update "
                  "your availability please?")
-        _text_paul(f"Check-in: {name} still wants to work. I've asked them to add availability.")
+        if late:
+            # They were marked inactive for not replying in time: switch them back on.
+            ok = _reactivate_in_bubble(nurse.get("bubble_user_id"))
+            client.table("nurses").update({"active": True}).eq("id", checkin["nurse_id"]).execute()
+            _text_paul(f"Check-in: {name} replied YES after the 24h cutoff, so I've made them "
+                       "active again and asked them to add availability."
+                       + ("" if ok else " Couldn't update Bubble, please set them active there."))
+        else:
+            _text_paul(f"Check-in: {name} still wants to work. I've asked them to add availability.")
+    elif late:
+        reply = ("Oh, that's such a shame. We hate to see you go. If you ever want to change "
+                 "your mind, please let us know. We now work across Wintringham, Brotherhood "
+                 "of St Laurence and VMCH so we have plenty of shifts to keep you busy =)")
     else:
         problem = "" if _deactivate_in_bubble(nurse.get("bubble_user_id")) else (
             " Couldn't update Bubble, please set account status and active to no there.")
