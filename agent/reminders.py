@@ -10,13 +10,16 @@ Only reachable from Paul's number: admin_agent only runs for the admin phone, so
 carer texting "remind me..." never touches this.
 
 Table: public.reminders (id, phone, message, remind_at, status, source_text,
-sent_at, created_at). status: pending -> sent | failed | cancelled.
+sent_at, created_at, followups, last_nudged_at, done_at).
+status: pending -> sent -> done | failed | cancelled.
+Once sent, Klarra follows up every 30 min (up to 3 times) until Paul texts "done"
+(mark_done, called by sms_webhook ahead of the admin agent).
 """
 
 import time
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import db
@@ -104,12 +107,71 @@ def send_due() -> int:
             continue
         row = claimed[0]
         try:
-            db.send_sms(row["phone"], f"Reminder: {row['message']}")
+            db.send_sms(row["phone"], f"Reminder: {row['message']}\nText me \"done\" when it's sorted.")
             sent += 1
         except Exception:
             logger.exception("Reminder %s failed to send", row["id"])
             client.table("reminders").update({"status": "failed"}).eq("id", row["id"]).execute()
     return sent
+
+
+FOLLOWUP_MINUTES = 30
+MAX_FOLLOWUPS = 3
+DONE_WORDS = {"done", "all done", "its done", "it's done", "sorted", "done thanks",
+              "done thank you", "completed", "finished", "did it", "done it"}
+
+
+def send_followups() -> int:
+    """A reminder Paul hasn't replied 'done' to gets a follow-up every FOLLOWUP_MINUTES,
+    up to MAX_FOLLOWUPS times."""
+    client = db.get_client()
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=FOLLOWUP_MINUTES)).isoformat()
+    oldest = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+    rows = (client.table("reminders").select("*")
+            .eq("status", "sent").lt("followups", MAX_FOLLOWUPS)
+            .lte("sent_at", cutoff).gte("sent_at", oldest).limit(50).execute().data) or []
+    nudged = 0
+    for r in rows:
+        last = r.get("last_nudged_at") or r.get("sent_at")
+        if last and _parse_utc(last) > datetime.now(timezone.utc) - timedelta(minutes=FOLLOWUP_MINUTES):
+            continue
+        n = (r.get("followups") or 0) + 1
+        claimed = (client.table("reminders")
+                   .update({"followups": n, "last_nudged_at": datetime.now(timezone.utc).isoformat()})
+                   .eq("id", r["id"]).eq("followups", n - 1).eq("status", "sent")
+                   .execute().data) or []
+        if not claimed:
+            continue
+        last_one = n >= MAX_FOLLOWUPS
+        body = f"Following up: {r['message']}. Text me \"done\" when it's sorted."
+        if last_one:
+            body = f"Last nudge on this one: {r['message']}. Text me \"done\" when it's sorted."
+        try:
+            db.send_sms(r["phone"], body)
+            nudged += 1
+        except Exception:
+            logger.exception("Reminder follow-up %s failed", r["id"])
+    return nudged
+
+
+def mark_done(phone: str, body: str) -> str | None:
+    """Paul texting 'done': close his most recent reminder still waiting on it.
+    Returns the reply, or None if the text isn't 'done' or nothing is waiting."""
+    t = " ".join((body or "").lower().replace("!", " ").replace(".", " ").split())
+    if t not in DONE_WORDS:
+        return None
+    client = db.get_client()
+    rows = (client.table("reminders").select("*")
+            .eq("phone", db.normalise_phone(phone)).eq("status", "sent")
+            .gte("sent_at", (datetime.now(timezone.utc) - timedelta(days=1)).isoformat())
+            .order("sent_at", desc=True).limit(1).execute().data) or []
+    if not rows:
+        return None
+    r = rows[0]
+    client.table("reminders").update({
+        "status": "done", "done_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", r["id"]).execute()
+    return f"Nice one. Marked done: {r['message']}"
 
 
 def _loop():
@@ -119,6 +181,10 @@ def _loop():
             send_due()
         except Exception:
             logger.exception("Reminder poll failed")
+        try:
+            send_followups()
+        except Exception:
+            logger.exception("Reminder follow-up poll failed")
         time.sleep(POLL_SECONDS)
 
 

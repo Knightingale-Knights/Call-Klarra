@@ -64,6 +64,7 @@ import admin_agent
 import questionnaire_sms
 import helpdesk
 import carer_checkin
+import reminders
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -747,6 +748,14 @@ def sms():
         dup_response = handle_duplicate_review_reply(body)
         if dup_response is not None:
             return dup_response
+
+        # "done" closes the reminder Klarra is following up on.
+        try:
+            done_reply = reminders.mark_done(from_number, body)
+            if done_reply:
+                return twiml_reply(done_reply)
+        except Exception:
+            logger.exception("Reminder done handling failed")
 
         # Help desk: Paul answering a carer's question ("Q12 <answer>"), or testing
         # the help desk himself ("? what's the uniform").
