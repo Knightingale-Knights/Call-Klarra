@@ -1051,6 +1051,9 @@ def upsert_nurse(bubble_id: str, first_name: str, last_name: str, phone: str,
         "first_name": first_name, "last_name": last_name,
         "phone": normalise_phone(phone),
         "role": role, "address": address, "bubble_user_id": bubble_id,
+        # The sync only fetches carers who are active in Bubble, so this re-activates
+        # anyone switched back on there (carer_checkin.py sets it false on a NO).
+        "active": True,
     }
     if existing.data:
         nid = existing.data[0]["id"]

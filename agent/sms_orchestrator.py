@@ -37,7 +37,8 @@ agreed to anything. If they later decline, the facility has already been told th
 covering it and someone has to walk that back manually.
 
 Also runs helpdesk.py's timeout checker (carers told "Checking with Paul" after 15 min
-waiting) and the reminders.py sender on background threads (Paul's personal
+waiting), carer_checkin.py's daily 10am "still want to work?" texts, and the
+reminders.py sender on background threads (Paul's personal
 reminders, set by texting Klarra).
 
 Run:  python agent/sms_orchestrator.py
@@ -55,6 +56,7 @@ from dotenv import load_dotenv
 import db
 import reminders
 import helpdesk
+import carer_checkin
 from orchestrator import rank_pool, rotate_top10
 
 load_dotenv()
@@ -468,6 +470,7 @@ def main():
                 db.KLARRA_MODE, POLL_SECONDS)
     reminders.start_worker()
     helpdesk.start_worker()
+    carer_checkin.start_worker()
     while True:
         try:
             check_adhoc_timeouts()

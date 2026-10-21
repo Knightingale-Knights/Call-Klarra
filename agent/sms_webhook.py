@@ -63,6 +63,7 @@ import db
 import admin_agent
 import questionnaire_sms
 import helpdesk
+import carer_checkin
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -791,6 +792,16 @@ def sms():
     active_adhoc = db.get_active_adhoc_offer_by_phone(from_number)
     if active_adhoc:
         return handle_adhoc_offer_reply(active_adhoc, body)
+
+    # A carer answering "would you still like to work?" (carer_checkin.py). Checked before
+    # late-offer replies, so their YES isn't mistaken for an old shift offer.
+    if not _is_admin_number(from_number):
+        try:
+            checkin_reply = carer_checkin.handle_reply(from_number, body)
+            if checkin_reply:
+                return twiml_reply(checkin_reply)
+        except Exception:
+            logger.exception("Check-in reply handling failed, continuing normal routing")
 
     facility = db.facility_by_phone(from_number)
 
