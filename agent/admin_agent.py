@@ -88,6 +88,9 @@ def _system() -> str:
         "4. Report replies (check_replies) when Paul asks who has answered.\n"
         "If a name matches several carers, ask which one. If a tool returns an error, "
         "tell Paul plainly what went wrong.\n"
+        "When a carer replies YES, the shift is created in Bubble automatically and Paul "
+        "is told, so don't create it again yourself. For Williamstown, pass shift_code if "
+        "Paul named one.\n"
         "After offer_shift succeeds, confirm briefly who was texted and that you will "
         "tell him as replies come in.\n"
         "5. Create a shift in Bubble for a named carer (create_shift). Needs carer, "
@@ -192,6 +195,9 @@ TOOLS = [
                 "facility": {"type": "string", "description": "Site name as Paul said it"},
                 "date": {"type": "string", "description": "YYYY-MM-DD"},
                 "shift_type": {"type": "string", "enum": BLOCKS},
+                "shift_code": {"type": "string", "description": (
+                    "Williamstown only, if Paul named one (D6, D7, D9, A2, A3). Used when "
+                    "the shift is created after the carer says yes.")},
             },
             "required": ["nurse_names", "facility", "date", "shift_type"],
         },
@@ -440,7 +446,7 @@ def tool_check_nurse(nurse_name, date, **_):
             "date": date, "available_blocks": blocks}
 
 
-def tool_offer_shift(nurse_names, facility, date, shift_type, **_):
+def tool_offer_shift(nurse_names, facility, date, shift_type, shift_code=None, **_):
     if db.MID:
         return {"error": "KLARRA_MODE is mid, so carers cannot be contacted. Nothing sent."}
     if not _valid_date(date) or shift_type not in BLOCKS:
@@ -495,6 +501,7 @@ def tool_offer_shift(nurse_names, facility, date, shift_type, **_):
             "status": "offered",
             "offered_at": "now()",
             "batch_id": batch_id,
+            "shift_code": (shift_code or "").strip().upper() or None,
         }).execute()
         offer_id = row.data[0]["id"]
         try:
@@ -714,7 +721,7 @@ def _res_pricing_key(template: dict) -> str | None:
     return RES_PRICING_KEY
 
 
-def tool_create_shift(nurse_name, facility, date, shift_type, shift_code=None, **_):
+def tool_create_shift(nurse_name, facility, date, shift_type, shift_code=None, _nurse=None, **_):
     if db.DEV:
         return {"error": "KLARRA_MODE is dev, so no shift was created."}
     if not _valid_date(date) or shift_type not in BLOCKS:
@@ -723,7 +730,10 @@ def tool_create_shift(nurse_name, facility, date, shift_type, shift_code=None, *
     if target < _now_melb().date():
         return {"error": "that date is in the past, nothing created"}
 
-    nurse, err = _resolve_nurse(nurse_name)
+    if _nurse:
+        nurse, err = _nurse, None
+    else:
+        nurse, err = _resolve_nurse(nurse_name)
     if err:
         return err
     fac = db.find_facility_by_name(facility)
@@ -1238,6 +1248,44 @@ def run(phone: str, body: str) -> str | None:
         messages.append({"role": "user", "content": results})
 
     return "Sorry, that took too many steps. Can you try again?"
+
+
+# --- carer said YES to an offer: create the shift --------------------------
+
+def create_shift_for_offer(offer: dict) -> str:
+    """A carer accepted an ad hoc offer: create the shift in Bubble (and Supabase) and
+    return the text for Paul. In a group offer only the first YES gets the shift."""
+    client = db.get_client()
+    nurse = db.get_nurse(offer["nurse_id"]) or {}
+    name = nurse.get("first_name") or "Carer"
+    what = (f"the {offer['shift_type']} shift at {offer.get('facility_name') or 'the site'} "
+            f"on {db.pretty_date(offer['date'])}")
+
+    if offer.get("batch_id"):
+        taken = (client.table("sms_adhoc_offers").select("id, nurses(first_name)")
+                 .eq("batch_id", offer["batch_id"]).neq("id", offer["id"])
+                 .not_.is_("shift_created", "null").limit(1).execute().data or [])
+        if taken:
+            other = (taken[0].get("nurses") or {}).get("first_name") or "someone else"
+            return f"{name} also said yes to {what}, but I'd already created it for {other}."
+
+    # Claim it so a second YES in the same batch can't create a duplicate.
+    client.table("sms_adhoc_offers").update({"shift_created": "pending"}).eq("id", offer["id"]).execute()
+    result = tool_create_shift(
+        nurse_name=name, facility=offer.get("facility_name") or "", date=offer["date"],
+        shift_type=offer["shift_type"], shift_code=offer.get("shift_code"), _nurse=nurse,
+    )
+    if result.get("bubble_shift_id"):
+        client.table("sms_adhoc_offers").update(
+            {"shift_created": result["bubble_shift_id"]}).eq("id", offer["id"]).execute()
+        return f"{name} confirmed {what}. I've created the shift in Bubble."
+
+    client.table("sms_adhoc_offers").update({"shift_created": None}).eq("id", offer["id"]).execute()
+    if result.get("needs_choice"):
+        return (f"{name} confirmed {what}, but I need the shift code to create it: "
+                f"{', '.join(result['needs_choice'])}. Text me e.g. 'create it D7'.")
+    problem = result.get("error") or result.get("problem") or "unknown problem"
+    return f"{name} confirmed {what}, but I couldn't create the shift: {problem}"
 
 
 # --- group reply summary ---------------------------------------------------

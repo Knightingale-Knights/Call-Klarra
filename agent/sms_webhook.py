@@ -546,6 +546,31 @@ def handle_adhoc_offer_reply(offer: dict, body: str) -> Response:
 
     late_note = (" (this came in after I'd flagged no response)"
                  if offer.get("timeout_alerted") else "")
+
+    if answer == "yes":
+        # Create the shift in Bubble straight away, in the background (Bubble calls can
+        # take longer than Twilio waits), then tell Paul it's confirmed and created.
+        import threading
+
+        def create():
+            try:
+                text = admin_agent.create_shift_for_offer(offer)
+            except Exception as e:
+                logger.exception("Auto shift create failed")
+                text = (f"{nurse_name} confirmed the {offer['shift_type']} shift at "
+                        f"{offer.get('facility_name') or 'the facility'} on "
+                        f"{db.pretty_date(offer['date'])}, but I couldn't create it: {e}")
+            try:
+                db.send_sms(ADMIN_PHONE, text + late_note)
+                summary = admin_agent.batch_summary(offer.get("batch_id"))
+                if summary:
+                    db.send_sms(ADMIN_PHONE, summary)
+            except Exception:
+                logger.exception("Failed to notify admin of auto shift create")
+
+        threading.Thread(target=create, daemon=True).start()
+        return twiml_reply("Great, thanks! Confirmed.")
+
     admin_text = (
         f"{nurse_name} {status} the {offer['shift_type']} shift at "
         f"{offer.get('facility_name') or 'the facility'} on "
