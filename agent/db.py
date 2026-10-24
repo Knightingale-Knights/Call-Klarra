@@ -1048,7 +1048,10 @@ def upsert_nurse(bubble_id: str, first_name: str, last_name: str, phone: str,
     client = get_client()
     existing = client.table("nurses").select("id").eq("bubble_user_id", bubble_id).limit(1).execute()
     payload = {
-        "first_name": first_name, "last_name": last_name,
+        # Bubble names often carry stray spaces ("Isaac "), which broke exact name
+        # matches in Klarra's lookups, so always store them trimmed.
+        "first_name": " ".join((first_name or "").split()),
+        "last_name": " ".join((last_name or "").split()),
         "phone": normalise_phone(phone),
         "role": role, "address": address, "bubble_user_id": bubble_id,
         # Only called for carers with active=yes AND account status=yes in Bubble, so

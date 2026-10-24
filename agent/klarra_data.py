@@ -54,6 +54,7 @@ _schema_cache: tuple[float, str] | None = None
 
 def query(sql: str):
     """Run one read-only query. Returns a list of rows, or {'error': ...}."""
+    sql = (sql or "").strip().rstrip(";").strip()
     try:
         r = db.get_client().rpc("klarra_query", {"q": sql}).execute()
     except Exception as e:
@@ -103,7 +104,10 @@ TOOL = {
         "Run ONE read-only SQL SELECT against Knightingale's Supabase database (Postgres). "
         "Returns up to 100 rows as JSON. Use it to look up carers, shifts, rosters, "
         "participants, availability, offers, progress notes, policies and anything else "
-        "in the schema. Never select embedding columns. Use ILIKE for names. Dates: "
+        "in the schema. Never select embedding columns. Match people by name loosely: "
+        "first_name ILIKE '%isaac%' (with % on both sides), never = or ILIKE without %. "
+        "If a name search finds nothing, try again more loosely (part of the name, or "
+        "last_name) before saying there are no results. Dates: "
         "shifts.start_time is UTC, convert with AT TIME ZONE 'Australia/Melbourne'."
     ),
     "input_schema": {
