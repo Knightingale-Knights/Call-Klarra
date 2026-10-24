@@ -251,14 +251,37 @@ def generate_for_template(template: dict) -> tuple | None:
             roster_line(template, target_date))
 
 
+def send_roster_reminder(nurse_id: int) -> None:
+    """One short text per nurse, regardless of how many recurring shifts they got this run."""
+    nurse = db.get_nurse(nurse_id)
+    if not nurse or not nurse.get("phone"):
+        logger.warning("Skipping roster reminder for nurse %s: no phone on file", nurse_id)
+        return
+    name = nurse.get("first_name") or "there"
+    # Plain ASCII on purpose (straight apostrophes) so it stays a single 160 character segment.
+    body = (f"Hi {name}, it's Klarra. Next week's roster is up. Please check your shifts "
+            f"and let Paul know if anything looks off. Have a fun day =)")
+    try:
+        db.send_sms(nurse["phone"], body)
+        logger.info("Sent roster reminder to nurse %s", nurse_id)
+    except Exception:
+        logger.exception("Failed to send roster reminder to nurse %s", nurse_id)
+
+
 def main():
     templates = db.get_active_recurring_templates()
     logger.info("Found %d active recurring templates", len(templates))
+    nurse_ids: set = set()
     for t in templates:
         try:
-            generate_for_template(t)
+            if generate_for_template(t):
+                nurse_ids.add(t["nurse_id"])
         except Exception:
             logger.exception("Failed generating shift for template %s", t.get("id"))
+
+    logger.info("Sending roster reminders to %d nurse(s)", len(nurse_ids))
+    for nurse_id in sorted(nurse_ids):
+        send_roster_reminder(nurse_id)
 
 
 if __name__ == "__main__":
