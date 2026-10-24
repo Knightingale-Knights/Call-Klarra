@@ -673,11 +673,7 @@ def handle_carer_link_request(phone: str, body: str, allow_auto: bool = False) -
         logger.exception("Carer link request failed (%s)", kind)
         if kind == "auto":
             return None
-    word = "check out" if kind == "checkout" else "check in"
-    return twiml_reply(
-        f"Sorry, I couldn't get your {word} link just now. Please try again in a minute, "
-        "or call Paul."
-    )
+    return twiml_reply("Sorry, I couldn't get your link just now. Please try again soon or call Paul.")
 
 
 AGENT_DEADLINE_SECONDS = 11
