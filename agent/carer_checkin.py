@@ -4,7 +4,8 @@ Inactive carer check-ins.
 Daily at 10am Melbourne, Klarra texts up to CHECKIN_DAILY_LIMIT (15) carers who have:
   - no shift in the last 30 days, and
   - no availability in the next 30 days,
-  - are still active, and haven't been checked in with in the last 30 days
+  - are still active, an account created more than 30 days ago, and haven't been checked in
+    with in the last 30 days
 (Supabase RPC carers_due_checkin, longest idle first). Each carer is re-checked against
 Bubble before texting: anyone Paul has already deactivated there is skipped, and so is
 anyone with a shift in Bubble in the last 30 days (Supabase only holds facility shifts).
@@ -110,6 +111,32 @@ def _still_active_in_bubble(bubble_user_id: str | None) -> bool:
         return False
 
 
+def _account_older_than(nurse_id: int, bubble_user_id: str | None, days: int = 30) -> bool:
+    """True if the carer's account was created more than `days` days ago. Uses the Bubble
+    user's Created Date, falling back to nurses.created_at. On any doubt, returns False
+    (don't text)."""
+    created = None
+    try:
+        if bubble_user_id:
+            r = requests.get(f"{BUBBLE_BASE}/user/{bubble_user_id}", headers=_bubble_headers(),
+                             timeout=20)
+            if r.ok:
+                created = r.json().get("response", {}).get("Created Date")
+        if not created:
+            row = (db.get_client().table("nurses").select("created_at").eq("id", nurse_id)
+                   .limit(1).execute().data or [])
+            created = row[0].get("created_at") if row else None
+        if not created:
+            return False
+        dt = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt <= datetime.now(timezone.utc) - timedelta(days=days)
+    except Exception:
+        logger.exception("Could not check account age for nurse %s", nurse_id)
+        return False
+
+
 def _bubble_search(datatype: str, constraints: list, limit: int = 20) -> list[dict] | None:
     """Search a Bubble data type. Returns None if the request failed."""
     import json
@@ -189,6 +216,9 @@ def run_once(limit: int | None = None) -> int:
         if not _still_active_in_bubble(n.get("bubble_user_id")):
             client.table("nurses").update({"active": False}).eq("id", n["id"]).execute()
             logger.info("Check-in skipped: %s is inactive in Bubble", n.get("first_name"))
+            continue
+        if not _account_older_than(n["id"], n.get("bubble_user_id")):
+            logger.info("Check-in skipped: %s's account is under 30 days old", n.get("first_name"))
             continue
         if _worked_recently_in_bubble(n.get("bubble_user_id")):
             logger.info("Check-in skipped: %s has a shift in Bubble in the last 30 days",
