@@ -21,7 +21,7 @@ Replies (routed here by sms_webhook while a check-in is open, 7 days):
          (nurses.active = false); Paul gets an FYI.
   No reply within 24h -> treated as NO: marked inactive and sent a goodbye text, Paul
          gets one summary text. A YES within 7 days of the check-in still reactivates them.
-  Anything else goes to the help desk as normal.
+  Anything else counts as a reply (never paused) and goes to the help desk for Paul.
 
 Every check-in text and reply is also logged in helpdesk_messages, so Klarra has the
 context if the carer keeps texting.
@@ -265,6 +265,14 @@ def expire_no_replies() -> int:
             .eq("status", "sent").lt("sent_at", cutoff).limit(50).execute().data or [])
     names, failed = [], []
     for c in rows:
+        # Belt and braces: any text from them since the check-in counts as a reply.
+        replied = (client.table("helpdesk_messages").select("id")
+                   .eq("phone", c["phone"]).eq("direction", "in")
+                   .gte("created_at", c["sent_at"]).limit(1).execute().data or [])
+        if replied:
+            client.table("carer_checkins").update({"status": "replied"}).eq("id", c["id"]) \
+                .eq("status", "sent").execute()
+            continue
         claimed = (client.table("carer_checkins").update({"status": "no_reply"})
                    .eq("id", c["id"]).eq("status", "sent").execute().data or [])
         if not claimed:
@@ -478,6 +486,14 @@ def handle_reply(phone: str, body: str) -> str | None:
     t = _norm(body)
     answer = "yes" if t in YES else "no" if t in NO else None
     if not answer:
+        # Anything other than a plain YES/NO ("Yes. Injured atm.", "available weekends")
+        # still counts as a reply, so they are never paused for not replying. The
+        # message itself carries on to the help desk, so Paul handles it.
+        first = t.split(" ")[0] if t else ""
+        db.get_client().table("carer_checkins").update({
+            "status": "yes" if first in YES else "no" if first in NO else "replied",
+            "reply": body, "replied_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", checkin["id"]).in_("status", ["sent"]).execute()
         return None
     late = checkin["status"] == "no_reply"
     if late and answer == "no":
