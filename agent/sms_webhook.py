@@ -145,6 +145,156 @@ def parse_request(text: str) -> dict | None:
     return data
 
 
+# Williamstown shift codes -> (shift_type, start, end). Mirrors admin_agent's table.
+SHIFT_CODES = {
+    "D6": ("Morning", "06:00", "14:00"),
+    "D7": ("Morning", "07:00", "15:00"),
+    "D9": ("Morning", "09:00", "17:00"),
+    "A2": ("Afternoon", "14:00", "22:00"),
+    "A3": ("Afternoon", "14:45", "22:15"),
+}
+
+MAX_PER_REQUEST = 10
+
+
+def parse_requests(text: str) -> list | None:
+    """Read a facility's free-text staffing request. Returns a list of request dicts
+    (one per role/shift, each with a 'count'), or None if nothing usable was found.
+
+    A request whose role is just "nurse" comes back with role 'NURSE' so the caller can
+    ask RN or EN rather than guess. Williamstown codes (D6, D7, D9, A2, A3) fill in the
+    shift type and times."""
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    msg = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=600,
+        messages=[{
+            "role": "user",
+            "content": (
+                "A care facility texted Knightingale (an aged care / NDIS staffing agency) "
+                "asking for staff. Read it the way a human scheduler would, in any wording. "
+                "The text may ask for several roles and/or several people.\n\n"
+                "Roles: RN (registered nurse), EN (enrolled nurse), PCA (personal care "
+                "assistant, also AIN, PCW, care worker), DSW (disability support worker, "
+                "also support worker). If the text says just 'nurse' with no level, use "
+                "role \"NURSE\". Never substitute one role for another. If a role is "
+                "something else entirely, skip that item.\n\n"
+                "Shift types: Morning, Afternoon, Night. Shift codes: D6, D7, D9 are "
+                "Morning, A2 and A3 are Afternoon; if a code is given, put it in "
+                "shift_code and set shift_type from it. 'x 2', '2 x', 'two' mean count 2; "
+                "default count is 1. Dates: resolve 'tomorrow', weekday names, 'Monday' etc. "
+                "to the next such day from today. If the text gives both a weekday and "
+                "'tomorrow' they refer to the same day.\n\n"
+                "Respond ONLY with JSON: "
+                '{"requests":[{"date":"YYYY-MM-DD","shift_type":"Morning|Afternoon|Night",'
+                '"role":"RN|EN|PCA|DSW|NURSE","count":1,"shift_code":"D7 or null",'
+                '"start_time":"HH:MM or null","end_time":"HH:MM or null",'
+                '"facility":"site name as written, or null if none is mentioned"}]}. '
+                "start_time/end_time only if the text states or clearly implies specific "
+                "times; otherwise null. If there is no usable staffing request, respond "
+                '{"requests":[]}. '
+                f"Today is {_today_melb()} (Australia/Melbourne). SMS: \"{text}\""
+            ),
+        }],
+    )
+    raw = msg.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+    try:
+        items = json.loads(raw).get("requests") or []
+    except Exception:
+        return None
+
+    out = []
+    for it in items:
+        role = str(it.get("role") or "").strip().upper()
+        if role not in STAFFED_ROLES + ["NURSE"]:
+            continue
+        code = str(it.get("shift_code") or "").strip().upper()
+        if code in SHIFT_CODES:
+            stype, start, end = SHIFT_CODES[code]
+            it["shift_type"] = it.get("shift_type") or stype
+            it["start_time"] = it.get("start_time") or start
+            it["end_time"] = it.get("end_time") or end
+        if not it.get("date") or it.get("shift_type") not in ("Morning", "Afternoon", "Night"):
+            continue
+        try:
+            count = int(it.get("count") or 1)
+        except Exception:
+            count = 1
+        it["count"] = max(1, min(count, MAX_PER_REQUEST))
+        it["role"] = role
+        out.append(it)
+    return out or None
+
+
+def _create_requests(items: list, facility: dict, callback: str) -> Response:
+    """Log one shift_request per person needed. Collins must name the target site."""
+    resolved = []
+    for it in items:
+        target_id = facility["id"]
+        if facility["slug"] == "collins":
+            match = db.find_facility_by_name(it.get("facility"))
+            if not match:
+                return twiml_reply(
+                    "Which site is this shift for? Please include the facility name, "
+                    "e.g. 'EN morning shift tomorrow at Port Melbourne'."
+                )
+            target_id = match["id"]
+        resolved.append((it, target_id))
+
+    try:
+        for it, target_id in resolved:
+            for _ in range(it["count"]):
+                db.create_shift_request(
+                    facility_id=target_id,
+                    callback_number=callback,
+                    date=it["date"],
+                    shift_type=it["shift_type"],
+                    role=it["role"],
+                    source="sms",
+                    start_time=it.get("start_time"),
+                    end_time=it.get("end_time"),
+                )
+    except Exception:
+        logger.exception("Failed to log SMS request")
+        return twiml_reply("Something went wrong logging your request. Please try calling instead.")
+    return twiml_reply(random.choice(ACK_REPLIES))
+
+
+def _handle_facility_text(body: str, facility: dict, from_number: str, callback: str) -> Response:
+    """Natural-language facility intake, including the RN-or-EN follow-up."""
+    pending = None
+    try:
+        pending = db.get_pending_requests(from_number)
+    except Exception:
+        logger.exception("Pending request lookup failed")
+
+    if pending:
+        m = re.search(r"\b(rn|en)\b|registered|enrolled", body.lower())
+        if m:
+            tok = m.group(1) or ("rn" if "registered" in m.group(0) else "en")
+            level = tok.upper()
+            for it in pending:
+                if it["role"] == "NURSE":
+                    it["role"] = level
+            db.clear_pending_requests(from_number)
+            return _create_requests(pending, facility, callback)
+        # Not an answer: drop the held request and treat this as a fresh text.
+        db.clear_pending_requests(from_number)
+
+    items = parse_requests(body)
+    if not items:
+        return twiml_reply(
+            "Sorry, I couldn't read that. Please text the date, shift "
+            "(morning/afternoon/night) and role (RN/EN/PCA/DSW)."
+        )
+
+    if any(it["role"] == "NURSE" for it in items):
+        db.save_pending_requests(from_number, items)
+        return twiml_reply("RN or EN?")
+
+    return _create_requests(items, facility, callback)
+
+
 def parse_admin_command(text: str) -> dict:
     """
     Classify a text from Paul (the admin number) as one of two ad hoc commands, or
@@ -873,39 +1023,7 @@ def sms():
     if db.DEV and from_number not in db.dev_testers():
         callback = os.environ.get("KLARRA_DEV_PHONE", from_number)
 
-    parsed = parse_request(body)
-    if not parsed:
-        return twiml_reply(
-            "Sorry, I couldn't read that. Please text the date, shift "
-            "(morning/afternoon/night) and role (RN/EN/PCA/DSW)."
-        )
-
-    target_facility_id = facility["id"]
-    if facility["slug"] == "collins":
-        match = db.find_facility_by_name(parsed.get("facility"))
-        if not match:
-            return twiml_reply(
-                "Which site is this shift for? Please include the facility name, "
-                "e.g. 'EN morning shift tomorrow at Port Melbourne'."
-            )
-        target_facility_id = match["id"]
-
-    try:
-        req_id = db.create_shift_request(
-            facility_id=target_facility_id,
-            callback_number=callback,
-            date=parsed["date"],
-            shift_type=parsed["shift_type"],
-            role=parsed["role"],
-            source="sms",
-            start_time=parsed.get("start_time"),
-            end_time=parsed.get("end_time"),
-        )
-    except Exception as e:
-        logger.exception("Failed to log SMS request")
-        return twiml_reply("Something went wrong logging your request. Please try calling instead.")
-
-    return twiml_reply(random.choice(ACK_REPLIES))
+    return _handle_facility_text(body, facility, from_number, callback)
 
 
 if __name__ == "__main__":

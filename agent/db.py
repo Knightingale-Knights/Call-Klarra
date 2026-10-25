@@ -377,6 +377,34 @@ def create_shift_request(facility_id: int | None, callback_number: str,
     return new_id
 
 
+def save_pending_requests(phone: str, requests_list: list) -> None:
+    """Hold a facility's parsed-but-incomplete requests until they answer a follow-up."""
+    get_client().table("facility_pending_requests").upsert({
+        "phone": phone,
+        "requests": requests_list,
+        "created_at": "now()",
+    }).execute()
+
+
+def get_pending_requests(phone: str, max_age_minutes: int = 120) -> list | None:
+    """Pending requests for this number, or None if none or older than max_age_minutes."""
+    from datetime import datetime, timedelta, timezone
+    r = (get_client().table("facility_pending_requests").select("*")
+         .eq("phone", phone).limit(1).execute())
+    if not r.data:
+        return None
+    row = r.data[0]
+    created = datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
+    if datetime.now(timezone.utc) - created > timedelta(minutes=max_age_minutes):
+        clear_pending_requests(phone)
+        return None
+    return row["requests"]
+
+
+def clear_pending_requests(phone: str) -> None:
+    get_client().table("facility_pending_requests").delete().eq("phone", phone).execute()
+
+
 # --- Orchestrator queue helpers (Step E) ---
 
 def claim_next_request() -> dict | None:
