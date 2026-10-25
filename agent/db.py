@@ -835,24 +835,66 @@ def get_available_nurses(date: str, shift_type: str, role: str) -> list[dict]:
 # one specific carer for a specific shift, Klarra texts only that carer, and there's
 # no shift_request or ranking involved at all.
 
+def display_phone(phone: str | None) -> str:
+    """+61412345678 -> 0412 345 678 for showing to Paul."""
+    digits = "".join(c for c in str(phone or "") if c.isdigit())
+    if digits.startswith("61") and len(digits) == 11:
+        digits = "0" + digits[2:]
+    if len(digits) == 10:
+        return f"{digits[:4]} {digits[4:7]} {digits[7:]}"
+    return str(phone or "no number")
+
+
+def nurse_label(n: dict) -> str:
+    """'Maria Garcia (RN, 0412 345 321)': enough to tell two carers with one name apart."""
+    detail = ", ".join(x for x in [(n.get("role") or "").strip(), display_phone(n.get("phone"))] if x)
+    return f"{n['first_name']} {n['last_name']} ({detail})"
+
+
 def find_nurse_by_name(name: str) -> tuple[dict | None, list[dict]]:
     """
     Fuzzy-match a typed carer name against nurses. Returns (nurse, candidates):
     exactly one is populated — a single confident match, or a short list when more
     than one carer plausibly matches (e.g. two carers named Maria), so the caller can
     ask Paul which one he means instead of guessing.
+
+    A name can carry the end of the carer's phone number to tell same-named carers
+    apart: 'Maria Garcia 321' (last 3 digits) or 'Maria Garcia 0412 345 321' (any
+    number of trailing digits, 3 or more).
     """
     if not name:
         return None, []
     client = get_client()
     resp = client.table("nurses").select("id, first_name, last_name, phone, role").execute()
     all_nurses = resp.data or []
+
+    import re
+    digits = re.sub(r"\D", "", name)
+    if len(digits) >= 3:
+        letters = re.sub(r"[\d+()\-]", " ", name).lower().split()
+        def digits_of(n):
+            d = re.sub(r"\D", "", n.get("phone") or "")
+            return d
+        by_phone = [n for n in all_nurses if digits_of(n).endswith(digits[-9:] if len(digits) >= 9 else digits)]
+        if letters:
+            def name_ok(n):
+                full = f"{n['first_name']} {n['last_name']}".lower()
+                return all(w in full for w in letters)
+            by_phone = [n for n in by_phone if name_ok(n)]
+        if len(by_phone) == 1:
+            return by_phone[0], []
+        if len(by_phone) > 1:
+            return None, by_phone
+        return None, []
+
     needle = name.lower().strip()
 
     full_matches = [n for n in all_nurses
                     if f"{n['first_name']} {n['last_name']}".lower().strip() == needle]
     if len(full_matches) == 1:
         return full_matches[0], []
+    if len(full_matches) > 1:
+        return None, full_matches
 
     first_matches = [n for n in all_nurses if (n["first_name"] or "").lower().strip() == needle]
     if len(first_matches) == 1:

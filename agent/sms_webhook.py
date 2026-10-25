@@ -376,8 +376,8 @@ def handle_text_nurse_command(parsed: dict) -> Response:
 
     nurse, candidates = db.find_nurse_by_name(name)
     if candidates:
-        opts = ", ".join(f"{c['first_name']} {c['last_name']}" for c in candidates)
-        return twiml_reply(f"A few carers match '{name}': {opts}. Which one?")
+        opts = "; ".join(db.nurse_label(c) for c in candidates)
+        return twiml_reply(f"A few carers match '{name}': {opts}. Which one? Reply with the name and the last 3 digits of their number.")
     if not nurse:
         return twiml_reply(f"Couldn't find a carer named '{name}'.")
 

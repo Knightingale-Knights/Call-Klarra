@@ -86,7 +86,9 @@ def _system() -> str:
         "If something is missing, ask for just that, one question. Texts are real, "
         "so only call offer_shift when Paul clearly asked you to text or ask carers.\n"
         "4. Report replies (check_replies) when Paul asks who has answered.\n"
-        "If a name matches several carers, ask which one. If a tool returns an error, "
+        "If a name matches several carers, ask Paul which one, listing each with their phone "
+        "number, then use the name plus the last 3 digits of the phone number he picks "
+        "(e.g. 'Maria Garcia 321'). If a tool returns an error, "
         "tell Paul plainly what went wrong.\n"
         "When a carer replies YES, the shift is created in Bubble automatically and Paul "
         "is told, so don't create it again yourself. For Williamstown, pass shift_code if "
@@ -346,7 +348,10 @@ def _resolve_nurse(name: str) -> tuple[dict | None, dict | None]:
         return None, {
             "name": name,
             "problem": "ambiguous",
-            "matches": [f"{c['first_name']} {c['last_name']}" for c in candidates],
+            "matches": [db.nurse_label(c) for c in candidates],
+            "hint": ("Ask Paul which one, listing each match with its phone number. When he "
+                     "answers, call again using the name plus the last 3 digits of that "
+                     "carer's phone number, e.g. 'Maria Garcia 321'."),
         }
     if not nurse:
         return None, {"name": name, "problem": "not_found"}
@@ -1121,8 +1126,9 @@ def tool_message_carer(nurse_names, message, **_):
         if nurse:
             resolved.append(nurse)
         elif candidates:
-            opts = ", ".join(f"{c['first_name']} {c['last_name']}" for c in candidates)
-            problems.append(f"'{name}' could be {opts}")
+            opts = "; ".join(db.nurse_label(c) for c in candidates)
+            problems.append(f"'{name}' could be {opts}. Ask Paul which one, then use the name "
+                            "plus the last 3 digits of their phone number")
         else:
             problems.append(f"no carer called '{name}'")
     if problems:
