@@ -149,6 +149,32 @@ def _num(v):
         return None
 
 
+def ensure_participant(bubble_id: str) -> int | None:
+    """Supabase id for this participant. If they are not in Supabase yet (a participant
+    added in Bubble since the last participant sync), fetch them from Bubble and add
+    them now, named by first name like sync_participants.py does. None if Bubble
+    cannot supply them either."""
+    pid = db.participant_id_by_bubble(bubble_id)
+    if pid:
+        return pid
+    try:
+        r = requests.get(f"{BUBBLE_BASE}/user/{bubble_id}", headers=BUBBLE_HEADERS, timeout=15)
+        r.raise_for_status()
+        user = r.json().get("response") or {}
+    except Exception:
+        logger.exception("Could not fetch participant %s from Bubble", bubble_id)
+        return None
+    name = user.get("first name")
+    if not name:
+        logger.warning("Participant %s has no first name in Bubble, not added", bubble_id)
+        return None
+    resp = db.get_client().table("participants").insert(
+        {"name": name, "bubble_id": bubble_id}
+    ).execute()
+    logger.info("Added new participant %s (%s) to Supabase", name, bubble_id)
+    return resp.data[0]["id"]
+
+
 @app.route("/shift-sync", methods=["POST"])
 def shift_sync():
     f = request.form
@@ -179,10 +205,11 @@ def shift_sync():
         return jsonify({"error": f"unknown nurse_bubble_id {nurse_bubble_id}"}), 404
 
     facility_id = db.facility_id_by_slug(facility_slug) if facility_slug else None
-    participant_id = (db.participant_id_by_bubble(participant_bubble_id)
+    participant_id = (ensure_participant(participant_bubble_id)
                       if participant_bubble_id else None)
     if not facility_id and not participant_id:
-        return jsonify({"error": "must supply facility_slug or participant_bubble_id"}), 400
+        return jsonify({"error": "must supply facility_slug or participant_bubble_id "
+                                 "(or the participant could not be found in Bubble)"}), 400
 
     # Is this an EDIT of a shift that already belongs to a weekly series?
     existing_shift = db.get_shift_by_bubble_id(shift_bubble_id)
