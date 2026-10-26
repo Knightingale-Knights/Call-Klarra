@@ -896,6 +896,8 @@ def tool_create_shift(nurse_name, facility, date, shift_type, shift_code=None, _
     except Exception:
         logger.exception("Shift %s created in Bubble but follow-up sync failed", new_id)
         problems.append("shift is in Bubble but the Supabase or availability update failed")
+    if not addr_text:
+        problems.append("no address set, add it in Bubble")
 
     code_txt = f"{_code} " if _code else ""
     label = BLOCK_LABEL[shift_type]
