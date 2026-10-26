@@ -840,9 +840,10 @@ def tool_create_shift(nurse_name, facility, date, shift_type, shift_code=None, _
             return {"error": (f"{nurse['first_name']} already has a shift that overlaps "
                               f"({other}). Nothing created.")}
 
-    # Bubble stores time past midnight on an overnight shift as 24xx (0700 -> 3100).
+    # Facility shifts store the end time as the clock time (a night shift ending at
+    # 0715 is 715, not 3115); Bubble works out it's the next day.
     start_num = int(start)
-    end_num = int(end) + (2400 if e_dt.date() > s_dt.date() else 0)
+    end_num = int(end)
 
     # Facility shifts have a 30 minute unpaid break: an 8h shift is 7.5h.
     hours = round((e_dt - s_dt).total_seconds() / 3600 - 0.5, 2)
