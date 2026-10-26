@@ -51,7 +51,7 @@ logger = logging.getLogger("knightingale-admin-agent")
 MODEL = "claude-sonnet-4-6"
 ROLES = ["RN", "EN", "PCA", "DSW"]
 BLOCKS = ["Morning", "Afternoon", "Night"]
-MAX_STEPS = 10
+MAX_STEPS = 14
 THREAD_MINUTES = 30
 MAX_HISTORY = 10  # messages kept per thread (user + assistant)
 
@@ -68,6 +68,11 @@ def _system() -> str:
         f"Today is {now.strftime('%A %d %B %Y')} ({now.strftime('%Y-%m-%d')}), "
         "Australia/Melbourne time. Resolve words like tomorrow, Friday, next Tuesday "
         "to a YYYY-MM-DD date yourself.\n\n"
+        "You can only act by calling tools in this reply. Once you send text without a "
+        "tool call, you stop and cannot do anything later, so never reply with what you "
+        "are about to do ('I'll create them now', 'let me kick them off'). Call the tools "
+        "first, then reply with what actually happened. For several shifts, call "
+        "create_shift once per shift, all in the same step.\n\n"
         "Reply as an SMS: plain text, short, no markdown, never use em dashes. Paul "
         "writes casually, so interpret loosely. Never invent names or availability, "
         "always use the tools.\n\n"
@@ -1217,6 +1222,16 @@ def _save_history(phone: str, messages: list) -> None:
         logger.exception("Could not save admin thread")
 
 
+PROMISE_PHRASES = ("i'll ", "i will ", "let me ", "i'm going to ", "i am going to ",
+                   "kick them off", "on it", "doing it now", "creating them now",
+                   "will do that now", "one moment", "give me a sec")
+
+
+def _sounds_like_a_promise(text: str) -> bool:
+    t = text.lower().replace("\u2019", "'")
+    return any(p in t for p in PROMISE_PHRASES)
+
+
 # --- entry point -----------------------------------------------------------
 
 def run(phone: str, body: str) -> str | None:
@@ -1227,19 +1242,30 @@ def run(phone: str, body: str) -> str | None:
     messages = history + [user_msg]
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
+    used_tools = False
+    nudged = False
     for _ in range(MAX_STEPS):
         resp = client.messages.create(
-            model=MODEL, max_tokens=700, system=_system(),
+            model=MODEL, max_tokens=1500, system=_system(),
             tools=TOOLS, messages=messages,
         )
         if resp.stop_reason != "tool_use":
             text = "".join(b.text for b in resp.content if b.type == "text").strip()
             if not text:
                 return None
+            # Promised to do something but called no tools: make it actually do it.
+            if not used_tools and not nudged and _sounds_like_a_promise(text):
+                nudged = True
+                messages.append({"role": "assistant", "content": text})
+                messages.append({"role": "user", "content": (
+                    "[system] You haven't done it yet. Call the tools now to do what Paul "
+                    "asked, then reply with what actually happened.")})
+                continue
             _save_history(phone, history + [user_msg, {"role": "assistant", "content": text}])
             return text
 
         messages.append({"role": "assistant", "content": resp.content})
+        used_tools = True
         results = []
         for block in resp.content:
             if block.type != "tool_use":
