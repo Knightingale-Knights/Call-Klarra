@@ -930,9 +930,30 @@ def find_nurse_by_name(name: str) -> tuple[dict | None, list[dict]]:
     if len(first_matches) > 1:
         return None, first_matches
 
+    import re
     import difflib
-    by_full = {f"{n['first_name']} {n['last_name']}".lower().strip(): n for n in all_nurses}
-    close = difflib.get_close_matches(needle, by_full.keys(), n=3, cutoff=0.6)
+
+    def words(text: str) -> list[str]:
+        return re.findall(r"[a-z]+", (text or "").lower())
+
+    # Every word Paul typed appears in the carer's name ("nhi dao" -> "Quynh Nhi (Nhi) Dao").
+    typed = words(needle)
+    if typed:
+        token_matches = [n for n in all_nurses
+                         if set(typed) <= set(words(f"{n['first_name']} {n['last_name']}"))]
+        if len(token_matches) == 1:
+            return token_matches[0], []
+        if len(token_matches) > 1:
+            return None, token_matches
+
+    # Typos ("suhkpreet kaur"): take the closest name if it is clearly the best.
+    by_full = {" ".join(words(f"{n['first_name']} {n['last_name']}")): n for n in all_nurses}
+    clean = " ".join(typed)
+    scored = sorted(((difflib.SequenceMatcher(None, clean, k).ratio(), k) for k in by_full),
+                    reverse=True)
+    if scored and scored[0][0] >= 0.8 and (len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.1):
+        return by_full[scored[0][1]], []
+    close = [k for r, k in scored[:3] if r >= 0.6]
     if len(close) == 1:
         return by_full[close[0]], []
     if len(close) > 1:
