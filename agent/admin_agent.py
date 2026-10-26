@@ -717,6 +717,14 @@ def _find_shift_template(location_id: str, start_num: int, role: str):
 RES_PRICING_KEY = "res pricing "
 
 
+def _bubble_location(location_id: str) -> dict:
+    """A site's Location record from Bubble (address, and supervisor if set there)."""
+    r = requests.get(f"{BUBBLE_BASE}/location/{location_id}", headers=_bubble_headers(),
+                     timeout=20)
+    r.raise_for_status()
+    return r.json().get("response", {})
+
+
 def _res_pricing_key(template: dict) -> str | None:
     """The Data API name of the Shift field linking to Residential Pricing, read
     off a real shift. Bubble keeps a field's original API name after a rename, so
@@ -776,12 +784,6 @@ def tool_create_shift(nurse_name, facility, date, shift_type, shift_code=None, _
     if not carer_bid:
         return {"error": f"{nurse['first_name']} has no Bubble id, cannot create the shift"}
 
-    clash = (db.get_client().table("shifts").select("id")
-             .eq("nurse_id", nurse["id"]).eq("date", date)
-             .neq("status", "cancelled").limit(1).execute().data)
-    if clash:
-        return {"error": f"{nurse['first_name']} already has a shift on {date}. Nothing created."}
-
     if role not in PRICING_NAMES:
         return {"error": (f"{role} shifts use NDIS pricing, not residential. "
                           "If this is an NDIS shift, ask Paul for the participant. "
@@ -797,16 +799,15 @@ def tool_create_shift(nurse_name, facility, date, shift_type, shift_code=None, _
     if not pricing:
         return {"error": f"no Residential Pricing record named '{pricing_name}'. Nothing created."}
 
-    template = _find_shift_template(location_id, int(start), role)
-    if not template:
-        return {"error": (f"no earlier {role} {shift_type} shift at {fac['name']} "
-                          f"({start}) to copy the role, address and supervisor from. "
-                          "Create the first one in Bubble.")}
-    pricing_key = _res_pricing_key(template)
-    if not pricing_key:
-        return {"error": (f"the earlier {fac['name']} shift has no residential pricing "
-                          "set, so the pricing field name could not be read. "
-                          "Nothing created.")}
+    # Everything comes from Bubble's own tables (Location, Residential Pricing) and the
+    # standard site times, never from copying an earlier shift.
+    try:
+        loc = _bubble_location(location_id)
+    except Exception:
+        logger.exception("Could not read Location %s from Bubble, using Supabase address", location_id)
+        loc = {}
+    addr = loc.get("address")
+    addr_text = (addr.get("address") if isinstance(addr, dict) else addr) or fac.get("address")
 
     rate = float(pricing.get("rate") or 0)
     carer_pay = float(pricing.get("carer pay") or 0)
@@ -821,6 +822,28 @@ def tool_create_shift(nurse_name, facility, date, shift_type, shift_code=None, _
             hour=int(end[:2]), minute=int(end[2:]), tzinfo=MELB)
     midnight = datetime(target.year, target.month, target.day, tzinfo=MELB)
 
+    # Two shifts on the same day are fine as long as the times don't overlap. Check the
+    # day before and after too, since night shifts cross midnight.
+    nearby = (db.get_client().table("shifts").select("start_time, end_time, date")
+              .eq("nurse_id", nurse["id"])
+              .gte("date", (target - timedelta(days=1)).isoformat())
+              .lte("date", (target + timedelta(days=1)).isoformat())
+              .neq("status", "cancelled").execute().data or [])
+    for row in nearby:
+        try:
+            rs = datetime.fromisoformat(str(row["start_time"]).replace("Z", "+00:00"))
+            re_ = datetime.fromisoformat(str(row["end_time"]).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if rs < e_dt and s_dt < re_:
+            other = f"{rs.astimezone(MELB):%a %d %b %H%M}-{re_.astimezone(MELB):%H%M}"
+            return {"error": (f"{nurse['first_name']} already has a shift that overlaps "
+                              f"({other}). Nothing created.")}
+
+    # Bubble stores time past midnight on an overnight shift as 24xx (0700 -> 3100).
+    start_num = int(start)
+    end_num = int(end) + (2400 if e_dt.date() > s_dt.date() else 0)
+
     # Facility shifts have a 30 minute unpaid break: an 8h shift is 7.5h.
     hours = round((e_dt - s_dt).total_seconds() / 3600 - 0.5, 2)
 
@@ -830,17 +853,17 @@ def tool_create_shift(nurse_name, facility, date, shift_type, shift_code=None, _
         "carer": carer_bid,
         "location": location_id,
         "date": midnight.isoformat(),
-        "start time": template["start time"],
-        "end time": template["end time"],
+        "start time": start_num,
+        "end time": end_num,
         "hours": hours,
         "rate": rate,
         "fee": round(hours * rate, 2),
         "wage": round(hours * carer_pay, 2),
         "revenue": round(hours * hourly_rev, 2),
-        "roles": template.get("roles"),
-        "address": template.get("address"),
-        pricing_key: pricing["_id"],
-        "supervisor": template.get("supervisor"),
+        "roles": [role],
+        "address": addr_text,
+        RES_PRICING_KEY: pricing["_id"],
+        "supervisor": loc.get("supervisor") or "NO",
         "check in time": s_dt.isoformat(),
         "check out time": e_dt.isoformat(),
     }

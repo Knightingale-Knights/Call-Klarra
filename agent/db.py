@@ -287,7 +287,7 @@ def find_facility_by_name(name: str | None) -> dict | None:
     if not name:
         return None
     client = get_client()
-    resp = client.table("facilities").select("id, name, slug, complexity").execute()
+    resp = client.table("facilities").select("id, name, slug, complexity, address").execute()
     candidates = [f for f in (resp.data or []) if f["slug"] != "collins"]
     needle = name.lower().strip()
 
