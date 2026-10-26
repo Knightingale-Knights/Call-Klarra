@@ -643,7 +643,7 @@ HOLIDAY_YEARS = {2026, 2027}
 PRICING_NAMES = {
     "EN": {"AM": "EN AM", "PM": "EN PM", "NS": "EN NS",
            "SAT": "EN SAT", "SUN": "EN SUN", "PH": "EN PH"},
-    "PCA": {"AM": "PCA AM", "PM": "PCA PM", "NS": "PCA NT",
+    "PCA": {"AM": "PCA AM", "PM": "PCA PM", "NS": "PCA NS",
             "SAT": "PCA SAT", "SUN": "PCA SUN", "PH": "PCA P/H"},
     "RN": {"AM": "RN JNR AM", "PM": "RN JNR PM", "NS": "JNR RN NS",
            "SAT": "RN JNR SAT", "SUN": "RN JNR SUN", "PH": "RN JNR PH"},

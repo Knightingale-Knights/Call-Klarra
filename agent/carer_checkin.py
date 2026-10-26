@@ -471,10 +471,19 @@ def _deactivate_in_bubble(bubble_user_id: str | None) -> bool:
 def open_checkin(phone: str) -> dict | None:
     since = (datetime.now(timezone.utc) - timedelta(days=REPLY_WINDOW_DAYS)).isoformat()
     r = (db.get_client().table("carer_checkins")
-         .select("*, nurses(id, first_name, last_name, bubble_user_id)")
-         .eq("phone", db.normalise_phone(phone)).in_("status", ["sent", "no_reply"])
+         .select("*, nurses(id, first_name, last_name, bubble_user_id, active)")
+         .eq("phone", db.normalise_phone(phone)).in_("status", ["sent", "no_reply", "replied"])
          .gte("sent_at", since).order("sent_at", desc=True).limit(1).execute())
-    return r.data[0] if r.data else None
+    if not r.data:
+        return None
+    c = r.data[0]
+    if c["status"] == "replied":
+        # Already replied in their own words. Only reopen it if they've since been
+        # paused (e.g. a goodbye text went out), so a YES switches them back on.
+        if (c.get("nurses") or {}).get("active"):
+            return None
+        c["status"] = "no_reply"
+    return c
 
 
 def handle_reply(phone: str, body: str) -> str | None:
