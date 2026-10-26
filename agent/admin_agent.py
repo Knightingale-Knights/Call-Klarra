@@ -719,8 +719,13 @@ RES_PRICING_KEY = "res pricing "
 
 def _bubble_location(location_id: str) -> dict:
     """A site's Location record from Bubble (address, and supervisor if set there)."""
-    r = requests.get(f"{BUBBLE_BASE}/location/{location_id}", headers=_bubble_headers(),
-                     timeout=20)
+    # The Bubble data type is "Locations", so its Data API path is /locations.
+    r = None
+    for endpoint in ("locations", "location"):
+        r = requests.get(f"{BUBBLE_BASE}/{endpoint}/{location_id}", headers=_bubble_headers(),
+                         timeout=20)
+        if r.status_code != 404:
+            break
     r.raise_for_status()
     return r.json().get("response", {})
 
