@@ -692,6 +692,17 @@ def handle_adhoc_offer_reply(offer: dict, body: str) -> Response:
     if answer not in ("yes", "no"):
         return twiml_reply("Sorry, I didn't catch that — reply YES or NO for the shift.")
 
+    # Group offer: if another carer in the batch already got this shift, this YES is late.
+    already_filled = False
+    if answer == "yes" and offer.get("batch_id"):
+        try:
+            taken = (db.get_client().table("sms_adhoc_offers").select("id")
+                     .eq("batch_id", offer["batch_id"]).neq("id", offer["id"])
+                     .not_.is_("shift_created", "null").limit(1).execute().data)
+            already_filled = bool(taken)
+        except Exception:
+            logger.exception("Could not check whether the batch shift was filled")
+
     status = "accepted" if answer == "yes" else "declined"
     db.mark_adhoc_offer(offer["id"], status, replied_at="now()")
 
@@ -720,6 +731,9 @@ def handle_adhoc_offer_reply(offer: dict, body: str) -> Response:
                 logger.exception("Failed to notify admin of auto shift create")
 
         threading.Thread(target=create, daemon=True).start()
+        if already_filled:
+            return twiml_reply("Thanks for replying. Sorry, that shift has just been "
+                               "filled by someone else.")
         return twiml_reply("Great, thanks! Confirmed.")
 
     admin_text = (
