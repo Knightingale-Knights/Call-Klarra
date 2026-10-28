@@ -401,7 +401,8 @@ TRIAGE_SYSTEM = (
     "health, medication or wellbeing, a complaint, a safety risk, or anything legal or "
     "disciplinary. These always go to Paul.\n"
     "Replies are SMS: warm, plain, brief, Australian English, no markdown, no em dashes, "
-    "use their first name at most once.\n"
+    "use their first name at most once. Never say or imply you checked, asked or "
+    "confirmed with Paul; just give the answer.\n"
     'Respond ONLY with JSON: {"kind":"draft|unknown|ack","used_kb_id":number|null,'
     '"topic":"...","confident":true|false,"sensitive":true|false,"reply":"text or empty"}'
 )
@@ -569,7 +570,8 @@ COMPOSE_SYSTEM = (
     "or to correcting anything. Write:\n"
     "reply = the SMS you, Klarra, send the carer. Use ONLY what Paul said; never add "
     "facts, conditions or advice. Warm, plain, brief, Australian English, no markdown, "
-    "no em dashes. You may say you've checked with Paul.\n"
+    "no em dashes. Never say or imply you checked, asked or confirmed with Paul; just "
+    "give the answer.\n"
     "kb_question = the carer's message as a general situation or question any carer "
     "could send (no names, dates or details specific to this carer), e.g. \"What should "
     "I do if I'm sick and can't make my shift?\".\n"
@@ -754,7 +756,8 @@ CORRECTION_SYSTEM = (
     "director) says it was wrong. His correction may be terse. Write:\n"
     "reply = a follow-up SMS to the carer, starting \"Quick update on my last message:\", "
     "giving the right answer. Use ONLY what Paul said. Warm, plain, brief, Australian "
-    "English, no markdown, no em dashes.\n"
+    "English, no markdown, no em dashes. Never say or imply you checked, asked or "
+    "confirmed with Paul.\n"
     "kb_question = the carer's message as a general question any carer could send.\n"
     "kb_answer = the right general answer, using only what Paul said.\n"
     "saved_answer_wrong = true if the saved answer shown is itself wrong (replace it), "
