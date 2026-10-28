@@ -88,6 +88,16 @@ def _system() -> str:
         "reply_text exactly as given, nothing added or removed. Questions about "
         "availability never send any texts.\n"
         "2. Say whether one named carer is available (check_nurse).\n"
+        "2a. FIND A CARER (fill_shift). When Paul asks you to find, fill, cover or get "
+        "someone for a shift, for example 'find me an EN for Port Melbourne PM tomorrow' "
+        "or 'I need a PCA Friday morning at Williamstown', do NOT list who is free and "
+        "do NOT ask whether to text them. Call fill_shift straight away: it texts every "
+        "available carer of that role approved for the site, and the first YES gets the "
+        "shift (created in Bubble automatically, Paul is told). You need role, site, "
+        "date and block. If any of those is missing, ask for just that, one short "
+        "question. After it succeeds, reply with one short line: how many carers were "
+        "texted and that you'll tell him as soon as someone says yes. If it texted "
+        "nobody, say so plainly and why.\n"
         "3. Text one or more named carers to ask if they can work a shift "
         "(offer_shift). You need the carer names, the site, the date and the block. "
         "If something is missing, ask for just that, one question. Texts are real, "
@@ -209,6 +219,27 @@ TOOLS = [
                     "the shift is created after the carer says yes.")},
             },
             "required": ["nurse_names", "facility", "date", "shift_type"],
+        },
+    },
+    {
+        "name": "fill_shift",
+        "description": (
+            "Find a carer for a shift. Texts EVERY available carer of that role who is "
+            "approved for the site, all at once. The first YES gets the shift and it is "
+            "created in Bubble automatically. Sends real SMS. Use this whenever Paul asks "
+            "you to find, fill, cover or get a carer for a shift without naming who."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "role": {"type": "string", "enum": ROLES},
+                "facility": {"type": "string", "description": "Site name as Paul said it"},
+                "date": {"type": "string", "description": "YYYY-MM-DD"},
+                "shift_type": {"type": "string", "enum": BLOCKS},
+                "shift_code": {"type": "string", "description": (
+                    "Williamstown only, if Paul named one (D6, D7, D9, A2, A3).")},
+            },
+            "required": ["role", "facility", "date", "shift_type"],
         },
     },
     {
@@ -481,12 +512,17 @@ def tool_offer_shift(nurse_names, facility, date, shift_type, shift_code=None, *
     if problems:
         return {"error": "fix these names first, nothing was sent", "problems": problems}
 
+    return _send_offers(resolved, fac, date, shift_type, shift_code)
+
+
+def _send_offers(nurses: list, fac: dict, date: str, shift_type: str, shift_code=None) -> dict:
+    """Text each carer the offer as one batch (first YES gets the shift)."""
     client = db.get_client()
     batch_id = str(uuid.uuid4())
     sent, skipped, failed = [], [], []
     seen = set()
 
-    for nurse in resolved:
+    for nurse in nurses:
         if nurse["id"] in seen:
             continue
         seen.add(nurse["id"])
@@ -528,6 +564,43 @@ def tool_offer_shift(nurse_names, facility, date, shift_type, shift_code=None, *
         "site": fac["name"], "date": date, "shift_type": shift_type,
         "texted": sent, "already_asked_and_waiting": skipped, "text_failed": failed,
     }
+
+
+def tool_fill_shift(role, facility, date, shift_type, shift_code=None, **_):
+    """Paul asked Klarra to find a carer: text every available, approved carer of that
+    role at once. The first YES gets the shift (create_shift_for_offer)."""
+    if db.MID:
+        return {"error": "KLARRA_MODE is mid, so carers cannot be contacted. Nothing sent."}
+    role = str(role or "").upper()
+    if role not in ROLES:
+        return {"error": "bad role"}
+    if not _valid_date(date) or shift_type not in BLOCKS:
+        return {"error": "bad date or shift_type"}
+    if datetime.strptime(date, "%Y-%m-%d").date() < _now_melb().date():
+        return {"error": "that date is in the past, nothing sent"}
+    fac = db.find_facility_by_name(facility)
+    if not fac:
+        return {"error": f"could not match a site called '{facility}'"}
+
+    pool = db.get_candidate_pool(fac["slug"], date, shift_type, role)
+    nurses = []
+    for c in pool:
+        nid = c.get("nurse_id")
+        if not nid:
+            continue
+        # Same rule as check_availability: anyone already rostered that day is out.
+        if not db.DEV and shift_type not in _nurse_blocks(nid, date):
+            continue
+        nurse = db.get_nurse(nid)
+        if nurse and nurse.get("phone"):
+            nurses.append(nurse)
+    if not nurses:
+        return {"site": fac["name"], "date": date, "shift_type": shift_type, "role": role,
+                "texted": [], "note": f"no available {role} carers approved for this site"}
+
+    result = _send_offers(nurses, fac, date, shift_type, shift_code)
+    result["role"] = role
+    return result
 
 
 def tool_check_replies(date=None, **_):
@@ -1190,6 +1263,7 @@ TOOL_FUNCS = {
     "check_availability": tool_check_availability,
     "check_nurse": tool_check_nurse,
     "offer_shift": tool_offer_shift,
+    "fill_shift": tool_fill_shift,
     "check_replies": tool_check_replies,
     "create_shift": tool_create_shift,
     "create_ndis_shift": tool_create_ndis_shift,
