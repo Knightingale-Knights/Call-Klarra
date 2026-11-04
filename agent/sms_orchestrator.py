@@ -71,6 +71,9 @@ REPLY_POLL_SECONDS = 3
 ADMIN_PHONE = os.environ.get("KLARRA_DEV_PHONE")
 REMINDER_INTERVAL_SECONDS = 300  # 5 min
 MAX_REMINDERS = 2
+# Paused: the "Nurse confirmed, reply OK" text with its reminders, and the "Shift filled" summary.
+# Set APPROVAL_TEXTS_ENABLED=1 to resume.
+PAUSED_APPROVAL_TEXTS = os.environ.get("APPROVAL_TEXTS_ENABLED") != "1"
 
 MID_FACILITY_DELAY_SECONDS = 30  # mid: pause before naming the nurse to the facility
 
@@ -138,7 +141,7 @@ def text_offer_outcome(nurse: dict, req: dict, outcome: str) -> None:
 def send_fyi(req: dict, nurse: dict, ranked: list[dict]) -> None:
     """Text Paul the final ranked list with the winner checked off — mirrors
     orchestrator.py's send_fyi for voice."""
-    if not ADMIN_PHONE:
+    if not ADMIN_PHONE or PAUSED_APPROVAL_TEXTS:
         return
     start = req.get("start_time") or ""
     end = req.get("end_time") or ""
@@ -235,7 +238,10 @@ def offer_nurse(offer: dict, req: dict) -> str:
 def request_admin_approval(req: dict, nurse: dict) -> bool:
     """Text Paul, wait for OK, sending up to 2 reminders 5 min apart. After the
     2nd reminder with no OK, auto-confirm (per spec) and return True. Always
-    returns True currently — kept as a function so the gate lives in one place."""
+    returns True currently — kept as a function so the gate lives in one place.
+    Paused: with PAUSED_APPROVAL_TEXTS the request is approved at once and nothing is texted."""
+    if PAUSED_APPROVAL_TEXTS:
+        return True
     body = (
         f"Nurse confirmed for shift.\n"
         f"Nurse: {nurse['first_name']}\n"
