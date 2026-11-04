@@ -724,9 +724,6 @@ def handle_adhoc_offer_reply(offer: dict, body: str) -> Response:
                         f"{db.pretty_date(offer['date'])}, but I couldn't create it: {e}")
             try:
                 db.send_sms(ADMIN_PHONE, text + late_note)
-                summary = admin_agent.batch_summary(offer.get("batch_id"))
-                if summary:
-                    db.send_sms(ADMIN_PHONE, summary)
             except Exception:
                 logger.exception("Failed to notify admin of auto shift create")
 
@@ -745,14 +742,6 @@ def handle_adhoc_offer_reply(offer: dict, body: str) -> Response:
         db.send_sms(ADMIN_PHONE, admin_text)
     except Exception:
         logger.exception("Failed to notify admin of adhoc offer reply")
-
-    # Group offer: once everyone in the batch has answered, send one summary line.
-    try:
-        summary = admin_agent.batch_summary(offer.get("batch_id"))
-        if summary:
-            db.send_sms(ADMIN_PHONE, summary)
-    except Exception:
-        logger.exception("Failed to send batch summary")
 
     if answer == "yes":
         return twiml_reply("Great, thanks! Confirmed.")
