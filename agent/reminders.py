@@ -116,7 +116,7 @@ def send_due() -> int:
 
 
 FOLLOWUP_MINUTES = 30
-MAX_FOLLOWUPS = 3
+MAX_FOLLOWUPS = 1
 DONE_WORDS = {"done", "all done", "its done", "it's done", "sorted", "done thanks",
               "done thank you", "completed", "finished", "did it", "done it"}
 
@@ -142,7 +142,7 @@ def send_followups() -> int:
                    .execute().data) or []
         if not claimed:
             continue
-        last_one = n >= MAX_FOLLOWUPS
+        last_one = n >= MAX_FOLLOWUPS and MAX_FOLLOWUPS > 1
         body = f"Following up: {r['message']}. Text me \"done\" when it's sorted."
         if last_one:
             body = f"Last nudge on this one: {r['message']}. Text me \"done\" when it's sorted."
