@@ -399,8 +399,8 @@ def _resolve_nurse(name: str) -> tuple[dict | None, dict | None]:
 def offer_message(nurse: dict, facility: dict, date: str, shift_type: str) -> str:
     return (
         f"Hi {nurse['first_name']}, I've got a shift at {facility['name']} "
-        f"on {db.short_date(date)} ({shift_type}). Please reply YES if you would "
-        f"like it. Please reply NO if you would prefer to pass. Thank you"
+        f"on {db.short_date(date)} ({shift_type}). Reply YES if you'd like it or "
+        f"NO to pass. Thanks"
     )
 
 

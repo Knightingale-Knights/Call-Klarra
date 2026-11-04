@@ -106,8 +106,8 @@ def offer_message(nurse: dict, req: dict) -> str:
         time_desc = f"({req['shift_type']})"
     return (
         f"Hi {nurse['first_name']}, I've got a shift at {req['facilities']['name']} "
-        f"on {nice_date} {time_desc}. Please reply YES if you would like it. "
-        f"Please reply NO if you would prefer to pass. Thank you"
+        f"on {nice_date} {time_desc}. Reply YES if you'd like it or NO to pass. "
+        f"Thanks"
     )
 
 
