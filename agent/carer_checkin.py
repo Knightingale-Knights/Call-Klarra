@@ -49,6 +49,8 @@ SEND_HOUR = 10
 DAILY_LIMIT = int(os.environ.get("CHECKIN_DAILY_LIMIT", "15"))
 REPLY_WINDOW_DAYS = 7
 POLL_SECONDS = 300
+# Paused: the daily "still want to work?" text and the goodbye text. Set CARER_CHECKIN_ENABLED=1 to resume.
+PAUSED_TEXTS = os.environ.get("CARER_CHECKIN_ENABLED") != "1"
 # First day texts may go out (YYYY-MM-DD, Melbourne).
 START_DATE = os.environ.get("CHECKIN_START_DATE", "2026-10-22")
 BUBBLE_BASE = "https://knightingale.com.au/api/1.1/obj"
@@ -407,14 +409,15 @@ def _loop() -> None:
     while True:
         try:
             now = datetime.now(MELB)
-            if (now.hour >= SEND_HOUR and now.date() != last_day
+            if (PAUSED_TEXTS is False and now.hour >= SEND_HOUR and now.date() != last_day
                     and now.date().isoformat() >= START_DATE):
                 run_once()
                 last_day = now.date()
         except Exception:
             logger.exception("Check-in run failed")
         try:
-            expire_no_replies()
+            if not PAUSED_TEXTS:
+                expire_no_replies()
         except Exception:
             logger.exception("Check-in expiry failed")
         try:

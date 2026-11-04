@@ -60,6 +60,8 @@ TEST_SECTION = os.environ.get("QUESTIONNAIRE_TEST_SECTION", "").strip() or None
 HEADS_UP_START, HEADS_UP_END = 17, 21      # Melbourne hours
 EARLIEST_START, LATEST_START = 7, 19        # only shifts starting in this window
 START_OFFSET = timedelta(minutes=30)
+# Paused: heads-up, start and nudge texts. Set QUESTIONNAIRE_TEXTS_ENABLED=1 to resume.
+PAUSED_TEXTS = os.environ.get("QUESTIONNAIRE_TEXTS_ENABLED") != "1"
 CHECKIN_GRACE = timedelta(minutes=90)
 
 
@@ -240,16 +242,17 @@ def main():
     while True:
         try:
             h = q.melb_now().hour
-            if (not TEST_NOW and HEADS_UP_START <= h < HEADS_UP_END
+            if (not PAUSED_TEXTS and not TEST_NOW and HEADS_UP_START <= h < HEADS_UP_END
                     and time.time() - last_heads_up > 900):
                 run_heads_up()
                 last_heads_up = time.time()
-            for s in due_sessions():
+            for s in ([] if PAUSED_TEXTS else due_sessions()):
                 try:
                     start_session(s)
                 except Exception:
                     logger.exception("Start failed for session %s", s["id"])
-            qs.check_timeouts()
+            if not PAUSED_TEXTS:
+                qs.check_timeouts()
             qs.email_pending_gaps()
             risk_plans.process_pending()
         except Exception:
