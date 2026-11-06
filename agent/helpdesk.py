@@ -29,7 +29,7 @@ Paul -> Klarra:
 
 Tables: helpdesk_kb (approvals / corrections counted per saved answer),
 helpdesk_questions (one row per carer text, status pending | draft | answered |
-approved | corrected | ack, plus a topic from TOPICS), helpdesk_messages (full carer
+approved | corrected | ack | unanswerable, plus a topic from TOPICS), helpdesk_messages (full carer
 conversation log). View helpdesk_topics: mode, approve vs correct rate and current
 approval streak per topic. Topics hand over to Klarra after 20 approvals in a row
 (see "topic handover" below); helpdesk_topic_settings holds each topic's mode.
@@ -607,6 +607,8 @@ def handle_paul_answer(body: str) -> str | None:
         if db.MID:
             return "KLARRA_MODE is mid, so carers can't be texted. Nothing sent."
         return _correct_auto_answer(q, answer)
+    if q["status"] == "unanswerable":
+        return f"Q{qid} was marked unanswerable. Nothing sent."
     if q["status"] not in ("pending", "draft"):
         return f"Q{qid} is already sorted."
     if not answer:
@@ -814,14 +816,13 @@ def _correct_auto_answer(q: dict, answer: str) -> str:
 
 # --- timeout: don't leave carers hanging ------------------------------------------
 
-TIMEOUT_MINUTES = int(os.environ.get("HELPDESK_TIMEOUT_MINUTES", "15"))
-TIMEOUT_REPLY = "Checking with Paul, back to you soon."
+TIMEOUT_MINUTES = int(os.environ.get("HELPDESK_TIMEOUT_MINUTES", "20"))
 TIMEOUT_POLL_SECONDS = 60
 
 
 def check_timeouts() -> int:
-    """Any carer text still waiting on Paul after TIMEOUT_MINUTES: text the carer once
-    that Klarra is checking with Paul, and nudge Paul once. Returns how many."""
+    """Any carer text Paul hasn't answered after TIMEOUT_MINUTES is marked unanswerable.
+    The carer is never texted; Paul gets one text saying which one was marked. Returns how many."""
     if db.MID:
         return 0
     client = db.get_client()
@@ -831,17 +832,13 @@ def check_timeouts() -> int:
             .lt("created_at", cutoff).limit(20).execute().data or [])
     for q in rows:
         # Claim it first so two workers never double-text.
-        claimed = (client.table("helpdesk_questions").update({"timeout_sent_at": _now()})
+        claimed = (client.table("helpdesk_questions")
+                   .update({"timeout_sent_at": _now(), "status": "unanswerable"})
                    .eq("id", q["id"]).is_("timeout_sent_at", "null").execute().data or [])
         if not claimed:
             continue
         if q["phone"] != db.normalise_phone(ADMIN_PHONE):
-            _send_carer(q, TIMEOUT_REPLY, "timeout")
-        name = q.get("carer_name") or "a carer"
-        how = (f"Reply Q{q['id']} yes, or Q{q['id']} + the right answer."
-               if q["status"] == "draft" else f"Reply Q{q['id']} + your answer.")
-        _text_paul(f"Q{q['id']} still waiting ({name}, {TIMEOUT_MINUTES} min): {q['question']}\n"
-                   f"I've told them I'm checking with you. {how}")
+            _text_paul(f"Marked unanswerable: {q['question']}")
     return len(rows)
 
 
